@@ -5,7 +5,7 @@
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
-        test-full test-multi-vcpu test-rwx test-sysroot-rename \
+        test-full test-multi-vcpu test-rwx test-oci-ref test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable \
@@ -31,6 +31,12 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-sysroot-procfs-exec
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-timeout-disable
+	@printf "\n$(BLUE)━━━ OCI reference parser unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-ref
+
+## Run the OCI image reference parser unit tests (native, no HVF)
+test-oci-ref: $(BUILD_DIR)/test-oci-ref
+	@$(BUILD_DIR)/test-oci-ref
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

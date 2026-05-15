@@ -15,7 +15,7 @@ ifeq ($(origin GUEST_TEST_BINARIES), undefined)
 endif
 
 # Exclude native macOS test files from cross-compilation
-NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c
+NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c tests/test-oci-ref.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c
 SPECIAL_TEST_BINS := $(BUILD_DIR)/test-lowbase-mem-200000 $(BUILD_DIR)/test-lowbase-mem-300000
 

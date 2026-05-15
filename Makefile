@@ -63,7 +63,9 @@ SRCS := \
     debug/gdbstub.c \
     debug/gdbstub-reg.c \
     debug/gdbstub-rsp.c \
-    debug/log.c
+    debug/log.c \
+    oci/ref.c \
+    oci/cli.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -127,6 +129,12 @@ $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
 ## Build the RWX W^X validation test (native macOS binary)
 $(BUILD_DIR)/test-rwx: $(BUILD_DIR)/test-rwx.o | $(BUILD_DIR)
 	$(call link-and-sign,$@,$<)
+
+## Build the OCI reference parser unit test (native macOS binary).
+## Pure C, no HVF, no codesign required.
+$(BUILD_DIR)/test-oci-ref: $(BUILD_DIR)/test-oci-ref.o $(BUILD_DIR)/oci/ref.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 # ── Guest test binaries (cross-compiled, aarch64-linux) ──────────
 # Only used when GUEST_TEST_BINARIES is not set.

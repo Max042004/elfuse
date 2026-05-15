@@ -31,6 +31,8 @@
 #include "core/guest.h"
 #include "core/sysroot.h"
 
+#include "oci/cli.h"
+
 #include "runtime/forkipc.h"
 #include "runtime/proctitle.h"
 
@@ -126,6 +128,13 @@ int main(int argc, char **argv)
     int gdb_port = 0;
     bool gdb_stop_on_entry = false;
     int arg_start = 1;
+
+    /* `elfuse oci ...` is a self-contained CLI subcommand: image distribution
+     * never touches Hypervisor.framework, so dispatch before any guest setup
+     * to avoid host-DC-ZVA / entitlement checks the user never asked for.
+     */
+    if (argc > 1 && !strcmp(argv[1], "oci"))
+        return oci_cli_main(argc - 1, argv + 1);
 
     /* --help and --version do not require an ELF path. */
     if (argc > 1) {
