@@ -7,6 +7,7 @@
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx \
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
+        test-oci-fetch test-oci-fetch-online \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -41,6 +42,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-blob-store
 	@printf "\n$(BLUE)━━━ OCI manifest parser unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-manifest
+	@printf "\n$(BLUE)━━━ OCI fetch unit tests (offline mock HTTP) ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-fetch
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -57,6 +60,17 @@ test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store
 ## Run the OCI manifest / index / config parser unit tests (native, no HVF)
 test-oci-manifest: $(BUILD_DIR)/test-oci-manifest
 	@$(BUILD_DIR)/test-oci-manifest
+
+## Run the OCI fetch unit tests against an in-process mock HTTP server
+## (native, no HVF, no network).
+test-oci-fetch: $(BUILD_DIR)/test-oci-fetch
+	@$(BUILD_DIR)/test-oci-fetch
+
+## Pull alpine:3.20 from Docker Hub anonymously, verify manifest parse and
+## blob digests against a real registry. Opt-in; requires network. Not run by
+## `make check`.
+test-oci-fetch-online: $(BUILD_DIR)/test-oci-fetch
+	@OCI_FETCH_ONLINE=1 $(BUILD_DIR)/test-oci-fetch
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

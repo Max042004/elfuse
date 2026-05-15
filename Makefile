@@ -69,7 +69,8 @@ SRCS := \
     oci/digest.c \
     oci/blob-store.c \
     oci/media-type.c \
-    oci/manifest.c
+    oci/manifest.c \
+    oci/fetch.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -89,7 +90,7 @@ $(CJSON_OBJ): $(CJSON_DIR)/cJSON.c $(CJSON_DIR)/cJSON.h | $(BUILD_DIR)
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
-HVF_LDFLAGS := -framework Hypervisor -arch arm64
+HVF_LDFLAGS := -framework Hypervisor -arch arm64 -lcurl
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.
@@ -166,6 +167,13 @@ $(BUILD_DIR)/test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store.o $(BUILD_DIR
 $(BUILD_DIR)/test-oci-manifest: $(BUILD_DIR)/test-oci-manifest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/digest.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI fetch (libcurl) unit test (native macOS, no HVF). Pulls in
+## blob-store + digest + manifest models + cJSON; links against system libcurl
+## and the platform pthread runtime for the in-process mock HTTP server.
+$(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread
 
 # ── Guest test binaries (cross-compiled, aarch64-linux) ──────────
 # Only used when GUEST_TEST_BINARIES is not set.
