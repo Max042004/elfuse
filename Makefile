@@ -70,7 +70,9 @@ SRCS := \
     oci/blob-store.c \
     oci/media-type.c \
     oci/manifest.c \
-    oci/fetch.c
+    oci/fetch.c \
+    oci/store.c \
+    oci/pull.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -168,13 +170,32 @@ $(BUILD_DIR)/test-oci-manifest: $(BUILD_DIR)/test-oci-manifest.o $(BUILD_DIR)/oc
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the shared OCI mock HTTPS server helper. tests/lib/oci-mock.{c,h}
+## terminates TLS via libssl from brew openssl@3; both the fetch and pull
+## suites link against the same compiled object to avoid duplicating ~400 LOC
+## of scaffolding in their own translation units.
+$(BUILD_DIR)/lib/oci-mock.o: CFLAGS += $(OPENSSL_CFLAGS)
+
 ## Build the OCI fetch (libcurl) unit test (native macOS, no HVF). Pulls in
 ## blob-store + digest + manifest models + cJSON; links against system libcurl
 ## and the platform pthread runtime for the in-process mock HTTP server. The
 ## test mock terminates TLS using libssl from brew openssl@3 so the ca_file
 ## negative cases exercise a real certificate verification path.
 $(BUILD_DIR)/test-oci-fetch.o: CFLAGS += $(OPENSSL_CFLAGS)
-$(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
+
+## Build the OCI local store unit test (native macOS, no HVF). Pure C; links
+## against the store wrapper plus its blob-store and digest dependencies.
+$(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/ref.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI pull pipeline unit test (native macOS, no HVF). Shares the
+## TLS-terminating mock server with test-oci-fetch via tests/lib/oci-mock.
+$(BUILD_DIR)/test-oci-pull.o: CFLAGS += $(OPENSSL_CFLAGS)
+$(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
 

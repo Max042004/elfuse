@@ -24,34 +24,27 @@
  * make test-oci-fetch-online and is not part of make check.
  */
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <ftw.h>
-#include <netinet/in.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <curl/curl.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
-#include <openssl/x509v3.h>
 
 #include "oci/blob-store.h"
 #include "oci/digest.h"
 #include "oci/fetch.h"
 #include "oci/manifest.h"
 #include "oci/ref.h"
+
+#include "lib/oci-mock.h"
 
 #define GREEN "\033[0;32m"
 #define RED "\033[0;31m"
@@ -84,393 +77,9 @@ static void report_fail(const char *name, const char *fmt, ...)
     printf("\n");
 }
 
-/* IO abstraction: every handler reads and writes through an io_t so the
- * underlying transport (an SSL session here) is swappable.
+/* Mock server infrastructure lives in tests/lib/oci-mock.{c,h}. This file now
+ * only carries the test-specific handlers and assertions.
  */
-typedef struct {
-    SSL *ssl;
-} io_t;
-
-static ssize_t io_read(io_t *io, void *buf, size_t cap)
-{
-    int n = SSL_read(io->ssl, buf, (int) cap);
-    return n > 0 ? (ssize_t) n : -1;
-}
-
-static void io_write(io_t *io, const void *buf, size_t n)
-{
-    const char *p = buf;
-    size_t left = n;
-    while (left) {
-        int w = SSL_write(io->ssl, p, (int) left);
-        if (w <= 0)
-            return;
-        p += w;
-        left -= (size_t) w;
-    }
-}
-
-/* ── Mock HTTP server ────────────────────────────────────────────── */
-
-typedef struct {
-    char method[8];
-    char path[1024];
-    char authorization[1024];
-    char accept[1024];
-} mock_request_t;
-
-#define MOCK_LOG_MAX 16
-
-typedef struct mock_server mock_server_t;
-typedef void (*mock_handler_t)(mock_server_t *s, io_t *io,
-                               const mock_request_t *req);
-
-struct mock_server {
-    int listen_fd;
-    int port;
-    pthread_t thread;
-    pthread_mutex_t lock;
-    bool stop;
-    int n_requests;
-    mock_request_t log[MOCK_LOG_MAX];
-    mock_handler_t handler;
-    void *ctx;
-    SSL_CTX *ssl_ctx;
-    char ca_pem_path[256];
-};
-
-static ssize_t read_request_until_empty(io_t *io, char *buf, size_t cap)
-{
-    size_t off = 0;
-    while (off + 1 < cap) {
-        ssize_t n = io_read(io, buf + off, cap - 1 - off);
-        if (n <= 0)
-            break;
-        off += (size_t) n;
-        buf[off] = '\0';
-        if (strstr(buf, "\r\n\r\n"))
-            break;
-    }
-    return (ssize_t) off;
-}
-
-static void parse_request(const char *raw, mock_request_t *out)
-{
-    memset(out, 0, sizeof(*out));
-    const char *sp1 = strchr(raw, ' ');
-    if (!sp1)
-        return;
-    size_t mlen = (size_t) (sp1 - raw);
-    if (mlen >= sizeof(out->method))
-        mlen = sizeof(out->method) - 1;
-    memcpy(out->method, raw, mlen);
-    const char *sp2 = strchr(sp1 + 1, ' ');
-    if (!sp2)
-        return;
-    size_t plen = (size_t) (sp2 - sp1 - 1);
-    if (plen >= sizeof(out->path))
-        plen = sizeof(out->path) - 1;
-    memcpy(out->path, sp1 + 1, plen);
-
-    const char *line = strstr(raw, "\r\n");
-    if (!line)
-        return;
-    line += 2;
-    while (*line && strncmp(line, "\r\n", 2) != 0) {
-        const char *eol = strstr(line, "\r\n");
-        if (!eol)
-            break;
-        size_t llen = (size_t) (eol - line);
-        if (llen > 13 && !strncasecmp(line, "Authorization:", 14)) {
-            const char *v = line + 14;
-            while (*v == ' ')
-                v++;
-            size_t vlen = (size_t) (eol - v);
-            if (vlen >= sizeof(out->authorization))
-                vlen = sizeof(out->authorization) - 1;
-            memcpy(out->authorization, v, vlen);
-            out->authorization[vlen] = '\0';
-        } else if (llen > 6 && !strncasecmp(line, "Accept:", 7)) {
-            const char *v = line + 7;
-            while (*v == ' ')
-                v++;
-            size_t vlen = (size_t) (eol - v);
-            if (vlen >= sizeof(out->accept))
-                vlen = sizeof(out->accept) - 1;
-            memcpy(out->accept, v, vlen);
-            out->accept[vlen] = '\0';
-        }
-        line = eol + 2;
-    }
-}
-
-static void *mock_server_loop(void *arg)
-{
-    mock_server_t *s = arg;
-    while (1) {
-        pthread_mutex_lock(&s->lock);
-        bool stop = s->stop;
-        pthread_mutex_unlock(&s->lock);
-        if (stop)
-            break;
-        int cfd = accept(s->listen_fd, NULL, NULL);
-        if (cfd < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        SSL *ssl = SSL_new(s->ssl_ctx);
-        if (!ssl) {
-            close(cfd);
-            continue;
-        }
-        SSL_set_fd(ssl, cfd);
-        if (SSL_accept(ssl) <= 0) {
-            /* Negative-trust tests deliberately abort the handshake; just
-             * recycle the socket and let the request log stay empty so the
-             * caller can assert n_requests == 0.
-             */
-            SSL_free(ssl);
-            close(cfd);
-            continue;
-        }
-        io_t io = {.ssl = ssl};
-        char buf[8192];
-        ssize_t got = read_request_until_empty(&io, buf, sizeof(buf));
-        if (got <= 0) {
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(cfd);
-            continue;
-        }
-        mock_request_t req;
-        parse_request(buf, &req);
-
-        pthread_mutex_lock(&s->lock);
-        if (s->n_requests < MOCK_LOG_MAX) {
-            s->log[s->n_requests++] = req;
-        }
-        mock_handler_t h = s->handler;
-        pthread_mutex_unlock(&s->lock);
-
-        if (h)
-            h(s, &io, &req);
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(cfd);
-    }
-    return NULL;
-}
-
-/* Generate an in-memory RSA keypair + self-signed cert valid for one day,
- * covering CN=127.0.0.1 plus SAN IP:127.0.0.1 and DNS:localhost. Writes the
- * certificate (PEM) to s->ca_pem_path for the fetcher to consume as
- * opts.ca_file.
- */
-static int mock_make_cert(mock_server_t *s, const char *scratch_root)
-{
-    EVP_PKEY *pkey = EVP_RSA_gen(2048);
-    if (!pkey)
-        return -1;
-    X509 *cert = X509_new();
-    if (!cert) {
-        EVP_PKEY_free(pkey);
-        return -1;
-    }
-    X509_set_version(cert, 2);
-    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
-    X509_gmtime_adj(X509_get_notBefore(cert), 0);
-    X509_gmtime_adj(X509_get_notAfter(cert), 60 * 60 * 24);
-    X509_set_pubkey(cert, pkey);
-    X509_NAME *name = X509_get_subject_name(cert);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               (const unsigned char *) "127.0.0.1", -1, -1, 0);
-    X509_set_issuer_name(cert, name);
-
-    X509V3_CTX vctx;
-    X509V3_set_ctx_nodb(&vctx);
-    X509V3_set_ctx(&vctx, cert, cert, NULL, NULL, 0);
-    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, &vctx,
-                                              NID_subject_alt_name,
-                                              "IP:127.0.0.1, DNS:localhost");
-    if (ext) {
-        X509_add_ext(cert, ext, -1);
-        X509_EXTENSION_free(ext);
-    }
-    if (!X509_sign(cert, pkey, EVP_sha256())) {
-        X509_free(cert);
-        EVP_PKEY_free(pkey);
-        return -1;
-    }
-
-    snprintf(s->ca_pem_path, sizeof(s->ca_pem_path), "%s/mock-ca.pem",
-             scratch_root);
-    FILE *fp = fopen(s->ca_pem_path, "w");
-    if (!fp) {
-        X509_free(cert);
-        EVP_PKEY_free(pkey);
-        return -1;
-    }
-    PEM_write_X509(fp, cert);
-    fclose(fp);
-
-    s->ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (!s->ssl_ctx) {
-        X509_free(cert);
-        EVP_PKEY_free(pkey);
-        return -1;
-    }
-    SSL_CTX_set_min_proto_version(s->ssl_ctx, TLS1_2_VERSION);
-    if (SSL_CTX_use_certificate(s->ssl_ctx, cert) != 1 ||
-        SSL_CTX_use_PrivateKey(s->ssl_ctx, pkey) != 1) {
-        SSL_CTX_free(s->ssl_ctx);
-        s->ssl_ctx = NULL;
-        X509_free(cert);
-        EVP_PKEY_free(pkey);
-        return -1;
-    }
-    X509_free(cert);
-    EVP_PKEY_free(pkey);
-    return 0;
-}
-
-static int mock_server_start(mock_server_t *s, const char *scratch_root)
-{
-    memset(s, 0, sizeof(*s));
-    pthread_mutex_init(&s->lock, NULL);
-    if (mock_make_cert(s, scratch_root) < 0) {
-        pthread_mutex_destroy(&s->lock);
-        return -1;
-    }
-    s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (s->listen_fd < 0)
-        goto err;
-    int yes = 1;
-    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in sa = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-        .sin_port = 0,
-    };
-    if (bind(s->listen_fd, (struct sockaddr *) &sa, sizeof(sa)) < 0)
-        goto err_sock;
-    socklen_t slen = sizeof(sa);
-    if (getsockname(s->listen_fd, (struct sockaddr *) &sa, &slen) < 0)
-        goto err_sock;
-    s->port = ntohs(sa.sin_port);
-    if (listen(s->listen_fd, 8) < 0)
-        goto err_sock;
-    if (pthread_create(&s->thread, NULL, mock_server_loop, s) != 0)
-        goto err_sock;
-    return 0;
-err_sock:
-    close(s->listen_fd);
-err:
-    SSL_CTX_free(s->ssl_ctx);
-    pthread_mutex_destroy(&s->lock);
-    return -1;
-}
-
-static void mock_server_stop(mock_server_t *s)
-{
-    pthread_mutex_lock(&s->lock);
-    s->stop = true;
-    pthread_mutex_unlock(&s->lock);
-    int wake = socket(AF_INET, SOCK_STREAM, 0);
-    if (wake >= 0) {
-        struct sockaddr_in sa = {
-            .sin_family = AF_INET,
-            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-            .sin_port = htons(s->port),
-        };
-        (void) connect(wake, (struct sockaddr *) &sa, sizeof(sa));
-        close(wake);
-    }
-    pthread_join(s->thread, NULL);
-    close(s->listen_fd);
-    SSL_CTX_free(s->ssl_ctx);
-    pthread_mutex_destroy(&s->lock);
-}
-
-static void mock_set_handler(mock_server_t *s, mock_handler_t h, void *ctx)
-{
-    pthread_mutex_lock(&s->lock);
-    s->handler = h;
-    s->ctx = ctx;
-    s->n_requests = 0;
-    memset(s->log, 0, sizeof(s->log));
-    pthread_mutex_unlock(&s->lock);
-}
-
-static int mock_request_count(mock_server_t *s)
-{
-    pthread_mutex_lock(&s->lock);
-    int n = s->n_requests;
-    pthread_mutex_unlock(&s->lock);
-    return n;
-}
-
-static void mock_send_full(io_t *io, int status, const char *status_text,
-                           const char *content_type,
-                           const char *www_authenticate,
-                           const char *docker_digest,
-                           const void *body,
-                           size_t body_len)
-{
-    char header[1024];
-    int n = snprintf(header, sizeof(header),
-                     "HTTP/1.1 %d %s\r\n"
-                     "Content-Length: %zu\r\n",
-                     status, status_text ? status_text : "OK", body_len);
-    if (content_type)
-        n += snprintf(header + n, sizeof(header) - (size_t) n,
-                      "Content-Type: %s\r\n", content_type);
-    if (www_authenticate)
-        n += snprintf(header + n, sizeof(header) - (size_t) n,
-                      "Www-Authenticate: %s\r\n", www_authenticate);
-    if (docker_digest)
-        n += snprintf(header + n, sizeof(header) - (size_t) n,
-                      "Docker-Content-Digest: %s\r\n", docker_digest);
-    n += snprintf(header + n, sizeof(header) - (size_t) n, "\r\n");
-    io_write(io, header, (size_t) n);
-    if (body_len > 0)
-        io_write(io, body, body_len);
-}
-
-/* ── Helpers ─────────────────────────────────────────────────────── */
-
-static int remove_entry(const char *path, const struct stat *st, int typeflag,
-                        struct FTW *ftwbuf)
-{
-    (void) st;
-    (void) typeflag;
-    (void) ftwbuf;
-    return remove(path);
-}
-
-static void wipe_dir(const char *root)
-{
-    (void) nftw(root, remove_entry, 8, FTW_DEPTH | FTW_PHYS);
-}
-
-static char *make_scratch_root(void)
-{
-    char *tmpl = strdup("/tmp/elfuse-oci-fetch-XXXXXX");
-    if (!tmpl || !mkdtemp(tmpl)) {
-        free(tmpl);
-        return NULL;
-    }
-    return tmpl;
-}
-
-static char *make_base_url(int port)
-{
-    char *url = malloc(64);
-    if (!url)
-        return NULL;
-    snprintf(url, 64, "https://127.0.0.1:%d", port);
-    return url;
-}
 
 static void fill_descriptor(oci_descriptor_t *desc,
                             char *digest_str_buf, size_t digest_str_cap,
@@ -497,16 +106,16 @@ typedef struct {
     const char *docker_digest;
 } handler_anonymous_manifest_t;
 
-static void h_anonymous_manifest(mock_server_t *s, io_t *io,
-                                 const mock_request_t *req)
+static void h_anonymous_manifest(oci_mock_server_t *s, oci_mock_io_t *io,
+                                 const oci_mock_request_t *req)
 {
     handler_anonymous_manifest_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->manifest_path) == 0) {
-        mock_send_full(io, 200, "OK", ctx->content_type, NULL, ctx->docker_digest,
+        oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, ctx->docker_digest,
                        ctx->body, ctx->body_len);
         return;
     }
-    mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
 }
 
 typedef struct {
@@ -518,7 +127,7 @@ typedef struct {
     char base_url[64];
 } handler_bearer_t;
 
-static void h_bearer_flow(mock_server_t *s, io_t *io, const mock_request_t *req)
+static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_mock_request_t *req)
 {
     handler_bearer_t *ctx = s->ctx;
     if (strncmp(req->path, "/token", 6) == 0) {
@@ -526,7 +135,7 @@ static void h_bearer_flow(mock_server_t *s, io_t *io, const mock_request_t *req)
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->expected_token);
-        mock_send_full(io, 200, "OK", "application/json", NULL, NULL, body,
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, body,
                        (size_t) n);
         return;
     }
@@ -534,7 +143,7 @@ static void h_bearer_flow(mock_server_t *s, io_t *io, const mock_request_t *req)
         char want_auth[256];
         snprintf(want_auth, sizeof(want_auth), "Bearer %s", ctx->expected_token);
         if (strcmp(req->authorization, want_auth) == 0) {
-            mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
+            oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
                            ctx->manifest_body, ctx->manifest_body_len);
             return;
         }
@@ -543,11 +152,11 @@ static void h_bearer_flow(mock_server_t *s, io_t *io, const mock_request_t *req)
                  "Bearer realm=\"%s/token\",service=\"reg\","
                  "scope=\"repository:private/secret:pull\"",
                  ctx->base_url);
-        mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
+        oci_mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
                        NULL, "{}", 2);
         return;
     }
-    mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
 }
 
 typedef struct {
@@ -558,16 +167,16 @@ typedef struct {
     bool oversize; /* if true, send body_len + 5 bytes */
 } handler_blob_t;
 
-static void h_blob(mock_server_t *s, io_t *io, const mock_request_t *req)
+static void h_blob(oci_mock_server_t *s, oci_mock_io_t *io, const oci_mock_request_t *req)
 {
     handler_blob_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->blob_path) != 0) {
-        mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
         return;
     }
     int status = ctx->status ? ctx->status : 200;
     if (status != 200) {
-        mock_send_full(io, status, "Error", "text/plain", NULL, NULL, "err", 3);
+        oci_mock_send_full(io, status, "Error", "text/plain", NULL, NULL, "err", 3);
         return;
     }
     if (ctx->oversize) {
@@ -575,12 +184,12 @@ static void h_blob(mock_server_t *s, io_t *io, const mock_request_t *req)
         char *buf = malloc(pad_len);
         memcpy(buf, ctx->body, ctx->body_len);
         memset(buf + ctx->body_len, 'X', 5);
-        mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
+        oci_mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
                        buf, pad_len);
         free(buf);
         return;
     }
-    mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
+    oci_mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
                    ctx->body, ctx->body_len);
 }
 
@@ -592,20 +201,20 @@ typedef struct {
     const char *content_type;
 } handler_basic_auth_t;
 
-static void h_basic_auth(mock_server_t *s, io_t *io,
-                         const mock_request_t *req)
+static void h_basic_auth(oci_mock_server_t *s, oci_mock_io_t *io,
+                         const oci_mock_request_t *req)
 {
     handler_basic_auth_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->manifest_path) != 0) {
-        mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
         return;
     }
     if (strcmp(req->authorization, ctx->expected_authorization) != 0) {
-        mock_send_full(io, 401, "Unauthorized", "application/json",
+        oci_mock_send_full(io, 401, "Unauthorized", "application/json",
                        "Basic realm=\"reg\"", NULL, "{}", 2);
         return;
     }
-    mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
+    oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
                    ctx->body, ctx->body_len);
 }
 
@@ -619,13 +228,13 @@ typedef struct {
     char base_url[64];
 } handler_basic_then_bearer_t;
 
-static void h_basic_then_bearer(mock_server_t *s, io_t *io,
-                                const mock_request_t *req)
+static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
+                                const oci_mock_request_t *req)
 {
     handler_basic_then_bearer_t *ctx = s->ctx;
     if (strncmp(req->path, "/token", 6) == 0) {
         if (strcmp(req->authorization, ctx->expected_basic) != 0) {
-            mock_send_full(io, 401, "Unauthorized", "application/json", NULL,
+            oci_mock_send_full(io, 401, "Unauthorized", "application/json", NULL,
                            NULL, "{}", 2);
             return;
         }
@@ -633,7 +242,7 @@ static void h_basic_then_bearer(mock_server_t *s, io_t *io,
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->expected_token);
-        mock_send_full(io, 200, "OK", "application/json", NULL, NULL, body,
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, body,
                        (size_t) n);
         return;
     }
@@ -642,7 +251,7 @@ static void h_basic_then_bearer(mock_server_t *s, io_t *io,
         snprintf(want_bearer, sizeof(want_bearer), "Bearer %s",
                  ctx->expected_token);
         if (strcmp(req->authorization, want_bearer) == 0) {
-            mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
+            oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
                            ctx->manifest_body, ctx->manifest_body_len);
             return;
         }
@@ -651,16 +260,16 @@ static void h_basic_then_bearer(mock_server_t *s, io_t *io,
                  "Bearer realm=\"%s/token\",service=\"reg\","
                  "scope=\"repository:private/secret:pull\"",
                  ctx->base_url);
-        mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
+        oci_mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
                        NULL, "{}", 2);
         return;
     }
-    mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
 
-static void test_anonymous_manifest(mock_server_t *server, oci_fetcher_t *f)
+static void test_anonymous_manifest(oci_mock_server_t *server, oci_fetcher_t *f)
 {
     static const char BODY[] = "{\"schemaVersion\":2}";
     static const char DIGEST[] =
@@ -672,7 +281,7 @@ static void test_anonymous_manifest(mock_server_t *server, oci_fetcher_t *f)
         .content_type = "application/vnd.oci.image.manifest.v1+json",
         .docker_digest = DIGEST,
     };
-    mock_set_handler(server, h_anonymous_manifest, &ctx);
+    oci_mock_set_handler(server, h_anonymous_manifest, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -706,7 +315,7 @@ static void test_anonymous_manifest(mock_server_t *server, oci_fetcher_t *f)
     oci_fetch_response_free(&resp);
 }
 
-static void test_manifest_404(mock_server_t *server, oci_fetcher_t *f)
+static void test_manifest_404(oci_mock_server_t *server, oci_fetcher_t *f)
 {
     handler_anonymous_manifest_t ctx = {
         .manifest_path = "/v2/library/missing/manifests/v9",
@@ -715,7 +324,7 @@ static void test_manifest_404(mock_server_t *server, oci_fetcher_t *f)
         .content_type = "application/json",
         .docker_digest = NULL,
     };
-    mock_set_handler(server, h_anonymous_manifest, &ctx);
+    oci_mock_set_handler(server, h_anonymous_manifest, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -736,10 +345,10 @@ static void test_manifest_404(mock_server_t *server, oci_fetcher_t *f)
     oci_fetch_response_free(&resp);
 }
 
-static void test_bearer_challenge(mock_server_t *server, oci_fetcher_t *f,
+static void test_bearer_challenge(oci_mock_server_t *server, oci_fetcher_t *f,
                                   handler_bearer_t *ctx)
 {
-    mock_set_handler(server, h_bearer_flow, ctx);
+    oci_mock_set_handler(server, h_bearer_flow, ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -773,7 +382,7 @@ static void test_bearer_challenge(mock_server_t *server, oci_fetcher_t *f,
     oci_fetch_response_free(&resp);
 }
 
-static void test_token_reuse(mock_server_t *server, oci_fetcher_t *f)
+static void test_token_reuse(oci_mock_server_t *server, oci_fetcher_t *f)
 {
     int before = server->n_requests;
     oci_ref_t ref = {
@@ -805,7 +414,7 @@ static const char HELLO_WORLD[] = "hello world";
 static const char HELLO_WORLD_SHA256[] =
     "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
-static void test_blob_success(mock_server_t *server, oci_fetcher_t *f,
+static void test_blob_success(oci_mock_server_t *server, oci_fetcher_t *f,
                               const char *store_root)
 {
     oci_blob_store_t *store = oci_blob_store_open(store_root);
@@ -821,7 +430,7 @@ static void test_blob_success(mock_server_t *server, oci_fetcher_t *f,
         .body = HELLO_WORLD,
         .body_len = strlen(HELLO_WORLD),
     };
-    mock_set_handler(server, h_blob, &ctx);
+    oci_mock_set_handler(server, h_blob, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -849,7 +458,7 @@ static void test_blob_success(mock_server_t *server, oci_fetcher_t *f,
     oci_blob_store_close(store);
 }
 
-static void test_blob_already_cached(mock_server_t *server, oci_fetcher_t *f,
+static void test_blob_already_cached(oci_mock_server_t *server, oci_fetcher_t *f,
                                      const char *store_root)
 {
     oci_blob_store_t *store = oci_blob_store_open(store_root);
@@ -870,7 +479,7 @@ static void test_blob_already_cached(mock_server_t *server, oci_fetcher_t *f,
         .body = "x",
         .body_len = 1,
     };
-    mock_set_handler(server, h_blob, &ctx);
+    oci_mock_set_handler(server, h_blob, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -896,7 +505,7 @@ static void test_blob_already_cached(mock_server_t *server, oci_fetcher_t *f,
     oci_blob_store_close(store);
 }
 
-static void test_blob_size_mismatch(mock_server_t *server, oci_fetcher_t *f,
+static void test_blob_size_mismatch(oci_mock_server_t *server, oci_fetcher_t *f,
                                     const char *store_root)
 {
     oci_blob_store_t *store = oci_blob_store_open(store_root);
@@ -911,7 +520,7 @@ static void test_blob_size_mismatch(mock_server_t *server, oci_fetcher_t *f,
         .body_len = strlen(HELLO_WORLD),
         .oversize = true,
     };
-    mock_set_handler(server, h_blob, &ctx);
+    oci_mock_set_handler(server, h_blob, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -937,7 +546,7 @@ static void test_blob_size_mismatch(mock_server_t *server, oci_fetcher_t *f,
     oci_blob_store_close(store);
 }
 
-static void test_blob_digest_mismatch(mock_server_t *server, oci_fetcher_t *f,
+static void test_blob_digest_mismatch(oci_mock_server_t *server, oci_fetcher_t *f,
                                       const char *store_root)
 {
     static const char WRONG_HEX[] =
@@ -955,7 +564,7 @@ static void test_blob_digest_mismatch(mock_server_t *server, oci_fetcher_t *f,
         .body = HELLO_WORLD,
         .body_len = strlen(HELLO_WORLD),
     };
-    mock_set_handler(server, h_blob, &ctx);
+    oci_mock_set_handler(server, h_blob, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -980,7 +589,7 @@ static void test_blob_digest_mismatch(mock_server_t *server, oci_fetcher_t *f,
     oci_blob_store_close(store);
 }
 
-static void test_blob_404(mock_server_t *server, oci_fetcher_t *f,
+static void test_blob_404(oci_mock_server_t *server, oci_fetcher_t *f,
                           const char *store_root)
 {
     oci_blob_store_t *store = oci_blob_store_open(store_root);
@@ -989,7 +598,7 @@ static void test_blob_404(mock_server_t *server, oci_fetcher_t *f,
         .body = "x",
         .body_len = 1,
     };
-    mock_set_handler(server, h_blob, &ctx);
+    oci_mock_set_handler(server, h_blob, &ctx);
 
     oci_ref_t ref = {
         .registry = "127.0.0.1:fake",
@@ -1015,7 +624,7 @@ static void test_blob_404(mock_server_t *server, oci_fetcher_t *f,
 
 /* ── Slice 4b cases ──────────────────────────────────────────────── */
 
-static void test_basic_auth_success(mock_server_t *server, const char *base_url,
+static void test_basic_auth_success(oci_mock_server_t *server, const char *base_url,
                                     const char *ca_pem)
 {
     /* alice:secret encoded as base64. */
@@ -1026,7 +635,7 @@ static void test_basic_auth_success(mock_server_t *server, const char *base_url,
         .body_len = strlen("{\"schemaVersion\":2}"),
         .content_type = "application/vnd.oci.image.manifest.v1+json",
     };
-    mock_set_handler(server, h_basic_auth, &ctx);
+    oci_mock_set_handler(server, h_basic_auth, &ctx);
 
     oci_fetcher_options_t opts = {
         .base_url_override = base_url,
@@ -1053,9 +662,9 @@ static void test_basic_auth_success(mock_server_t *server, const char *base_url,
     } else if (resp.http_status != 200) {
         report_fail("basic auth: server accepts credentials", "status=%ld",
                     resp.http_status);
-    } else if (mock_request_count(server) != 1) {
+    } else if (oci_mock_request_count(server) != 1) {
         report_fail("basic auth: server accepts credentials",
-                    "expected 1 request, got %d", mock_request_count(server));
+                    "expected 1 request, got %d", oci_mock_request_count(server));
     } else if (strcmp(server->log[0].authorization,
                       "Basic YWxpY2U6c2VjcmV0") != 0) {
         report_fail("basic auth: server accepts credentials",
@@ -1067,7 +676,7 @@ static void test_basic_auth_success(mock_server_t *server, const char *base_url,
     oci_fetcher_free(f);
 }
 
-static void test_basic_then_bearer(mock_server_t *server, const char *base_url,
+static void test_basic_then_bearer(oci_mock_server_t *server, const char *base_url,
                                    const char *ca_pem)
 {
     static const char BODY[] = "{\"schemaVersion\":2,\"mixed\":true}";
@@ -1080,7 +689,7 @@ static void test_basic_then_bearer(mock_server_t *server, const char *base_url,
         .content_type = "application/vnd.oci.image.manifest.v1+json",
     };
     snprintf(ctx.base_url, sizeof(ctx.base_url), "%s", base_url);
-    mock_set_handler(server, h_basic_then_bearer, &ctx);
+    oci_mock_set_handler(server, h_basic_then_bearer, &ctx);
 
     oci_fetcher_options_t opts = {
         .base_url_override = base_url,
@@ -1132,7 +741,7 @@ static void test_basic_then_bearer(mock_server_t *server, const char *base_url,
     oci_fetcher_free(f);
 }
 
-static void test_insecure_loopback_allowed(mock_server_t *server,
+static void test_insecure_loopback_allowed(oci_mock_server_t *server,
                                            const char *base_url)
 {
     static const char BODY[] = "{\"schemaVersion\":2}";
@@ -1143,7 +752,7 @@ static void test_insecure_loopback_allowed(mock_server_t *server,
         .content_type = "application/vnd.oci.image.manifest.v1+json",
         .docker_digest = NULL,
     };
-    mock_set_handler(server, h_anonymous_manifest, &ctx);
+    oci_mock_set_handler(server, h_anonymous_manifest, &ctx);
 
     /* No ca_file: verification is suppressed via allow_insecure. The loopback
      * registry host (127.0.0.1) is on the whitelist so policy lets the request
@@ -1173,9 +782,9 @@ static void test_insecure_loopback_allowed(mock_server_t *server,
     } else if (resp.http_status != 200) {
         report_fail("insecure: loopback host bypasses TLS verify",
                     "status=%ld", resp.http_status);
-    } else if (mock_request_count(server) != 1) {
+    } else if (oci_mock_request_count(server) != 1) {
         report_fail("insecure: loopback host bypasses TLS verify",
-                    "expected 1 request, got %d", mock_request_count(server));
+                    "expected 1 request, got %d", oci_mock_request_count(server));
     } else {
         report_pass("insecure: loopback host bypasses TLS verify");
     }
@@ -1183,7 +792,7 @@ static void test_insecure_loopback_allowed(mock_server_t *server,
     oci_fetcher_free(f);
 }
 
-static void test_insecure_non_loopback_rejected(mock_server_t *server,
+static void test_insecure_non_loopback_rejected(oci_mock_server_t *server,
                                                 const char *base_url,
                                                 const char *ca_pem)
 {
@@ -1198,7 +807,7 @@ static void test_insecure_non_loopback_rejected(mock_server_t *server,
         .content_type = "application/json",
         .docker_digest = NULL,
     };
-    mock_set_handler(server, h_anonymous_manifest, &ctx);
+    oci_mock_set_handler(server, h_anonymous_manifest, &ctx);
 
     oci_fetcher_options_t opts = {
         .base_url_override = base_url,
@@ -1225,9 +834,9 @@ static void test_insecure_non_loopback_rejected(mock_server_t *server,
     } else if (saved_errno != EPERM) {
         report_fail("insecure: non-loopback host rejected", "errno=%d (%s)",
                     saved_errno, strerror(saved_errno));
-    } else if (mock_request_count(server) != 0) {
+    } else if (oci_mock_request_count(server) != 0) {
         report_fail("insecure: non-loopback host rejected",
-                    "%d request(s) leaked to server", mock_request_count(server));
+                    "%d request(s) leaked to server", oci_mock_request_count(server));
     } else {
         report_pass("insecure: non-loopback host rejected");
     }
@@ -1235,7 +844,7 @@ static void test_insecure_non_loopback_rejected(mock_server_t *server,
     oci_fetcher_free(f);
 }
 
-static void test_ca_file_missing_rejected(mock_server_t *server,
+static void test_ca_file_missing_rejected(oci_mock_server_t *server,
                                           const char *base_url)
 {
     /* No ca_file at all: the mock's self-signed certificate cannot be
@@ -1249,7 +858,7 @@ static void test_ca_file_missing_rejected(mock_server_t *server,
         .content_type = "application/json",
         .docker_digest = NULL,
     };
-    mock_set_handler(server, h_anonymous_manifest, &ctx);
+    oci_mock_set_handler(server, h_anonymous_manifest, &ctx);
 
     oci_fetcher_options_t opts = {.base_url_override = base_url};
     oci_fetcher_t *f = oci_fetcher_new(&opts);
@@ -1280,7 +889,7 @@ static void test_ca_file_missing_rejected(mock_server_t *server,
     oci_fetcher_free(f);
 }
 
-static void test_ca_file_wrong_rejected(mock_server_t *server,
+static void test_ca_file_wrong_rejected(oci_mock_server_t *server,
                                         const char *base_url,
                                         const char *scratch_root)
 {
@@ -1320,7 +929,7 @@ static void test_ca_file_wrong_rejected(mock_server_t *server,
         .content_type = "application/json",
         .docker_digest = NULL,
     };
-    mock_set_handler(server, h_anonymous_manifest, &ctx);
+    oci_mock_set_handler(server, h_anonymous_manifest, &ctx);
 
     oci_fetcher_options_t opts = {
         .base_url_override = base_url,
@@ -1414,23 +1023,23 @@ int main(void)
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
 
-    char *scratch = make_scratch_root();
+    char *scratch = oci_mock_make_scratch_root("elfuse-oci-fetch");
     if (!scratch) {
         fprintf(stderr, "mkdtemp failed: %s\n", strerror(errno));
         return 1;
     }
-    mock_server_t server;
-    if (mock_server_start(&server, scratch) != 0) {
+    oci_mock_server_t server;
+    if (oci_mock_server_start(&server, scratch) != 0) {
         fprintf(stderr, "mock server start failed: %s\n", strerror(errno));
-        wipe_dir(scratch);
+        oci_mock_wipe_dir(scratch);
         free(scratch);
         return 1;
     }
-    char *base_url = make_base_url(server.port);
+    char *base_url = oci_mock_make_base_url(server.port);
     if (!base_url) {
         fprintf(stderr, "oom on base url\n");
-        mock_server_stop(&server);
-        wipe_dir(scratch);
+        oci_mock_server_stop(&server);
+        oci_mock_wipe_dir(scratch);
         free(scratch);
         return 1;
     }
@@ -1446,8 +1055,8 @@ int main(void)
         if (!f) {
             fprintf(stderr, "oci_fetcher_new failed\n");
             free(base_url);
-            mock_server_stop(&server);
-            wipe_dir(scratch);
+            oci_mock_server_stop(&server);
+            oci_mock_wipe_dir(scratch);
             free(scratch);
             return 1;
         }
@@ -1507,14 +1116,14 @@ int main(void)
     test_ca_file_wrong_rejected(&server, base_url, scratch);
 
     free(base_url);
-    mock_server_stop(&server);
+    oci_mock_server_stop(&server);
 
     if (getenv("OCI_FETCH_ONLINE")) {
         printf("oci_fetch (online docker.io)\n");
         test_online_dockerhub();
     }
 
-    wipe_dir(scratch);
+    oci_mock_wipe_dir(scratch);
     free(scratch);
 
     printf("\nResults: %d/%d passed\n", g_passed, g_total);

@@ -7,7 +7,7 @@
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx \
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
-        test-oci-fetch test-oci-fetch-online \
+        test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -44,6 +44,10 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-manifest
 	@printf "\n$(BLUE)━━━ OCI fetch unit tests (offline mock HTTP) ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-fetch
+	@printf "\n$(BLUE)━━━ OCI store unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-store
+	@printf "\n$(BLUE)━━━ OCI pull pipeline unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-pull
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -71,6 +75,14 @@ test-oci-fetch: $(BUILD_DIR)/test-oci-fetch
 ## `make check`.
 test-oci-fetch-online: $(BUILD_DIR)/test-oci-fetch
 	@OCI_FETCH_ONLINE=1 $(BUILD_DIR)/test-oci-fetch
+
+## Run the OCI local store unit tests (native, no HVF)
+test-oci-store: $(BUILD_DIR)/test-oci-store
+	@$(BUILD_DIR)/test-oci-store
+
+## Run the OCI pull pipeline unit tests (native, no HVF, no network)
+test-oci-pull: $(BUILD_DIR)/test-oci-pull
+	@$(BUILD_DIR)/test-oci-pull
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \
