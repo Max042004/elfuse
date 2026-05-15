@@ -5,7 +5,9 @@
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
-        test-full test-multi-vcpu test-rwx test-oci-ref test-sysroot-rename \
+        test-full test-multi-vcpu test-rwx \
+        test-oci-ref test-oci-digest test-oci-blob-store \
+        test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable \
@@ -33,10 +35,22 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-timeout-disable
 	@printf "\n$(BLUE)━━━ OCI reference parser unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-ref
+	@printf "\n$(BLUE)━━━ OCI digest unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-digest
+	@printf "\n$(BLUE)━━━ OCI blob store unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-blob-store
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
 	@$(BUILD_DIR)/test-oci-ref
+
+## Run the OCI digest unit tests (native, no HVF)
+test-oci-digest: $(BUILD_DIR)/test-oci-digest
+	@$(BUILD_DIR)/test-oci-digest
+
+## Run the OCI blob store unit tests (native, no HVF)
+test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store
+	@$(BUILD_DIR)/test-oci-blob-store
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

@@ -65,7 +65,9 @@ SRCS := \
     debug/gdbstub-rsp.c \
     debug/log.c \
     oci/ref.c \
-    oci/cli.c
+    oci/cli.c \
+    oci/digest.c \
+    oci/blob-store.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -133,6 +135,16 @@ $(BUILD_DIR)/test-rwx: $(BUILD_DIR)/test-rwx.o | $(BUILD_DIR)
 ## Build the OCI reference parser unit test (native macOS binary).
 ## Pure C, no HVF, no codesign required.
 $(BUILD_DIR)/test-oci-ref: $(BUILD_DIR)/test-oci-ref.o $(BUILD_DIR)/oci/ref.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI digest unit test (native macOS binary). Pure C, no HVF.
+$(BUILD_DIR)/test-oci-digest: $(BUILD_DIR)/test-oci-digest.o $(BUILD_DIR)/oci/digest.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI blob store unit test (native macOS binary). Pure C, no HVF.
+$(BUILD_DIR)/test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
