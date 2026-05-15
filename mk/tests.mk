@@ -6,7 +6,7 @@
         test-glibc-coreutils test-perf \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx \
-        test-oci-ref test-oci-digest test-oci-blob-store \
+        test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -39,6 +39,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-digest
 	@printf "\n$(BLUE)━━━ OCI blob store unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-blob-store
+	@printf "\n$(BLUE)━━━ OCI manifest parser unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-manifest
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -51,6 +53,10 @@ test-oci-digest: $(BUILD_DIR)/test-oci-digest
 ## Run the OCI blob store unit tests (native, no HVF)
 test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store
 	@$(BUILD_DIR)/test-oci-blob-store
+
+## Run the OCI manifest / index / config parser unit tests (native, no HVF)
+test-oci-manifest: $(BUILD_DIR)/test-oci-manifest
+	@$(BUILD_DIR)/test-oci-manifest
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

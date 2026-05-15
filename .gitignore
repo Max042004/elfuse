@@ -1,6 +1,11 @@
 build/
 archive/
-externals/
+# externals/ holds downloaded fixtures (kernel, rootfs, packages) that are
+# fetched on demand; tracking them in git would balloon the repo. The
+# vendored cJSON tree is an exception: it ships with the source so the
+# OCI parser builds out of the box.
+externals/*
+!externals/cjson/
 lib/modules/
 *.o
 *.bin

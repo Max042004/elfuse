@@ -67,10 +67,24 @@ SRCS := \
     oci/ref.c \
     oci/cli.c \
     oci/digest.c \
-    oci/blob-store.c
+    oci/blob-store.c \
+    oci/media-type.c \
+    oci/manifest.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+
+# Vendored cJSON: third-party MIT JSON parser pinned at v1.7.18. Only OCI
+# translation units include it. Compiles cleanly with the project warning
+# posture, so no per-file CFLAGS override is required.
+CJSON_DIR := externals/cjson
+CJSON_OBJ := $(BUILD_DIR)/externals/cjson/cJSON.o
+OBJS += $(CJSON_OBJ)
+
+$(CJSON_OBJ): $(CJSON_DIR)/cJSON.c $(CJSON_DIR)/cJSON.h | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -c -o $@ $<
 
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
@@ -145,6 +159,11 @@ $(BUILD_DIR)/test-oci-digest: $(BUILD_DIR)/test-oci-digest.o $(BUILD_DIR)/oci/di
 
 ## Build the OCI blob store unit test (native macOS binary). Pure C, no HVF.
 $(BUILD_DIR)/test-oci-blob-store: $(BUILD_DIR)/test-oci-blob-store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI manifest / index / config parser unit test (native, no HVF).
+$(BUILD_DIR)/test-oci-manifest: $(BUILD_DIR)/test-oci-manifest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/digest.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
