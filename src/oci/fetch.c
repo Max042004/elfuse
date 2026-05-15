@@ -51,6 +51,18 @@ struct oci_fetcher {
     char *base_url_override;
     char *bearer_token;
     bearer_challenge_t challenge;
+    /* Pre-built "user:pass" string for CURLOPT_USERPWD. NULL when basic auth
+     * is disabled. The fetcher attaches it to every easy-handle reset (manifest
+     * GET, blob GET, token GET) so a registry that bridges basic and bearer
+     * sees the basic credentials on both the manifest probe and the token
+     * exchange.
+     */
+    char *user_pass;
+    /* PEM bundle path passed through to CURLOPT_CAINFO. NULL leaves libcurl on
+     * its compiled-in trust store.
+     */
+    char *ca_file;
+    bool allow_insecure;
 };
 
 static pthread_once_t g_curl_init_once = PTHREAD_ONCE_INIT;
@@ -88,6 +100,23 @@ static void bearer_challenge_free(bearer_challenge_t *c)
     c->scope = NULL;
 }
 
+static char *build_user_pass(const char *user, const char *pass)
+{
+    if (!user)
+        return NULL;
+    size_t ul = strlen(user);
+    size_t pl = pass ? strlen(pass) : 0;
+    char *out = malloc(ul + 1 + pl + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, user, ul);
+    out[ul] = ':';
+    if (pl)
+        memcpy(out + ul + 1, pass, pl);
+    out[ul + 1 + pl] = '\0';
+    return out;
+}
+
 oci_fetcher_t *oci_fetcher_new(const oci_fetcher_options_t *opts)
 {
     if (oci_fetch_global_init() < 0)
@@ -112,6 +141,29 @@ oci_fetcher_t *oci_fetcher_new(const oci_fetcher_options_t *opts)
             return NULL;
         }
     }
+    if (opts && opts->username) {
+        f->user_pass = build_user_pass(opts->username, opts->password);
+        if (!f->user_pass) {
+            curl_easy_cleanup(f->easy);
+            free(f->base_url_override);
+            free(f);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    if (opts && opts->ca_file) {
+        f->ca_file = strdup(opts->ca_file);
+        if (!f->ca_file) {
+            curl_easy_cleanup(f->easy);
+            free(f->base_url_override);
+            free(f->user_pass);
+            free(f);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    if (opts)
+        f->allow_insecure = opts->allow_insecure;
     return f;
 }
 
@@ -124,6 +176,8 @@ void oci_fetcher_free(oci_fetcher_t *f)
     free(f->base_url_override);
     free(f->bearer_token);
     bearer_challenge_free(&f->challenge);
+    free(f->user_pass);
+    free(f->ca_file);
     free(f);
 }
 
@@ -139,6 +193,97 @@ void oci_fetch_response_free(oci_fetch_response_t *r)
     r->docker_content_digest = NULL;
     r->body_len = 0;
     r->http_status = 0;
+}
+
+/* Strip the [bracketed] form of an IPv6 literal and any trailing :port from a
+ * registry-shaped string ("127.0.0.1:fake", "ghcr.io", "[::1]:5000",
+ * "registry.example.com"). Writes the bare host into out and returns true on
+ * success; returns false when out is too small to fit the result.
+ *
+ * Bracketed IPv6 forms have a colon inside the address, so port-stripping
+ * keys off the closing ']'; for non-bracketed registries the rightmost ':'
+ * is the port delimiter.
+ */
+static bool extract_host_from_registry(const char *reg, char *out, size_t cap)
+{
+    if (!reg || !out || cap == 0)
+        return false;
+    if (reg[0] == '[') {
+        const char *close = strchr(reg, ']');
+        if (!close)
+            return false;
+        size_t n = (size_t) (close - reg - 1);
+        if (n + 1 > cap)
+            return false;
+        memcpy(out, reg + 1, n);
+        out[n] = '\0';
+        return true;
+    }
+    const char *colon = strrchr(reg, ':');
+    size_t n = colon ? (size_t) (colon - reg) : strlen(reg);
+    if (n + 1 > cap)
+        return false;
+    memcpy(out, reg, n);
+    out[n] = '\0';
+    return true;
+}
+
+static bool is_loopback_host(const char *host)
+{
+    if (!host)
+        return false;
+    if (!strcasecmp(host, "127.0.0.1"))
+        return true;
+    if (!strcasecmp(host, "localhost"))
+        return true;
+    if (!strcasecmp(host, "::1"))
+        return true;
+    return false;
+}
+
+/* Reject allow_insecure when the registry host is not on the loopback
+ * whitelist. Honors ref->registry as the authoritative target even when a
+ * test passes base_url_override, so that policy reflects the production
+ * surface ("which host am I pulling from?") rather than where the bytes
+ * happen to flow during a unit test.
+ */
+static int check_insecure_policy(const oci_fetcher_t *f, const oci_ref_t *ref,
+                                 const char **err_msg)
+{
+    if (!f->allow_insecure)
+        return 0;
+    char host[256];
+    if (!extract_host_from_registry(ref->registry, host, sizeof(host))) {
+        if (err_msg)
+            *err_msg = "registry host is malformed";
+        errno = EINVAL;
+        return -1;
+    }
+    if (!is_loopback_host(host)) {
+        if (err_msg)
+            *err_msg = "allow_insecure is restricted to loopback registries";
+        errno = EPERM;
+        return -1;
+    }
+    return 0;
+}
+
+/* Apply the per-fetcher security options to the easy handle in its post-reset
+ * state. Called from every GET path (manifest, blob, token) after
+ * curl_easy_reset so the option set survives the reset.
+ */
+static void apply_security_opts(CURL *easy, const oci_fetcher_t *f)
+{
+    if (f->user_pass) {
+        curl_easy_setopt(easy, CURLOPT_USERPWD, f->user_pass);
+        curl_easy_setopt(easy, CURLOPT_HTTPAUTH, (long) CURLAUTH_BASIC);
+    }
+    if (f->ca_file)
+        curl_easy_setopt(easy, CURLOPT_CAINFO, f->ca_file);
+    if (f->allow_insecure) {
+        curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 }
 
 /* docker.io is the canonical registry name from the reference parser; the
@@ -470,6 +615,7 @@ static int fetch_token(oci_fetcher_t *f, const char **err_msg)
     body_buf_t body = {.max = FETCH_BODY_MAX};
     headers_ctx_t hctx = {0};
     curl_easy_reset(f->easy);
+    apply_security_opts(f->easy, f);
     curl_easy_setopt(f->easy, CURLOPT_URL, url);
     curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
@@ -551,6 +697,7 @@ static int perform_manifest_get(oci_fetcher_t *f,
         bearer_challenge_free(challenge_out);
 
     curl_easy_reset(f->easy);
+    apply_security_opts(f->easy, f);
     curl_easy_setopt(f->easy, CURLOPT_URL, url);
     curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
@@ -609,6 +756,8 @@ int oci_fetch_manifest(oci_fetcher_t *f,
         return -1;
     }
     memset(out, 0, sizeof(*out));
+    if (check_insecure_policy(f, ref, err_msg) < 0)
+        return -1;
     const char *selector = digest_or_tag;
     if (!selector)
         selector = ref->digest;
@@ -707,6 +856,7 @@ static int perform_blob_get(oci_fetcher_t *f,
         bearer_challenge_free(challenge_out);
 
     curl_easy_reset(f->easy);
+    apply_security_opts(f->easy, f);
     curl_easy_setopt(f->easy, CURLOPT_URL, url);
     curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
@@ -761,6 +911,8 @@ int oci_fetch_blob(oci_fetcher_t *f,
         errno = EINVAL;
         return -1;
     }
+    if (check_insecure_policy(f, ref, err_msg) < 0)
+        return -1;
     if (desc->size < 0) {
         if (err_msg)
             *err_msg = "descriptor size is negative";

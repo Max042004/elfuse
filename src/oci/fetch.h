@@ -36,12 +36,31 @@ typedef struct {
     /* Optional override of the registry base URL. When non-NULL, the fetcher
      * uses this prefix for every /v2/... request instead of computing one
      * from ref->registry. Test scaffolding sets this to a local mock
-     * (http://127.0.0.1:<port>); production callers leave it NULL.
-     *
-     * Reserved for slice 4b: username, password, ca_file, allow_insecure.
-     * Treat any unset future field as NULL/false.
+     * (https://127.0.0.1:<port>); production callers leave it NULL.
      */
     const char *base_url_override;
+
+    /* HTTP Basic authentication. When username is non-NULL, libcurl produces
+     * Authorization: Basic <b64(user:pass)> on every request the fetcher
+     * issues, including the token endpoint when the registry also requires a
+     * Bearer flow. password may be NULL for an empty secret.
+     */
+    const char *username;
+    const char *password;
+
+    /* Path to a PEM-encoded CA bundle. When non-NULL the fetcher passes it to
+     * libcurl as CURLOPT_CAINFO, replacing the system trust store for that
+     * connection. Effective only with an OpenSSL-style SSL backend (the
+     * default macOS Secure Transport backend ignores CAINFO).
+     */
+    const char *ca_file;
+
+    /* Disable TLS verification. Honored only when the resolved registry host
+     * is on the loopback whitelist (127.0.0.1, localhost, ::1). Any other
+     * host with allow_insecure=true causes oci_fetch_manifest /
+     * oci_fetch_blob to fail with errno=EPERM before a single byte is sent.
+     */
+    bool allow_insecure;
 } oci_fetcher_options_t;
 
 typedef struct oci_fetcher oci_fetcher_t;

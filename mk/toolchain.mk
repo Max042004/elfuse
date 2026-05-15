@@ -42,3 +42,25 @@ SHIM_ASFLAGS ?= -arch arm64
 
 # clang-format
 CLANG_FORMAT ?= clang-format
+
+# OpenSSL (Homebrew) for the OCI fetch test scaffolding. The mock HTTP server
+# uses libssl/libcrypto to terminate TLS with a self-signed certificate so the
+# ca_file negative cases exercise a real handshake. macOS ships LibreSSL
+# headers in a private framework and does not publish a usable include path
+# under /usr; brew openssl@3 is the documented public location.
+ifeq ($(origin OPENSSL_PREFIX),undefined)
+  ifneq ($(wildcard /opt/homebrew/opt/openssl@3/include/openssl/ssl.h),)
+    OPENSSL_PREFIX := /opt/homebrew/opt/openssl@3
+  else ifneq ($(wildcard /usr/local/opt/openssl@3/include/openssl/ssl.h),)
+    OPENSSL_PREFIX := /usr/local/opt/openssl@3
+  else
+    OPENSSL_PREFIX :=
+  endif
+endif
+ifneq ($(OPENSSL_PREFIX),)
+  OPENSSL_CFLAGS  := -I$(OPENSSL_PREFIX)/include
+  OPENSSL_LDFLAGS := -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
+else
+  OPENSSL_CFLAGS  :=
+  OPENSSL_LDFLAGS := -lssl -lcrypto
+endif

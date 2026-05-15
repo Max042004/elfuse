@@ -170,10 +170,13 @@ $(BUILD_DIR)/test-oci-manifest: $(BUILD_DIR)/test-oci-manifest.o $(BUILD_DIR)/oc
 
 ## Build the OCI fetch (libcurl) unit test (native macOS, no HVF). Pulls in
 ## blob-store + digest + manifest models + cJSON; links against system libcurl
-## and the platform pthread runtime for the in-process mock HTTP server.
+## and the platform pthread runtime for the in-process mock HTTP server. The
+## test mock terminates TLS using libssl from brew openssl@3 so the ca_file
+## negative cases exercise a real certificate verification path.
+$(BUILD_DIR)/test-oci-fetch.o: CFLAGS += $(OPENSSL_CFLAGS)
 $(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
-	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
 
 # ── Guest test binaries (cross-compiled, aarch64-linux) ──────────
 # Only used when GUEST_TEST_BINARIES is not set.
