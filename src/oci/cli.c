@@ -5,9 +5,10 @@
  *
  * Slice 5a turns pull into a real subcommand: argument parsing for --store,
  * -u USER[:PASS], --insecure-ca PEM, --insecure, -q, plus the actual oci_pull
- * invocation against a freshly opened store and fetcher. inspect, prune, and
- * list still rely on inspect's slice-1 canonical-ref print or return rc=2
- * "not implemented yet" (inspect's offline rendering lands in slice 5b).
+ * invocation against a freshly opened store and fetcher. Slice 5b extends
+ * inspect with --store and --all-platforms and an offline manifest tree
+ * renderer (src/oci/inspect.c). prune and list still return rc=2 "not
+ * implemented yet".
  */
 
 #include "cli.h"
@@ -18,6 +19,7 @@
 #include <string.h>
 
 #include "fetch.h"
+#include "inspect.h"
 #include "pull.h"
 #include "ref.h"
 #include "store.h"
@@ -28,10 +30,10 @@ static int print_usage(FILE *out)
         "usage: elfuse oci <subcommand> [args]\n"
         "\n"
         "Subcommands:\n"
-        "  pull [OPTIONS] <ref>  Download an image into the local store\n"
-        "  inspect <ref>         Show the canonical reference and parsed fields\n"
-        "  prune                 Remove unreferenced blobs from the local store\n"
-        "  list                  List images in the local store\n"
+        "  pull    [OPTIONS] <ref>  Download an image into the local store\n"
+        "  inspect [OPTIONS] <ref>  Show the canonical reference and parsed fields\n"
+        "  prune                    Remove unreferenced blobs from the local store\n"
+        "  list                     List images in the local store\n"
         "\n"
         "Pull options:\n"
         "  --store DIR           Override the local store root\n"
@@ -41,6 +43,11 @@ static int print_usage(FILE *out)
         "  --insecure            Skip TLS verify (loopback registries only)\n"
         "  -q, --quiet           Suppress per-blob progress output\n"
         "\n"
+        "Inspect options:\n"
+        "  --store DIR           Override the local store root\n"
+        "  --all-platforms       List every platform entry of an image index\n"
+        "                        instead of drilling into linux/arm64\n"
+        "\n"
         "Refs follow the docker/containerd grammar:\n"
         "  alpine, alpine:3.20, user/repo, ghcr.io/owner/img:tag,\n"
         "  repo@sha256:<hex>, repo:tag@sha256:<hex>\n",
@@ -48,15 +55,67 @@ static int print_usage(FILE *out)
     return out == stderr ? 2 : 0;
 }
 
+/* Argument parser state for `oci inspect`. Mirrors pull_args_t in shape so a
+ * future cleanup could share the flag-loop, but the option set is disjoint
+ * enough that today the two parsers live side by side.
+ */
+typedef struct {
+    const char *store_root;
+    bool show_all_platforms;
+    const char *ref_str;
+} inspect_args_t;
+
+static int parse_inspect_args(int argc, char **argv, inspect_args_t *out)
+{
+    int i = 1;
+    while (i < argc) {
+        const char *a = argv[i];
+        if (a[0] != '-')
+            break;
+        if (!strcmp(a, "--")) {
+            i++;
+            break;
+        }
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            return 1;
+        } else if (!strcmp(a, "--all-platforms")) {
+            out->show_all_platforms = true;
+        } else if (!strcmp(a, "--store")) {
+            if (++i >= argc) {
+                fputs("error: --store needs an argument\n", stderr);
+                return -1;
+            }
+            out->store_root = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown inspect option: %s\n", a);
+            return -1;
+        }
+        i++;
+    }
+    if (i >= argc) {
+        fputs("error: inspect needs a reference argument\n", stderr);
+        return -1;
+    }
+    if (i != argc - 1) {
+        fputs("error: extra arguments after inspect reference\n", stderr);
+        return -1;
+    }
+    out->ref_str = argv[i];
+    return 0;
+}
+
 static int cmd_inspect(int argc, char **argv)
 {
-    if (argc != 2) {
-        fputs("error: inspect takes exactly one reference argument\n", stderr);
+    inspect_args_t args = {0};
+    int prc = parse_inspect_args(argc, argv, &args);
+    if (prc == 1)
+        return print_usage(stdout);
+    if (prc < 0)
         return 2;
-    }
-    oci_ref_t ref;
+
+    oci_ref_t ref = {0};
     const char *err = NULL;
-    if (oci_ref_parse(argv[1], &ref, &err) < 0) {
+    if (oci_ref_parse(args.ref_str, &ref, &err) < 0) {
         fprintf(stderr, "error: %s\n", err ? err : "invalid reference");
         return 1;
     }
@@ -72,8 +131,44 @@ static int cmd_inspect(int argc, char **argv)
     printf("tag:        %s\n", ref.tag ? ref.tag : "(none)");
     printf("digest:     %s\n", ref.digest ? ref.digest : "(none)");
     free(canonical);
+
+    /* Resolve store root: --store override or platform default. */
+    char *default_root = NULL;
+    const char *store_root = args.store_root;
+    if (!store_root) {
+        default_root = oci_store_default_root();
+        if (!default_root) {
+            fprintf(stderr,
+                    "error: could not determine default store root "
+                    "(HOME not set?)\n");
+            oci_ref_free(&ref);
+            return 1;
+        }
+        store_root = default_root;
+    }
+
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        fprintf(stderr, "error: could not open store at %s: %s\n", store_root,
+                strerror(errno));
+        oci_ref_free(&ref);
+        free(default_root);
+        return 1;
+    }
+
+    oci_inspect_options_t opts = {
+        .out = stdout,
+        .show_all_platforms = args.show_all_platforms,
+    };
+    err = NULL;
+    int rc = oci_inspect(store, &ref, &opts, &err);
+    if (rc < 0 && err)
+        fprintf(stderr, "error: %s\n", err);
+
+    oci_store_close(store);
     oci_ref_free(&ref);
-    return 0;
+    free(default_root);
+    return rc < 0 ? 1 : 0;
 }
 
 /* Argument parser state for `oci pull`. Defaults are populated by the caller,

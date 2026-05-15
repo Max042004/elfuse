@@ -72,7 +72,8 @@ SRCS := \
     oci/manifest.c \
     oci/fetch.c \
     oci/store.c \
-    oci/pull.c
+    oci/pull.c \
+    oci/inspect.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -198,6 +199,13 @@ $(BUILD_DIR)/test-oci-pull.o: CFLAGS += $(OPENSSL_CFLAGS)
 $(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
+
+## Build the OCI inspect renderer unit test (native macOS, no HVF). Pure
+## offline: no fetcher, no mock server, no libcurl. Pre-populates the store
+## via oci_blob_store_put_bytes + oci_store_put_ref.
+$(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/inspect.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 # ── Guest test binaries (cross-compiled, aarch64-linux) ──────────
 # Only used when GUEST_TEST_BINARIES is not set.

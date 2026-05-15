@@ -1,0 +1,394 @@
+/* Offline manifest tree renderer for elfuse oci inspect
+ *
+ * Copyright 2026 elfuse contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Reads the blob the local pin points at, classifies it as an image index or
+ * image manifest, and prints a tree. No network, no fetcher. The manifest
+ * model from slice 3 enforces every digest is lowercase and every descriptor
+ * size is non-negative, so the renderer can trust its inputs once the parse
+ * returns 0.
+ *
+ * Detection between index and manifest is structural: oci_index_parse refuses
+ * a body that has no "manifests" array, oci_manifest_parse refuses a body
+ * that has no "config" + "layers" pair. The two parsers therefore reject
+ * disjoint shapes, and trying one then the other is unambiguous. Image
+ * configs never reach this code path because pins point at manifest-shaped
+ * blobs (slice 5a stores the manifest body it received from the registry).
+ */
+
+#include "inspect.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "blob-store.h"
+#include "digest.h"
+#include "manifest.h"
+#include "media-type.h"
+
+/* Upper bound on a manifest/index body. Real manifests are well under 1 MiB;
+ * a 64 MiB cap is generous and prevents a corrupted store from forcing a
+ * pathological malloc.
+ */
+#define INSPECT_BODY_MAX ((size_t) 64 * 1024 * 1024)
+
+/* Render a digest in two compact forms:
+ *
+ *   - short_digest("sha256:abcdef0123456789...")
+ *       -> "sha256:abcdef012345..."   (first 19 chars + "...")
+ *
+ * Matches the slice 5a pull progress line so the two surfaces stay visually
+ * consistent. The caller-supplied buffer keeps the function reentrant; using
+ * one static buffer would clobber on the second %s in a single printf.
+ */
+static void short_digest(const char *full, char out[24])
+{
+    if (!full) {
+        snprintf(out, 24, "(null)");
+        return;
+    }
+    size_t len = strlen(full);
+    if (len <= 22) {
+        snprintf(out, 24, "%s", full);
+        return;
+    }
+    snprintf(out, 24, "%.19s...", full);
+}
+
+/* Compose a "linux/arm64/v8" string from a parsed platform descriptor. The
+ * variant suffix is omitted when the variant field is empty so a platform
+ * with no variant prints as "linux/amd64" rather than "linux/amd64/".
+ */
+static void render_platform(const oci_platform_t *p, char out[64])
+{
+    const char *os = p->os && *p->os ? p->os : "?";
+    const char *arch = p->architecture && *p->architecture ? p->architecture
+                                                           : "?";
+    if (p->variant && *p->variant) {
+        snprintf(out, 64, "%s/%s/%s", os, arch, p->variant);
+    } else {
+        snprintf(out, 64, "%s/%s", os, arch);
+    }
+}
+
+/* Open <store-root>/blobs/<algo>/<hex> and slurp the contents into a fresh
+ * heap buffer. NUL-terminates the buffer so the slice 3 parsers (which accept
+ * exact-length bytes) can also be fed as C strings if a caller wants. On
+ * miss returns -1 with errno=ENOENT; on read failure returns -1 with errno
+ * preserved or set to EIO.
+ */
+static int read_blob_file(oci_blob_store_t *blobs, oci_digest_algo_t algo,
+                          const char *hex, char **out_body, size_t *out_len)
+{
+    char path[4096];
+    int n = oci_blob_store_path(blobs, algo, hex, path, sizeof(path));
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (st.st_size < 0 || (uintmax_t) st.st_size > INSPECT_BODY_MAX) {
+        close(fd);
+        errno = EFBIG;
+        return -1;
+    }
+    size_t want = (size_t) st.st_size;
+    char *buf = malloc(want + 1);
+    if (!buf) {
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t off = 0;
+    while (off < want) {
+        ssize_t r = read(fd, buf + off, want - off);
+        if (r < 0) {
+            int saved = errno;
+            free(buf);
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        if (r == 0)
+            break;
+        off += (size_t) r;
+    }
+    close(fd);
+    if (off != want) {
+        free(buf);
+        errno = EIO;
+        return -1;
+    }
+    buf[want] = '\0';
+    *out_body = buf;
+    *out_len = want;
+    return 0;
+}
+
+/* Print the config + layer table for a parsed manifest. When manifest_digest
+ * is non-NULL, a "manifest: <full digest> (<media type>)" header line goes
+ * first; the direct-manifest path passes NULL so it does not duplicate the
+ * already-printed pin line.
+ */
+static void render_manifest(FILE *out, const oci_manifest_t *mf,
+                            const char *manifest_digest)
+{
+    if (manifest_digest) {
+        const char *mt = oci_media_type_name(mf->media_type);
+        fprintf(out, "manifest:   %s (%s)\n", manifest_digest,
+                mt ? mt : "unknown");
+    }
+    char buf[24];
+    short_digest(mf->config.digest_str, buf);
+    const char *config_mt = oci_media_type_name(mf->config.media_type);
+    fprintf(out, "  config:   %-22s %12" PRId64 "B  %s\n", buf,
+            mf->config.size, config_mt ? config_mt : "unknown");
+    fprintf(out, "  layers:\n");
+    for (size_t i = 0; i < mf->nlayers; i++) {
+        const oci_descriptor_t *l = &mf->layers[i];
+        short_digest(l->digest_str, buf);
+        const char *lmt = oci_media_type_name(l->media_type);
+        fprintf(out, "    [%zu]     %-22s %12" PRId64 "B  %s\n", i, buf,
+                l->size, lmt ? lmt : "unknown");
+    }
+}
+
+/* Render the index entry table. Default mode prints only the picked
+ * linux/arm64 entry (with a "[arm64]" tag); --all-platforms prints every
+ * entry, tagging the picked one so users still see which one elfuse will
+ * resolve.
+ */
+static void render_index_platforms(FILE *out, const oci_index_t *idx,
+                                   const oci_index_entry_t *picked,
+                                   bool show_all)
+{
+    fprintf(out, "platforms:\n");
+    for (size_t i = 0; i < idx->nentries; i++) {
+        const oci_index_entry_t *e = &idx->entries[i];
+        bool is_picked = (e == picked);
+        if (!show_all && !is_picked)
+            continue;
+        char digest_buf[24];
+        short_digest(e->desc.digest_str, digest_buf);
+        char platform_buf[64];
+        render_platform(&e->platform, platform_buf);
+        const char *mt = oci_media_type_name(e->desc.media_type);
+        fprintf(out, "  %-9s %-22s %-22s %12" PRId64 "B  %s\n",
+                is_picked ? "[arm64]" : "", platform_buf, digest_buf,
+                e->desc.size, mt ? mt : "unknown");
+    }
+    fprintf(out, "\n");
+}
+
+int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
+                const oci_inspect_options_t *opts, const char **err_msg)
+{
+    if (!store || !ref || !ref->registry || !ref->repository) {
+        if (err_msg)
+            *err_msg = "invalid arguments";
+        errno = EINVAL;
+        return -1;
+    }
+    FILE *out = opts && opts->out ? opts->out : stdout;
+    bool show_all = opts && opts->show_all_platforms;
+
+    /* 1. Resolve manifest digest from ref. */
+    char *pinned = NULL;
+    bool from_pin = false;
+    if (ref->digest) {
+        pinned = strdup(ref->digest);
+        if (!pinned) {
+            errno = ENOMEM;
+            if (err_msg)
+                *err_msg = "out of memory";
+            return -1;
+        }
+    } else if (ref->tag) {
+        const char *get_err = NULL;
+        int gr = oci_store_get_ref(store, ref, &pinned, &get_err);
+        if (gr < 0) {
+            if (errno == ENOENT) {
+                fprintf(out,
+                        "pinned:     (no local manifest; run 'elfuse oci "
+                        "pull' first)\n");
+                return 0;
+            }
+            if (err_msg)
+                *err_msg = get_err ? get_err : "failed to read pin";
+            return -1;
+        }
+        from_pin = true;
+    } else {
+        /* The slice 1 ref parser defaults tag to "latest" when no digest is
+         * given, so this branch is structurally unreachable through the CLI.
+         * Guard it anyway so a hand-constructed ref does not segfault.
+         */
+        if (err_msg)
+            *err_msg = "ref has neither tag nor digest";
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* 2. Print the pin line. The digest reference annotation tells the user
+     * this came from ref->digest rather than the local pin file.
+     */
+    if (from_pin) {
+        fprintf(out, "pinned:     %s\n", pinned);
+    } else {
+        fprintf(out, "pinned:     %s (digest reference)\n", pinned);
+    }
+
+    /* 3. Validate the digest and read the blob. */
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(pinned, &algo, hex)) {
+        if (err_msg)
+            *err_msg = "pinned digest is malformed";
+        errno = EINVAL;
+        free(pinned);
+        return -1;
+    }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    if (read_blob_file(oci_store_blobs(store), algo, hex, &body, &body_len) <
+        0) {
+        if (errno == ENOENT) {
+            fprintf(out,
+                    "error: manifest blob %s not found in local store\n",
+                    pinned);
+            if (err_msg)
+                *err_msg = "manifest blob missing from local store";
+            free(pinned);
+            errno = ENOENT;
+            return -1;
+        }
+        int saved = errno;
+        if (err_msg)
+            *err_msg = "failed to read manifest blob";
+        free(pinned);
+        errno = saved;
+        return -1;
+    }
+
+    /* 4. Classify: try index first, then manifest. The two parsers reject
+     * disjoint shapes (one requires "manifests", the other requires "config"
+     * + "layers"), so a successful parse is unambiguous.
+     */
+    oci_index_t idx = {0};
+    oci_manifest_t mf = {0};
+    bool is_index = false;
+    bool is_manifest = false;
+    if (oci_index_parse(body, body_len, &idx, NULL) == 0) {
+        is_index = true;
+    } else if (oci_manifest_parse(body, body_len, &mf, NULL) == 0) {
+        is_manifest = true;
+    } else {
+        if (err_msg)
+            *err_msg = "manifest blob is neither a valid index nor manifest";
+        errno = EPROTO;
+        free(body);
+        free(pinned);
+        return -1;
+    }
+
+    /* 5. Render. */
+    int rc = 0;
+    if (is_index) {
+        const char *imt = oci_media_type_name(idx.media_type);
+        fprintf(out, "type:       image index (%s)\n\n",
+                imt ? imt : "unknown");
+
+        const oci_index_entry_t *picked = oci_index_pick_linux_arm64(&idx);
+        render_index_platforms(out, &idx, picked, show_all);
+
+        /* Default mode drills into the picked linux/arm64 sub-manifest. The
+         * --all-platforms request is "show me the cover", not "drill"; skip
+         * the sub-manifest read entirely.
+         */
+        if (!show_all) {
+            if (!picked) {
+                fprintf(out, "error: index has no linux/arm64 entry\n");
+                if (err_msg)
+                    *err_msg = "index has no linux/arm64 entry";
+                errno = ENOENT;
+                rc = -1;
+            } else {
+                char *sub_body = NULL;
+                size_t sub_len = 0;
+                if (read_blob_file(oci_store_blobs(store), picked->desc.algo,
+                                   picked->desc.hex, &sub_body, &sub_len) <
+                    0) {
+                    if (errno == ENOENT) {
+                        fprintf(stderr,
+                                "warning: linux/arm64 manifest blob %s not "
+                                "in local store\n",
+                                picked->desc.digest_str);
+                        if (err_msg)
+                            *err_msg =
+                                "indexed manifest blob missing from local "
+                                "store";
+                        errno = ENOENT;
+                        rc = -1;
+                    } else {
+                        int saved = errno;
+                        if (err_msg)
+                            *err_msg = "failed to read sub-manifest blob";
+                        errno = saved;
+                        rc = -1;
+                    }
+                } else {
+                    oci_manifest_t sub_mf = {0};
+                    if (oci_manifest_parse(sub_body, sub_len, &sub_mf, NULL) ==
+                        0) {
+                        render_manifest(out, &sub_mf, picked->desc.digest_str);
+                        oci_manifest_free(&sub_mf);
+                    } else {
+                        fprintf(out,
+                                "error: sub-manifest blob %s is malformed\n",
+                                picked->desc.digest_str);
+                        if (err_msg)
+                            *err_msg = "sub-manifest is malformed";
+                        errno = EPROTO;
+                        rc = -1;
+                    }
+                    free(sub_body);
+                }
+            }
+        }
+    } else if (is_manifest) {
+        const char *mmt = oci_media_type_name(mf.media_type);
+        fprintf(out, "type:       image manifest (%s)\n\n",
+                mmt ? mmt : "unknown");
+        render_manifest(out, &mf, NULL);
+    }
+
+    /* errno preserved across cleanup, like slice 5a oci_pull. */
+    int saved_errno = errno;
+    oci_index_free(&idx);
+    oci_manifest_free(&mf);
+    free(body);
+    free(pinned);
+    if (rc != 0)
+        errno = saved_errno;
+    return rc;
+}

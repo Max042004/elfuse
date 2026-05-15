@@ -1,0 +1,593 @@
+/* elfuse oci inspect renderer unit tests
+ *
+ * Copyright 2026 elfuse contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Drives oci_inspect against a pre-populated scratch store. The store is
+ * built directly via oci_blob_store_put_bytes + oci_store_put_ref so the
+ * cases stay independent of the slice 4 fetcher and the slice 5a pull
+ * pipeline. open_memstream captures stdout and the assertions grep for
+ * distinctive substrings (digest prefixes, section headers, "[arm64]" tag)
+ * so output format tweaks do not cause spurious failures unless the
+ * semantically-relevant fields disappear.
+ *
+ * Cases:
+ *   1. Direct manifest pull + pin: config + layers section, layer count
+ *   2. Index + arm64 picked: platform table with [arm64] tag, drill prints
+ *      manifest layers
+ *   3. Index + --all-platforms: every platform listed, no drill section
+ *   4. Pin miss: "(no local manifest...)" on stdout, rc=0
+ *   5. ref with digest, blob missing: "error: manifest blob ... not found",
+ *      rc=-1 errno=ENOENT
+ *   6. Index ok, sub-manifest blob missing: stdout contains the platform
+ *      table, rc=-1 errno=ENOENT, err_msg identifies the missing blob
+ */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "oci/blob-store.h"
+#include "oci/digest.h"
+#include "oci/inspect.h"
+#include "oci/ref.h"
+#include "oci/store.h"
+
+#define GREEN "\033[0;32m"
+#define RED "\033[0;31m"
+#define RESET "\033[0m"
+
+static int g_total = 0;
+static int g_passed = 0;
+
+static void report_pass(const char *name)
+{
+    g_total++;
+    g_passed++;
+    printf("  " GREEN "OK" RESET "   %s\n", name);
+}
+
+static void report_fail(const char *name, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void report_fail(const char *name, const char *fmt, ...)
+{
+    g_total++;
+    printf("  " RED "FAIL" RESET " %s", name);
+    if (fmt && *fmt) {
+        printf(": ");
+        va_list ap;
+        va_start(ap, fmt);
+        vprintf(fmt, ap);
+        va_end(ap);
+    }
+    printf("\n");
+}
+
+static int remove_entry(const char *path, const struct stat *st, int typeflag,
+                        struct FTW *ftwbuf)
+{
+    (void) st;
+    (void) typeflag;
+    (void) ftwbuf;
+    return remove(path);
+}
+
+static void wipe_dir(const char *root)
+{
+    (void) nftw(root, remove_entry, 8, FTW_DEPTH | FTW_PHYS);
+}
+
+static char *make_scratch_root(void)
+{
+    char tmpl[] = "/tmp/elfuse-test-oci-inspect-XXXXXX";
+    if (!mkdtemp(tmpl))
+        return NULL;
+    return strdup(tmpl);
+}
+
+/* Drop the manifest body bytes that the slice 5a pull pipeline would
+ * normally have written. Hashes them with SHA-256 so the digest stays
+ * consistent with the bytes the store will serve back.
+ */
+static char *put_manifest_blob(oci_blob_store_t *blobs, const char *body,
+                               size_t body_len, char *out_digest_str,
+                               size_t out_cap, char *out_hex)
+{
+    if (oci_digest_bytes(OCI_DIGEST_SHA256, body, body_len, out_hex) == 0) {
+        fprintf(stderr, "hash failed\n");
+        return NULL;
+    }
+    snprintf(out_digest_str, out_cap, "sha256:%s", out_hex);
+    if (oci_blob_store_put_bytes(blobs, OCI_DIGEST_SHA256, out_hex, body,
+                                 body_len) < 0) {
+        fprintf(stderr, "blob put failed: %s\n", strerror(errno));
+        return NULL;
+    }
+    return out_hex;
+}
+
+static char *vformat(size_t *out_len, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static char *vformat(size_t *out_len, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return NULL;
+    char *r = malloc((size_t) n + 1);
+    if (!r)
+        return NULL;
+    va_start(ap, fmt);
+    vsnprintf(r, (size_t) n + 1, fmt, ap);
+    va_end(ap);
+    *out_len = (size_t) n;
+    return r;
+}
+
+/* Run oci_inspect and return the captured stdout bytes via *out_buf (caller
+ * frees) plus the rc / saved errno / err_msg.
+ */
+typedef struct {
+    int rc;
+    int saved_errno;
+    const char *err_msg;
+    char *out;
+    size_t out_len;
+} inspect_result_t;
+
+static void run_inspect(oci_store_t *store, const oci_ref_t *ref,
+                        const oci_inspect_options_t *base_opts,
+                        inspect_result_t *result)
+{
+    memset(result, 0, sizeof(*result));
+    char *buf = NULL;
+    size_t cap = 0;
+    FILE *fp = open_memstream(&buf, &cap);
+    if (!fp) {
+        result->rc = -1;
+        result->saved_errno = errno;
+        return;
+    }
+    oci_inspect_options_t opts = base_opts ? *base_opts
+                                           : (oci_inspect_options_t){0};
+    opts.out = fp;
+    const char *err = NULL;
+    errno = 0;
+    result->rc = oci_inspect(store, ref, &opts, &err);
+    result->saved_errno = errno;
+    result->err_msg = err;
+    fflush(fp);
+    fclose(fp);
+    result->out = buf;
+    result->out_len = cap;
+}
+
+static bool contains(const char *haystack, const char *needle)
+{
+    return haystack && needle && strstr(haystack, needle) != NULL;
+}
+
+/* ── Case 1: direct manifest ─────────────────────────────────────── */
+
+static void case_direct_manifest(const char *scratch)
+{
+    const char *name = "inspect: direct manifest renders config + layers";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-direct", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    static const char LAYER1[] = "layer-one-bytes";
+    static const char LAYER2[] = "layer-two-bytes-longer";
+    char l1_hex[OCI_DIGEST_HEX_MAX + 1];
+    char l2_hex[OCI_DIGEST_HEX_MAX + 1];
+    char l1_digest[OCI_DIGEST_HEX_MAX + 16];
+    char l2_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, LAYER1, sizeof(LAYER1) - 1, l1_digest,
+                      sizeof(l1_digest), l1_hex);
+    put_manifest_blob(blobs, LAYER2, sizeof(LAYER2) - 1, l2_digest,
+                      sizeof(l2_digest), l2_hex);
+
+    static const char CONFIG[] = "{\"architecture\":\"arm64\"}";
+    char cfg_hex[OCI_DIGEST_HEX_MAX + 1];
+    char cfg_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, CONFIG, sizeof(CONFIG) - 1, cfg_digest,
+                      sizeof(cfg_digest), cfg_hex);
+
+    size_t mlen = 0;
+    char *manifest = vformat(
+        &mlen,
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"config\":{"
+            "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+            "\"digest\":\"%s\",\"size\":%zu},"
+        "\"layers\":["
+            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+             "\"digest\":\"%s\",\"size\":%zu},"
+            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+             "\"digest\":\"%s\",\"size\":%zu}]}",
+        cfg_digest, sizeof(CONFIG) - 1, l1_digest, sizeof(LAYER1) - 1,
+        l2_digest, sizeof(LAYER2) - 1);
+
+    char m_hex[OCI_DIGEST_HEX_MAX + 1];
+    char m_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, manifest, mlen, m_digest, sizeof(m_digest),
+                      m_hex);
+
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &parse_err);
+    oci_store_put_ref(store, &ref, m_digest, NULL);
+
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d errno=%d err=%s", r.rc, r.saved_errno,
+                    r.err_msg ? r.err_msg : "(none)");
+    } else if (!contains(r.out, "pinned:")) {
+        report_fail(name, "missing pinned line");
+    } else if (!contains(r.out, m_digest)) {
+        report_fail(name, "missing manifest digest in output");
+    } else if (!contains(r.out, "type:       image manifest")) {
+        report_fail(name, "missing type line");
+    } else if (!contains(r.out, "config:")) {
+        report_fail(name, "missing config line");
+    } else if (!contains(r.out, "layers:")) {
+        report_fail(name, "missing layers section");
+    } else if (!contains(r.out, "[0]")) {
+        report_fail(name, "missing layer index [0]");
+    } else if (!contains(r.out, "[1]")) {
+        report_fail(name, "missing layer index [1]");
+    } else if (contains(r.out, "[2]")) {
+        report_fail(name, "unexpected layer index [2]");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(manifest);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* ── Helpers for index-based cases ───────────────────────────────── */
+
+/* Three-platform index where linux/arm64/v8 references manifest_digest. The
+ * other two entries point at digests the test never stores; the renderer does
+ * not need them for the default-mode drill.
+ */
+static char *build_index_three_platforms(size_t *out_len,
+                                         const char *arm64_digest,
+                                         size_t arm64_size)
+{
+    return vformat(
+        out_len,
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+        "\"manifests\":["
+          "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+           "\"digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\","
+           "\"size\":1024,"
+           "\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
+          "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+           "\"digest\":\"%s\",\"size\":%zu,"
+           "\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\","
+           "\"variant\":\"v8\"}},"
+          "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+           "\"digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\","
+           "\"size\":1024,"
+           "\"platform\":{\"architecture\":\"s390x\",\"os\":\"linux\"}}]}",
+        arm64_digest, arm64_size);
+}
+
+/* Build a minimal manifest body and persist it. Returns the manifest digest
+ * string (heap, caller frees) for the index to reference.
+ */
+static char *build_and_store_manifest(oci_blob_store_t *blobs, size_t *out_len)
+{
+    static const char BODY[] =
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"config\":{"
+            "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+            "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
+            "00000000000000000000\",\"size\":1},"
+        "\"layers\":["
+            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+             "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
+             "00000000000000000001\",\"size\":2},"
+            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+             "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
+             "00000000000000000002\",\"size\":3}]}";
+    size_t len = sizeof(BODY) - 1;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    char digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!put_manifest_blob(blobs, BODY, len, digest, sizeof(digest), hex))
+        return NULL;
+    *out_len = len;
+    return strdup(digest);
+}
+
+/* ── Case 2: index drills arm64 ──────────────────────────────────── */
+
+static void case_index_default_drills_arm64(const char *scratch)
+{
+    const char *name = "inspect: index drills linux/arm64 manifest";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-idx-default", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    size_t m_len = 0;
+    char *m_digest = build_and_store_manifest(blobs, &m_len);
+
+    size_t idx_len = 0;
+    char *idx_body = build_index_three_platforms(&idx_len, m_digest, m_len);
+    char idx_hex[OCI_DIGEST_HEX_MAX + 1];
+    char idx_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, idx_body, idx_len, idx_digest, sizeof(idx_digest),
+                      idx_hex);
+
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &parse_err);
+    oci_store_put_ref(store, &ref, idx_digest, NULL);
+
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d errno=%d err=%s", r.rc, r.saved_errno,
+                    r.err_msg ? r.err_msg : "(none)");
+    } else if (!contains(r.out, "type:       image index")) {
+        report_fail(name, "missing type=index line");
+    } else if (!contains(r.out, "platforms:")) {
+        report_fail(name, "missing platforms section");
+    } else if (!contains(r.out, "[arm64]")) {
+        report_fail(name, "missing [arm64] tag");
+    } else if (!contains(r.out, "linux/arm64/v8")) {
+        report_fail(name, "missing linux/arm64/v8 platform string");
+    } else if (contains(r.out, "linux/amd64")) {
+        report_fail(name, "amd64 listed in default mode (should be hidden)");
+    } else if (!contains(r.out, "manifest:")) {
+        report_fail(name, "missing drill manifest section");
+    } else if (!contains(r.out, "config:")) {
+        report_fail(name, "missing config line from drill");
+    } else if (!contains(r.out, "layers:")) {
+        report_fail(name, "missing layers section from drill");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(m_digest);
+    free(idx_body);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* ── Case 3: index --all-platforms ───────────────────────────────── */
+
+static void case_index_all_platforms(const char *scratch)
+{
+    const char *name = "inspect: --all-platforms lists every entry, no drill";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-idx-all", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    size_t m_len = 0;
+    char *m_digest = build_and_store_manifest(blobs, &m_len);
+    size_t idx_len = 0;
+    char *idx_body = build_index_three_platforms(&idx_len, m_digest, m_len);
+    char idx_hex[OCI_DIGEST_HEX_MAX + 1];
+    char idx_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, idx_body, idx_len, idx_digest, sizeof(idx_digest),
+                      idx_hex);
+
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &parse_err);
+    oci_store_put_ref(store, &ref, idx_digest, NULL);
+
+    oci_inspect_options_t opts = {.show_all_platforms = true};
+    inspect_result_t r;
+    run_inspect(store, &ref, &opts, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d errno=%d err=%s", r.rc, r.saved_errno,
+                    r.err_msg ? r.err_msg : "(none)");
+    } else if (!contains(r.out, "linux/amd64")) {
+        report_fail(name, "missing linux/amd64 entry");
+    } else if (!contains(r.out, "linux/arm64/v8")) {
+        report_fail(name, "missing linux/arm64/v8 entry");
+    } else if (!contains(r.out, "linux/s390x")) {
+        report_fail(name, "missing linux/s390x entry");
+    } else if (!contains(r.out, "[arm64]")) {
+        report_fail(name, "missing [arm64] tag");
+    } else if (contains(r.out, "manifest:")) {
+        /* The drill section starts with "manifest:". --all-platforms must
+         * not include it.
+         */
+        report_fail(name, "drill section unexpectedly present");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(m_digest);
+    free(idx_body);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* ── Case 4: pin miss ────────────────────────────────────────────── */
+
+static void case_pin_miss(const char *scratch)
+{
+    const char *name = "inspect: pin miss prints informational line, rc=0";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-miss", scratch);
+    oci_store_t *store = oci_store_open(root);
+
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse("alpine:never-pulled", &ref, &parse_err);
+
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d (expected 0)", r.rc);
+    } else if (!contains(r.out, "(no local manifest")) {
+        report_fail(name, "missing informational text");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* ── Case 5: digest ref but blob missing ─────────────────────────── */
+
+static void case_digest_blob_missing(const char *scratch)
+{
+    const char *name = "inspect: digest ref with missing blob errors out";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-digest-missing", scratch);
+    oci_store_t *store = oci_store_open(root);
+
+    /* Use a synthetic digest that the store has never seen. */
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse(
+        "alpine@sha256:00000000000000000000000000000000000000000000000000000000"
+        "00000000",
+        &ref, &parse_err);
+
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != -1) {
+        report_fail(name, "rc=%d (expected -1)", r.rc);
+    } else if (r.saved_errno != ENOENT) {
+        report_fail(name, "errno=%d (expected ENOENT)", r.saved_errno);
+    } else if (!contains(r.out, "error: manifest blob")) {
+        report_fail(name, "missing error line on stdout");
+    } else if (!contains(r.out, "(digest reference)")) {
+        report_fail(name, "missing digest reference annotation");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* ── Case 6: index ok, sub-manifest missing ──────────────────────── */
+
+static void case_sub_manifest_missing(const char *scratch)
+{
+    const char *name =
+        "inspect: index ok but sub-manifest blob missing -> rc=-1, table"
+        " still shown";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-sub-missing", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    /* Reference a manifest digest that is NOT in the store. */
+    static const char ABSENT[] =
+        "sha256:dead00000000000000000000000000000000000000000000000000000000be"
+        "ef";
+    size_t idx_len = 0;
+    char *idx_body = build_index_three_platforms(&idx_len, ABSENT, 1024);
+    char idx_hex[OCI_DIGEST_HEX_MAX + 1];
+    char idx_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, idx_body, idx_len, idx_digest, sizeof(idx_digest),
+                      idx_hex);
+
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &parse_err);
+    oci_store_put_ref(store, &ref, idx_digest, NULL);
+
+    /* Redirect stderr to /dev/null so the warning line does not pollute the
+     * test driver output. The function under test still writes the warning;
+     * scripts key on rc + errno.
+     */
+    int saved_stderr = dup(STDERR_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+    }
+
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (saved_stderr >= 0) {
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
+
+    if (r.rc != -1) {
+        report_fail(name, "rc=%d (expected -1)", r.rc);
+    } else if (r.saved_errno != ENOENT) {
+        report_fail(name, "errno=%d (expected ENOENT)", r.saved_errno);
+    } else if (!contains(r.out, "platforms:")) {
+        report_fail(name, "platform table not on stdout");
+    } else if (!contains(r.out, "[arm64]")) {
+        report_fail(name, "[arm64] tag missing");
+    } else if (!r.err_msg ||
+               !contains(r.err_msg, "indexed manifest blob missing")) {
+        report_fail(name, "err_msg unexpected: %s",
+                    r.err_msg ? r.err_msg : "(null)");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(idx_body);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+int main(void)
+{
+    char *scratch = make_scratch_root();
+    if (!scratch) {
+        fprintf(stderr, "scratch root mkdtemp failed: %s\n", strerror(errno));
+        return 1;
+    }
+    printf("OCI inspect unit tests (scratch=%s)\n", scratch);
+
+    case_direct_manifest(scratch);
+    case_index_default_drills_arm64(scratch);
+    case_index_all_platforms(scratch);
+    case_pin_miss(scratch);
+    case_digest_blob_missing(scratch);
+    case_sub_manifest_missing(scratch);
+
+    wipe_dir(scratch);
+    free(scratch);
+
+    printf("\nResults: %d/%d passed\n", g_passed, g_total);
+    return g_passed == g_total ? 0 : 1;
+}
