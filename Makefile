@@ -275,6 +275,15 @@ $(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
+## Build the OCI fixture builder (Phase 3 compat tests). Standalone tool
+## that synthesises a complete OCI store from uncompressed-tar layers
+## plus image-config flags. Used by tests/test-oci-compat.sh and
+## available standalone for one-off "shape an image from local files"
+## experiments.
+$(BUILD_DIR)/oci-fixture-builder: $(BUILD_DIR)/lib/oci-fixture-builder.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## decompress.c is the only translation unit in elfuse that includes
 ## externals/zstd/lib/zstd.h. Attach the zstd include path as a target-
 ## specific CFLAG so the rest of the codebase never sees zstd headers.

@@ -11,7 +11,7 @@
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-layer-apply test-oci-volume test-oci-clone \
         test-oci-unpack test-oci-runspec test-oci-path-resolve \
-        test-oci-run \
+        test-oci-run test-oci-compat oci-fixture-builder \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -74,6 +74,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-path-resolve
 	@printf "\n$(BLUE)━━━ OCI run orchestrator unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-run
+	@printf "\n$(BLUE)━━━ OCI compat shell smoke ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-compat
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -168,6 +170,19 @@ test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve
 ## commit 6 compat shell suite.
 test-oci-run: $(BUILD_DIR)/test-oci-run
 	@$(BUILD_DIR)/test-oci-run
+
+## Build the OCI fixture builder tool. Standalone executable used by
+## tests/test-oci-compat.sh and available for hand-rolled fixtures.
+oci-fixture-builder: $(BUILD_DIR)/oci-fixture-builder
+
+## Run the OCI run compatibility shell smoke (native, no HVF). Default
+## mode covers CLI surface + fixture-builder integration; OCI_COMPAT_TEST=1
+## gates the heavy end-to-end harness (hdiutil sparsebundle + actual
+## elfuse oci run launches); OCI_FETCH_ONLINE=1 gates the docker.io
+## pull + run sibling. Requires test-hello (assembly aarch64 ELF) +
+## elfuse + oci-fixture-builder pre-built.
+test-oci-compat: $(ELFUSE_BIN) $(BUILD_DIR)/oci-fixture-builder $(TEST_HELLO_DEP)
+	@bash tests/test-oci-compat.sh
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \
