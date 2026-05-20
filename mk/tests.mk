@@ -8,7 +8,7 @@
         test-full test-multi-vcpu test-rwx \
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
-        test-oci-inspect \
+        test-oci-inspect test-oci-tar \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -51,6 +51,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-pull
 	@printf "\n$(BLUE)━━━ OCI inspect renderer unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-inspect
+	@printf "\n$(BLUE)━━━ OCI tar reader unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-tar
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -90,6 +92,10 @@ test-oci-pull: $(BUILD_DIR)/test-oci-pull
 ## Run the OCI inspect renderer unit tests (native, no HVF, no network)
 test-oci-inspect: $(BUILD_DIR)/test-oci-inspect
 	@$(BUILD_DIR)/test-oci-inspect
+
+## Run the OCI tar reader unit tests (native, no HVF, no network)
+test-oci-tar: $(BUILD_DIR)/test-oci-tar
+	@$(BUILD_DIR)/test-oci-tar
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \
