@@ -77,7 +77,8 @@ SRCS := \
     oci/tar.c \
     oci/decompress.c \
     oci/layer-meta.c \
-    oci/layer-apply.c
+    oci/layer-apply.c \
+    oci/volume.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -258,6 +259,14 @@ $(BUILD_DIR)/test-oci-meta: $(BUILD_DIR)/test-oci-meta.o $(BUILD_DIR)/oci/layer-
 ## tar payloads in memory, drives them through oci_layer_apply into a
 ## tmp tree, and verifies filesystem state via lstat/readlink.
 $(BUILD_DIR)/test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/tar.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI volume bootstrap unit test (native macOS, no HVF).
+## Default-volume test is gated behind OCI_VOLUME_TEST=1 because it
+## costs ~150 ms of hdiutil orchestration on first run. Links
+## src/core/sysroot.o for the hdiutil wrappers PR #33 introduced.
+$(BUILD_DIR)/test-oci-volume: $(BUILD_DIR)/test-oci-volume.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
