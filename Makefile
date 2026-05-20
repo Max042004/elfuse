@@ -81,7 +81,10 @@ SRCS := \
     oci/layer-apply.c \
     oci/volume.c \
     oci/clone-rootfs.c \
-    oci/unpack.c
+    oci/unpack.c \
+    oci/runspec.c \
+    oci/path-resolve.c \
+    oci/run.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -261,6 +264,16 @@ $(BUILD_DIR)/test-oci-runspec: $(BUILD_DIR)/test-oci-runspec.o $(BUILD_DIR)/oci/
 $(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD_DIR)/oci/path-resolve.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI run orchestrator unit test (native macOS, no HVF). Links
+## the same OCI graph the unpack test pulls in, plus oci/run.o,
+## oci/runspec.o, and oci/path-resolve.o. Does NOT link core/launch.o:
+## the test ships an in-file elfuse_launch stub that aborts when called,
+## and every case installs a launch hook via oci_run_set_launch_for_testing
+## before invoking oci_run, so the real VM bring-up never runs from a test.
+$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
 ## decompress.c is the only translation unit in elfuse that includes
 ## externals/zstd/lib/zstd.h. Attach the zstd include path as a target-

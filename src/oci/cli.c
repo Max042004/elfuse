@@ -24,6 +24,7 @@
 #include "inspect.h"
 #include "pull.h"
 #include "ref.h"
+#include "run.h"
 #include "store.h"
 #include "unpack.h"
 #include "volume.h"
@@ -41,6 +42,8 @@ static int print_usage(FILE *out)
         "sysroot\n"
         "  clone   [OPTIONS] <ref>  Create a per-run rootfs via APFS "
         "clonefile\n"
+        "  run     [OPTIONS] <ref> [ARG...]\n"
+        "                           Launch a guest binary from a pulled image\n"
         "  prune                    Remove unreferenced blobs from the local "
         "store\n"
         "  list                     List images in the local store\n"
@@ -615,6 +618,8 @@ int oci_cli_main(int argc, char **argv)
         return cmd_unpack(argc - 1, argv + 1);
     if (!strcmp(sub, "clone"))
         return cmd_clone(argc - 1, argv + 1);
+    if (!strcmp(sub, "run"))
+        return oci_cli_run(argc - 1, argv + 1);
     if (!strcmp(sub, "prune"))
         return cmd_not_implemented("prune");
     if (!strcmp(sub, "list") || !strcmp(sub, "ls"))

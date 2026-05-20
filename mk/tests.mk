@@ -11,6 +11,7 @@
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-layer-apply test-oci-volume test-oci-clone \
         test-oci-unpack test-oci-runspec test-oci-path-resolve \
+        test-oci-run \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -71,6 +72,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-runspec
 	@printf "\n$(BLUE)━━━ OCI path-resolve unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-path-resolve
+	@printf "\n$(BLUE)━━━ OCI run orchestrator unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-run
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -156,6 +159,15 @@ test-oci-runspec: $(BUILD_DIR)/test-oci-runspec
 ## EACCES on noexec, ENOENT diagnostics with searched-dirs list.
 test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve
 	@$(BUILD_DIR)/test-oci-path-resolve
+
+## Run the OCI run orchestrator unit tests (native, no HVF, no network).
+## Covers oci_cli_run argument parsing plus oci_run early-failure
+## paths against a case-insensitive volume; the launch backend is
+## stubbed via oci_run_set_launch_for_testing so the test never spins
+## up a real HVF VM. End-to-end launch coverage lives in the Phase 3
+## commit 6 compat shell suite.
+test-oci-run: $(BUILD_DIR)/test-oci-run
+	@$(BUILD_DIR)/test-oci-run
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \
