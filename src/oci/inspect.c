@@ -72,8 +72,8 @@ static void short_digest(const char *full, char out[24])
 static void render_platform(const oci_platform_t *p, char out[64])
 {
     const char *os = p->os && *p->os ? p->os : "?";
-    const char *arch = p->architecture && *p->architecture ? p->architecture
-                                                           : "?";
+    const char *arch =
+        p->architecture && *p->architecture ? p->architecture : "?";
     if (p->variant && *p->variant) {
         snprintf(out, 64, "%s/%s/%s", os, arch, p->variant);
     } else {
@@ -87,8 +87,11 @@ static void render_platform(const oci_platform_t *p, char out[64])
  * miss returns -1 with errno=ENOENT; on read failure returns -1 with errno
  * preserved or set to EIO.
  */
-static int read_blob_file(oci_blob_store_t *blobs, oci_digest_algo_t algo,
-                          const char *hex, char **out_body, size_t *out_len)
+static int read_blob_file(oci_blob_store_t *blobs,
+                          oci_digest_algo_t algo,
+                          const char *hex,
+                          char **out_body,
+                          size_t *out_len)
 {
     char path[4096];
     int n = oci_blob_store_path(blobs, algo, hex, path, sizeof(path));
@@ -144,12 +147,117 @@ static int read_blob_file(oci_blob_store_t *blobs, oci_digest_algo_t algo,
     return 0;
 }
 
+/* Emit one entry of a JSON-style string array with backslash and double-quote
+ * escaping. Control characters pass through verbatim: image-config Entrypoint
+ * and Cmd entries are container argv strings, which in practice never carry
+ * raw control bytes, and a partial JSON escape table would mislead a reader
+ * who expects strict RFC 8259 conformance. Callers downstream of inspect
+ * (commit 2 onward) reparse the array via the cJSON-backed image-config
+ * loader, not by scanning the human-readable inspect output.
+ */
+static void print_quoted_token(FILE *out, const char *s)
+{
+    fputc('"', out);
+    for (const char *p = s; *p; p++) {
+        if (*p == '"' || *p == '\\')
+            fputc('\\', out);
+        fputc(*p, out);
+    }
+    fputc('"', out);
+}
+
+/* Render a NULL-terminated string array as ["a", "b", "c"]. Empty array
+ * (arr[0] == NULL) renders as []. Caller has already pre-checked arr != NULL.
+ */
+static void print_json_string_array(FILE *out, char *const *arr)
+{
+    fputc('[', out);
+    for (size_t i = 0; arr[i] != NULL; i++) {
+        if (i > 0)
+            fputs(", ", out);
+        print_quoted_token(out, arr[i]);
+    }
+    fputc(']', out);
+}
+
+/* Render the image-config runtime block (User, WorkingDir, Entrypoint, Cmd,
+ * Env). Absent fields (NULL pointer in the parsed model) skip the bullet
+ * entirely; empty arrays still print "[]" because that is the
+ * spec-defined "explicit empty" shape and silently hiding it would
+ * misrepresent the image. Label column width is 13 so values align with the
+ * preceding "  config:   " column from render_manifest.
+ *
+ * Multi-line Env: the first var sits on the "env:" line; remaining vars
+ * indent to the value column on continuation lines. Output stays grep-friendly
+ * (each VAR=value on its own line) without sacrificing the leading section
+ * header.
+ */
+static void render_runtime(FILE *out, const oci_image_runtime_t *rt)
+{
+    fprintf(out, "runtime:\n");
+    if (rt->user)
+        fprintf(out, "  user:        %s\n", rt->user);
+    if (rt->working_dir)
+        fprintf(out, "  workingdir:  %s\n", rt->working_dir);
+    if (rt->entrypoint) {
+        fprintf(out, "  entrypoint:  ");
+        print_json_string_array(out, rt->entrypoint);
+        fputc('\n', out);
+    }
+    if (rt->cmd) {
+        fprintf(out, "  cmd:         ");
+        print_json_string_array(out, rt->cmd);
+        fputc('\n', out);
+    }
+    if (rt->env) {
+        if (rt->env[0] == NULL) {
+            fprintf(out, "  env:         []\n");
+        } else {
+            for (size_t i = 0; rt->env[i] != NULL; i++) {
+                fprintf(out, "%s%s\n",
+                        i == 0 ? "  env:         " : "               ",
+                        rt->env[i]);
+            }
+        }
+    }
+}
+
+/* Best-effort read+parse of the image-config blob referenced by a manifest's
+ * config descriptor; on success, emits the runtime block. Failure (blob
+ * missing, parse rejects the body) is silent: the surrounding inspect output
+ * already names the config digest in the layer table, so a reader can chase
+ * it via 'elfuse oci pull' or by inspecting the store directly. Inspect's
+ * primary contract is to render the manifest tree, not to fail when a
+ * pulled image is missing the auxiliary config blob.
+ */
+static void try_render_runtime(FILE *out,
+                               oci_blob_store_t *blobs,
+                               const oci_descriptor_t *config_desc)
+{
+    char *body = NULL;
+    size_t body_len = 0;
+    if (read_blob_file(blobs, config_desc->algo, config_desc->hex, &body,
+                       &body_len) < 0)
+        return;
+    oci_image_config_t cfg = {0};
+    if (oci_image_config_parse(body, body_len, &cfg, NULL) == 0) {
+        render_runtime(out, &cfg.config);
+        oci_image_config_free(&cfg);
+    }
+    free(body);
+}
+
 /* Print the config + layer table for a parsed manifest. When manifest_digest
  * is non-NULL, a "manifest: <full digest> (<media type>)" header line goes
  * first; the direct-manifest path passes NULL so it does not duplicate the
- * already-printed pin line.
+ * already-printed pin line. After the layer table, attempt to render the
+ * image-config runtime block (User, Env, Entrypoint, Cmd, WorkingDir) when
+ * the config blob can be loaded; absent/unreadable config blobs leave the
+ * runtime section out, since the manifest tree itself is the primary signal.
  */
-static void render_manifest(FILE *out, const oci_manifest_t *mf,
+static void render_manifest(FILE *out,
+                            oci_blob_store_t *blobs,
+                            const oci_manifest_t *mf,
                             const char *manifest_digest)
 {
     if (manifest_digest) {
@@ -160,8 +268,8 @@ static void render_manifest(FILE *out, const oci_manifest_t *mf,
     char buf[24];
     short_digest(mf->config.digest_str, buf);
     const char *config_mt = oci_media_type_name(mf->config.media_type);
-    fprintf(out, "  config:   %-22s %12" PRId64 "B  %s\n", buf,
-            mf->config.size, config_mt ? config_mt : "unknown");
+    fprintf(out, "  config:   %-22s %12" PRId64 "B  %s\n", buf, mf->config.size,
+            config_mt ? config_mt : "unknown");
     fprintf(out, "  layers:\n");
     for (size_t i = 0; i < mf->nlayers; i++) {
         const oci_descriptor_t *l = &mf->layers[i];
@@ -170,6 +278,7 @@ static void render_manifest(FILE *out, const oci_manifest_t *mf,
         fprintf(out, "    [%zu]     %-22s %12" PRId64 "B  %s\n", i, buf,
                 l->size, lmt ? lmt : "unknown");
     }
+    try_render_runtime(out, blobs, &mf->config);
 }
 
 /* Render the index entry table. Default mode prints only the picked
@@ -177,7 +286,8 @@ static void render_manifest(FILE *out, const oci_manifest_t *mf,
  * entry, tagging the picked one so users still see which one elfuse will
  * resolve.
  */
-static void render_index_platforms(FILE *out, const oci_index_t *idx,
+static void render_index_platforms(FILE *out,
+                                   const oci_index_t *idx,
                                    const oci_index_entry_t *picked,
                                    bool show_all)
 {
@@ -199,8 +309,10 @@ static void render_index_platforms(FILE *out, const oci_index_t *idx,
     fprintf(out, "\n");
 }
 
-int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
-                const oci_inspect_options_t *opts, const char **err_msg)
+int oci_inspect(oci_store_t *store,
+                const oci_ref_t *ref,
+                const oci_inspect_options_t *opts,
+                const char **err_msg)
 {
     if (!store || !ref || !ref->registry || !ref->repository) {
         if (err_msg)
@@ -273,8 +385,7 @@ int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
     if (read_blob_file(oci_store_blobs(store), algo, hex, &body, &body_len) <
         0) {
         if (errno == ENOENT) {
-            fprintf(out,
-                    "error: manifest blob %s not found in local store\n",
+            fprintf(out, "error: manifest blob %s not found in local store\n",
                     pinned);
             if (err_msg)
                 *err_msg = "manifest blob missing from local store";
@@ -315,8 +426,7 @@ int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
     int rc = 0;
     if (is_index) {
         const char *imt = oci_media_type_name(idx.media_type);
-        fprintf(out, "type:       image index (%s)\n\n",
-                imt ? imt : "unknown");
+        fprintf(out, "type:       image index (%s)\n\n", imt ? imt : "unknown");
 
         const oci_index_entry_t *picked = oci_index_pick_linux_arm64(&idx);
         render_index_platforms(out, &idx, picked, show_all);
@@ -336,8 +446,7 @@ int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
                 char *sub_body = NULL;
                 size_t sub_len = 0;
                 if (read_blob_file(oci_store_blobs(store), picked->desc.algo,
-                                   picked->desc.hex, &sub_body, &sub_len) <
-                    0) {
+                                   picked->desc.hex, &sub_body, &sub_len) < 0) {
                     if (errno == ENOENT) {
                         fprintf(stderr,
                                 "warning: linux/arm64 manifest blob %s not "
@@ -360,7 +469,8 @@ int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
                     oci_manifest_t sub_mf = {0};
                     if (oci_manifest_parse(sub_body, sub_len, &sub_mf, NULL) ==
                         0) {
-                        render_manifest(out, &sub_mf, picked->desc.digest_str);
+                        render_manifest(out, oci_store_blobs(store), &sub_mf,
+                                        picked->desc.digest_str);
                         oci_manifest_free(&sub_mf);
                     } else {
                         fprintf(out,
@@ -379,7 +489,7 @@ int oci_inspect(oci_store_t *store, const oci_ref_t *ref,
         const char *mmt = oci_media_type_name(mf.media_type);
         fprintf(out, "type:       image manifest (%s)\n\n",
                 mmt ? mmt : "unknown");
-        render_manifest(out, &mf, NULL);
+        render_manifest(out, oci_store_blobs(store), &mf, NULL);
     }
 
     /* errno preserved across cleanup, like slice 5a oci_pull. */

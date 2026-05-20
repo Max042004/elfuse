@@ -12,7 +12,8 @@
  * semantically-relevant fields disappear.
  *
  * Cases:
- *   1. Direct manifest pull + pin: config + layers section, layer count
+ *   1. Direct manifest pull + pin: config + layers section, layer count,
+ *      runtime block (user, workingdir, entrypoint, cmd, env all populated)
  *   2. Index + arm64 picked: platform table with [arm64] tag, drill prints
  *      manifest layers
  *   3. Index + --all-platforms: every platform listed, no drill section
@@ -21,6 +22,8 @@
  *      rc=-1 errno=ENOENT
  *   6. Index ok, sub-manifest blob missing: stdout contains the platform
  *      table, rc=-1 errno=ENOENT, err_msg identifies the missing blob
+ *   7. Runtime block with Env=[]: explicit empty array renders as "env: []"
+ *      while absent fields stay omitted
  */
 
 #include <errno.h>
@@ -71,7 +74,9 @@ static void report_fail(const char *name, const char *fmt, ...)
     printf("\n");
 }
 
-static int remove_entry(const char *path, const struct stat *st, int typeflag,
+static int remove_entry(const char *path,
+                        const struct stat *st,
+                        int typeflag,
                         struct FTW *ftwbuf)
 {
     (void) st;
@@ -97,9 +102,12 @@ static char *make_scratch_root(void)
  * normally have written. Hashes them with SHA-256 so the digest stays
  * consistent with the bytes the store will serve back.
  */
-static char *put_manifest_blob(oci_blob_store_t *blobs, const char *body,
-                               size_t body_len, char *out_digest_str,
-                               size_t out_cap, char *out_hex)
+static char *put_manifest_blob(oci_blob_store_t *blobs,
+                               const char *body,
+                               size_t body_len,
+                               char *out_digest_str,
+                               size_t out_cap,
+                               char *out_hex)
 {
     if (oci_digest_bytes(OCI_DIGEST_SHA256, body, body_len, out_hex) == 0) {
         fprintf(stderr, "hash failed\n");
@@ -146,7 +154,8 @@ typedef struct {
     size_t out_len;
 } inspect_result_t;
 
-static void run_inspect(oci_store_t *store, const oci_ref_t *ref,
+static void run_inspect(oci_store_t *store,
+                        const oci_ref_t *ref,
                         const oci_inspect_options_t *base_opts,
                         inspect_result_t *result)
 {
@@ -159,8 +168,8 @@ static void run_inspect(oci_store_t *store, const oci_ref_t *ref,
         result->saved_errno = errno;
         return;
     }
-    oci_inspect_options_t opts = base_opts ? *base_opts
-                                           : (oci_inspect_options_t){0};
+    oci_inspect_options_t opts =
+        base_opts ? *base_opts : (oci_inspect_options_t) {0};
     opts.out = fp;
     const char *err = NULL;
     errno = 0;
@@ -199,7 +208,24 @@ static void case_direct_manifest(const char *scratch)
     put_manifest_blob(blobs, LAYER2, sizeof(LAYER2) - 1, l2_digest,
                       sizeof(l2_digest), l2_hex);
 
-    static const char CONFIG[] = "{\"architecture\":\"arm64\"}";
+    /* Full image-config so inspect's runtime block (added in Phase 3) finds
+     * a parseable blob alongside the manifest. The five runtime fields
+     * (User, WorkingDir, Entrypoint, Cmd, Env) are all populated; rootfs is
+     * the minimum the parser accepts. The diff_id digest is a synthetic
+     * 64-hex-char value so oci_digest_parse validates it.
+     */
+    static const char CONFIG[] =
+        "{\"architecture\":\"arm64\",\"os\":\"linux\","
+        "\"config\":{"
+        "\"User\":\"1000:1000\","
+        "\"WorkingDir\":\"/home/app\","
+        "\"Entrypoint\":[\"/entrypoint.sh\"],"
+        "\"Cmd\":[\"python\",\"main.py\"],"
+        "\"Env\":[\"PATH=/usr/local/bin:/usr/bin:/bin\","
+        "\"HOME=/home/app\"]},"
+        "\"rootfs\":{\"type\":\"layers\",\"diff_ids\":["
+        "\"sha256:00000000000000000000000000000000000000000000000000000000"
+        "00000001\"]}}";
     char cfg_hex[OCI_DIGEST_HEX_MAX + 1];
     char cfg_digest[OCI_DIGEST_HEX_MAX + 16];
     put_manifest_blob(blobs, CONFIG, sizeof(CONFIG) - 1, cfg_digest,
@@ -211,20 +237,19 @@ static void case_direct_manifest(const char *scratch)
         "{\"schemaVersion\":2,"
         "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
         "\"config\":{"
-            "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
-            "\"digest\":\"%s\",\"size\":%zu},"
+        "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+        "\"digest\":\"%s\",\"size\":%zu},"
         "\"layers\":["
-            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
-             "\"digest\":\"%s\",\"size\":%zu},"
-            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
-             "\"digest\":\"%s\",\"size\":%zu}]}",
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"%s\",\"size\":%zu},"
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"%s\",\"size\":%zu}]}",
         cfg_digest, sizeof(CONFIG) - 1, l1_digest, sizeof(LAYER1) - 1,
         l2_digest, sizeof(LAYER2) - 1);
 
     char m_hex[OCI_DIGEST_HEX_MAX + 1];
     char m_digest[OCI_DIGEST_HEX_MAX + 16];
-    put_manifest_blob(blobs, manifest, mlen, m_digest, sizeof(m_digest),
-                      m_hex);
+    put_manifest_blob(blobs, manifest, mlen, m_digest, sizeof(m_digest), m_hex);
 
     oci_ref_t ref = {0};
     const char *parse_err = NULL;
@@ -253,6 +278,22 @@ static void case_direct_manifest(const char *scratch)
         report_fail(name, "missing layer index [1]");
     } else if (contains(r.out, "[2]")) {
         report_fail(name, "unexpected layer index [2]");
+    } else if (!contains(r.out, "runtime:")) {
+        report_fail(name, "missing runtime section header");
+    } else if (!contains(r.out, "user:        1000:1000")) {
+        report_fail(name, "runtime user line missing or misaligned");
+    } else if (!contains(r.out, "workingdir:  /home/app")) {
+        report_fail(name, "runtime workingdir line missing or misaligned");
+    } else if (!contains(r.out, "entrypoint:  [\"/entrypoint.sh\"]")) {
+        report_fail(name, "runtime entrypoint not JSON-array quoted");
+    } else if (!contains(r.out, "cmd:         [\"python\", \"main.py\"]")) {
+        report_fail(name, "runtime cmd not JSON-array quoted with comma+space");
+    } else if (!contains(r.out, "env:         PATH=/usr/local/bin")) {
+        report_fail(name, "runtime env first line missing PATH");
+    } else if (!contains(r.out, "               HOME=/home/app")) {
+        report_fail(name,
+                    "runtime env continuation line missing HOME or"
+                    " misindented");
     } else {
         report_pass(name);
     }
@@ -278,18 +319,20 @@ static char *build_index_three_platforms(size_t *out_len,
         "{\"schemaVersion\":2,"
         "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
         "\"manifests\":["
-          "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
-           "\"digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\","
-           "\"size\":1024,"
-           "\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
-          "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
-           "\"digest\":\"%s\",\"size\":%zu,"
-           "\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\","
-           "\"variant\":\"v8\"}},"
-          "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
-           "\"digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\","
-           "\"size\":1024,"
-           "\"platform\":{\"architecture\":\"s390x\",\"os\":\"linux\"}}]}",
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"sha256:"
+        "1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"size\":1024,"
+        "\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"%s\",\"size\":%zu,"
+        "\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\","
+        "\"variant\":\"v8\"}},"
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"sha256:"
+        "3333333333333333333333333333333333333333333333333333333333333333\","
+        "\"size\":1024,"
+        "\"platform\":{\"architecture\":\"s390x\",\"os\":\"linux\"}}]}",
         arm64_digest, arm64_size);
 }
 
@@ -302,16 +345,16 @@ static char *build_and_store_manifest(oci_blob_store_t *blobs, size_t *out_len)
         "{\"schemaVersion\":2,"
         "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
         "\"config\":{"
-            "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
-            "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
-            "00000000000000000000\",\"size\":1},"
+        "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+        "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
+        "00000000000000000000\",\"size\":1},"
         "\"layers\":["
-            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
-             "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
-             "00000000000000000001\",\"size\":2},"
-            "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
-             "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
-             "00000000000000000002\",\"size\":3}]}";
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
+        "00000000000000000001\",\"size\":2},"
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"sha256:00000000000000000000000000000000000000000000"
+        "00000000000000000002\",\"size\":3}]}";
     size_t len = sizeof(BODY) - 1;
     char hex[OCI_DIGEST_HEX_MAX + 1];
     char digest[OCI_DIGEST_HEX_MAX + 16];
@@ -569,6 +612,91 @@ static void case_sub_manifest_missing(const char *scratch)
     oci_store_close(store);
 }
 
+/* Case 7: runtime block with Env=[] -------------------------------- */
+
+static void case_runtime_empty_env(const char *scratch)
+{
+    const char *name =
+        "inspect: runtime block renders empty Env as [] and omits absent"
+        " bullets";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-runtime-empty-env", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    static const char LAYER[] = "single-layer-bytes";
+    char l_hex[OCI_DIGEST_HEX_MAX + 1];
+    char l_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, LAYER, sizeof(LAYER) - 1, l_digest,
+                      sizeof(l_digest), l_hex);
+
+    /* Env present but explicitly empty; User and WorkingDir omitted entirely
+     * so the renderer must skip their bullets. Cmd populated so the runtime
+     * section still has structural content beyond the empty Env line.
+     */
+    static const char CONFIG[] =
+        "{\"architecture\":\"arm64\",\"os\":\"linux\","
+        "\"config\":{"
+        "\"Cmd\":[\"/bin/echo\",\"hi\"],"
+        "\"Env\":[]},"
+        "\"rootfs\":{\"type\":\"layers\",\"diff_ids\":["
+        "\"sha256:00000000000000000000000000000000000000000000000000000000"
+        "00000002\"]}}";
+    char cfg_hex[OCI_DIGEST_HEX_MAX + 1];
+    char cfg_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, CONFIG, sizeof(CONFIG) - 1, cfg_digest,
+                      sizeof(cfg_digest), cfg_hex);
+
+    size_t mlen = 0;
+    char *manifest = vformat(
+        &mlen,
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"config\":{"
+        "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+        "\"digest\":\"%s\",\"size\":%zu},"
+        "\"layers\":["
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"%s\",\"size\":%zu}]}",
+        cfg_digest, sizeof(CONFIG) - 1, l_digest, sizeof(LAYER) - 1);
+
+    char m_hex[OCI_DIGEST_HEX_MAX + 1];
+    char m_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, manifest, mlen, m_digest, sizeof(m_digest), m_hex);
+
+    oci_ref_t ref = {0};
+    const char *parse_err = NULL;
+    oci_ref_parse("scratch:empty-env", &ref, &parse_err);
+    oci_store_put_ref(store, &ref, m_digest, NULL);
+
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d errno=%d err=%s", r.rc, r.saved_errno,
+                    r.err_msg ? r.err_msg : "(none)");
+    } else if (!contains(r.out, "runtime:")) {
+        report_fail(name, "missing runtime section");
+    } else if (contains(r.out, "user:")) {
+        report_fail(name, "absent User must not render a bullet");
+    } else if (contains(r.out, "workingdir:")) {
+        report_fail(name, "absent WorkingDir must not render a bullet");
+    } else if (contains(r.out, "entrypoint:")) {
+        report_fail(name, "absent Entrypoint must not render a bullet");
+    } else if (!contains(r.out, "cmd:         [\"/bin/echo\", \"hi\"]")) {
+        report_fail(name, "Cmd line missing or not JSON-array quoted");
+    } else if (!contains(r.out, "env:         []")) {
+        report_fail(name, "empty Env must render as []");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(manifest);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
 int main(void)
 {
     char *scratch = make_scratch_root();
@@ -584,6 +712,7 @@ int main(void)
     case_pin_miss(scratch);
     case_digest_blob_missing(scratch);
     case_sub_manifest_missing(scratch);
+    case_runtime_empty_env(scratch);
 
     wipe_dir(scratch);
     free(scratch);
