@@ -8,7 +8,7 @@
         test-full test-multi-vcpu test-rwx \
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
-        test-oci-inspect test-oci-tar \
+        test-oci-inspect test-oci-tar test-oci-decompress \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -53,6 +53,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-inspect
 	@printf "\n$(BLUE)━━━ OCI tar reader unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-tar
+	@printf "\n$(BLUE)━━━ OCI decompression dispatch unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-decompress
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -96,6 +98,10 @@ test-oci-inspect: $(BUILD_DIR)/test-oci-inspect
 ## Run the OCI tar reader unit tests (native, no HVF, no network)
 test-oci-tar: $(BUILD_DIR)/test-oci-tar
 	@$(BUILD_DIR)/test-oci-tar
+
+## Run the OCI decompression dispatch unit tests (native, no HVF, no network)
+test-oci-decompress: $(BUILD_DIR)/test-oci-decompress
+	@$(BUILD_DIR)/test-oci-decompress
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

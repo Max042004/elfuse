@@ -74,7 +74,8 @@ SRCS := \
     oci/store.c \
     oci/pull.c \
     oci/inspect.c \
-    oci/tar.c
+    oci/tar.c \
+    oci/decompress.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -238,6 +239,21 @@ $(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/
 $(BUILD_DIR)/test-oci-tar: $(BUILD_DIR)/test-oci-tar.o $(BUILD_DIR)/oci/tar.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## decompress.c is the only translation unit in elfuse that includes
+## externals/zstd/lib/zstd.h. Attach the zstd include path as a target-
+## specific CFLAG so the rest of the codebase never sees zstd headers.
+$(BUILD_DIR)/oci/decompress.o: CFLAGS += -I$(ZSTD_DIR)/lib
+
+## Build the OCI decompression dispatch unit test (native macOS, no HVF).
+## Links zstd objects + system zlib so gzip and zstd payloads both round-
+## trip through oci_stream_t. The gzip fixture is generated at test time
+## via zlib; the zstd fixture is an embedded byte array because the
+## vendored libzstd is decode-only.
+$(BUILD_DIR)/test-oci-decompress.o: CFLAGS += -I$(ZSTD_DIR)/lib
+$(BUILD_DIR)/test-oci-decompress: $(BUILD_DIR)/test-oci-decompress.o $(BUILD_DIR)/oci/decompress.o $(ZSTD_OBJS) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
 # ── Guest test binaries (cross-compiled, aarch64-linux) ──────────
 # Only used when GUEST_TEST_BINARIES is not set.
