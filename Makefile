@@ -253,6 +253,14 @@ $(BUILD_DIR)/test-oci-runspec: $(BUILD_DIR)/test-oci-runspec.o $(BUILD_DIR)/oci/
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the OCI path-resolve unit test (native macOS, no HVF). Touches
+## the host filesystem to build a small fake sysroot tree and drives
+## oci_path_resolve through realpath / stat / symlink-follow scenarios.
+## Pure C; no libcurl, no zstd, no HVF.
+$(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD_DIR)/oci/path-resolve.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## decompress.c is the only translation unit in elfuse that includes
 ## externals/zstd/lib/zstd.h. Attach the zstd include path as a target-
 ## specific CFLAG so the rest of the codebase never sees zstd headers.

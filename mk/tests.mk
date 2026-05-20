@@ -10,7 +10,7 @@
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-layer-apply test-oci-volume test-oci-clone \
-        test-oci-unpack test-oci-runspec \
+        test-oci-unpack test-oci-runspec test-oci-path-resolve \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -69,6 +69,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-unpack
 	@printf "\n$(BLUE)━━━ OCI runspec resolver unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-runspec
+	@printf "\n$(BLUE)━━━ OCI path-resolve unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-path-resolve
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -147,6 +149,13 @@ test-oci-unpack: $(BUILD_DIR)/test-oci-unpack
 ## outputs against the Phase 3 override matrix and Env policy.
 test-oci-runspec: $(BUILD_DIR)/test-oci-runspec
 	@$(BUILD_DIR)/test-oci-runspec
+
+## Run the OCI guest PATH resolver unit tests (native, no HVF, no network).
+## Builds a fake sysroot tree under /tmp and drives oci_path_resolve
+## against it: PATH search, symlink-follow, escape-symlink skip,
+## EACCES on noexec, ENOENT diagnostics with searched-dirs list.
+test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve
+	@$(BUILD_DIR)/test-oci-path-resolve
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \
