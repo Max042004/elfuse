@@ -22,7 +22,7 @@ NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c tests/test-oci-ref.c \
                 tests/test-oci-inspect.c tests/test-oci-tar.c \
                 tests/test-oci-decompress.c tests/test-oci-meta.c \
                 tests/test-oci-layer-apply.c tests/test-oci-volume.c \
-                tests/test-oci-clone.c
+                tests/test-oci-clone.c tests/test-oci-unpack.c
 SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c
 SPECIAL_TEST_BINS := $(BUILD_DIR)/test-lowbase-mem-200000 $(BUILD_DIR)/test-lowbase-mem-300000
 

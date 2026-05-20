@@ -10,6 +10,7 @@
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-layer-apply test-oci-volume test-oci-clone \
+        test-oci-unpack \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -64,6 +65,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-volume
 	@printf "\n$(BLUE)━━━ OCI clone-rootfs unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-clone
+	@printf "\n$(BLUE)━━━ OCI unpack orchestrator smoke ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-unpack
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -130,6 +133,11 @@ test-oci-volume: $(BUILD_DIR)/test-oci-volume
 ## if the test scratch directory does not support clonefile.
 test-oci-clone: $(BUILD_DIR)/test-oci-clone
 	@$(BUILD_DIR)/test-oci-clone
+
+## Run the OCI unpack orchestrator smoke (native, no HVF). The full
+## end-to-end fixture is gated behind OCI_VOLUME_TEST=1.
+test-oci-unpack: $(BUILD_DIR)/test-oci-unpack
+	@$(BUILD_DIR)/test-oci-unpack
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

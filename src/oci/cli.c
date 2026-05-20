@@ -14,15 +14,19 @@
 #include "cli.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "clone-rootfs.h"
 #include "fetch.h"
 #include "inspect.h"
 #include "pull.h"
 #include "ref.h"
 #include "store.h"
+#include "unpack.h"
+#include "volume.h"
 
 static int print_usage(FILE *out)
 {
@@ -31,13 +35,20 @@ static int print_usage(FILE *out)
         "\n"
         "Subcommands:\n"
         "  pull    [OPTIONS] <ref>  Download an image into the local store\n"
-        "  inspect [OPTIONS] <ref>  Show the canonical reference and parsed fields\n"
-        "  prune                    Remove unreferenced blobs from the local store\n"
+        "  inspect [OPTIONS] <ref>  Show the canonical reference and parsed "
+        "fields\n"
+        "  unpack  [OPTIONS] <ref>  Apply layers into a case-sensitive "
+        "sysroot\n"
+        "  clone   [OPTIONS] <ref>  Create a per-run rootfs via APFS "
+        "clonefile\n"
+        "  prune                    Remove unreferenced blobs from the local "
+        "store\n"
         "  list                     List images in the local store\n"
         "\n"
         "Pull options:\n"
         "  --store DIR           Override the local store root\n"
-        "                        (default: ~/Library/Application Support/elfuse/store)\n"
+        "                        (default: ~/Library/Application "
+        "Support/elfuse/store)\n"
         "  -u, --user USER[:PASS]  HTTP Basic auth for private registries\n"
         "  --insecure-ca PEM     Trust PEM as the registry CA bundle\n"
         "  --insecure            Skip TLS verify (loopback registries only)\n"
@@ -47,6 +58,23 @@ static int print_usage(FILE *out)
         "  --store DIR           Override the local store root\n"
         "  --all-platforms       List every platform entry of an image index\n"
         "                        instead of drilling into linux/arm64\n"
+        "\n"
+        "Unpack options:\n"
+        "  --store DIR           Override the local store root\n"
+        "  --volume DIR          Override the sysroot APFS volume mount point\n"
+        "                        (default: auto-provisioned sparsebundle "
+        "under\n"
+        "                         ~/Library/Application "
+        "Support/elfuse/sysroots/)\n"
+        "  --force               Re-extract even if the image sysroot exists\n"
+        "  -q, --quiet           Suppress per-layer progress output\n"
+        "\n"
+        "Clone options:\n"
+        "  --store DIR           Override the local store root\n"
+        "  --volume DIR          Override the sysroot APFS volume mount point\n"
+        "  --name NAME           Human-friendly suffix for the per-run rootfs\n"
+        "  --keep                Do not register the run dir for cleanup "
+        "(no-op)\n"
         "\n"
         "Refs follow the docker/containerd grammar:\n"
         "  alpine, alpine:3.20, user/repo, ghcr.io/owner/img:tag,\n"
@@ -175,14 +203,14 @@ static int cmd_inspect(int argc, char **argv)
  * then patched by parse_pull_args.
  */
 typedef struct {
-    const char *store_root;  /* heap-owned by main, not by parse */
+    const char *store_root; /* heap-owned by main, not by parse */
     const char *user;
     const char *password;
     const char *ca_file;
     bool allow_insecure;
     bool quiet;
     const char *ref_str;
-    char *user_pass_buf;     /* heap; freed by caller */
+    char *user_pass_buf; /* heap; freed by caller */
 } pull_args_t;
 
 /* Split USER[:PASS] in-place. Returns 0 on success or -1 with errno=ENOMEM. */
@@ -356,6 +384,213 @@ static int cmd_pull(int argc, char **argv)
     return rc < 0 ? 1 : 0;
 }
 
+typedef struct {
+    const char *store_root;
+    const char *volume_root;
+    const char *ref_str;
+    const char *name; /* clone only */
+    bool quiet;
+    bool force_relayer;
+    bool keep_on_exit; /* clone only */
+} unpack_args_t;
+
+static int parse_unpack_args(int argc,
+                             char **argv,
+                             unpack_args_t *out,
+                             bool clone_mode)
+{
+    int i = 1;
+    while (i < argc) {
+        const char *a = argv[i];
+        if (a[0] != '-')
+            break;
+        if (!strcmp(a, "--")) {
+            i++;
+            break;
+        }
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            return 1;
+        } else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) {
+            out->quiet = true;
+        } else if (!strcmp(a, "--force")) {
+            if (clone_mode) {
+                fputs("error: --force is not valid for oci clone\n", stderr);
+                return -1;
+            }
+            out->force_relayer = true;
+        } else if (!strcmp(a, "--keep")) {
+            if (!clone_mode) {
+                fputs("error: --keep is only valid for oci clone\n", stderr);
+                return -1;
+            }
+            out->keep_on_exit = true;
+        } else if (!strcmp(a, "--store")) {
+            if (++i >= argc) {
+                fputs("error: --store needs an argument\n", stderr);
+                return -1;
+            }
+            out->store_root = argv[i];
+        } else if (!strcmp(a, "--volume")) {
+            if (++i >= argc) {
+                fputs("error: --volume needs an argument\n", stderr);
+                return -1;
+            }
+            out->volume_root = argv[i];
+        } else if (clone_mode && !strcmp(a, "--name")) {
+            if (++i >= argc) {
+                fputs("error: --name needs an argument\n", stderr);
+                return -1;
+            }
+            out->name = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown option: %s\n", a);
+            return -1;
+        }
+        i++;
+    }
+    if (i >= argc) {
+        fputs("error: subcommand needs a reference argument\n", stderr);
+        return -1;
+    }
+    if (i != argc - 1) {
+        fputs("error: extra arguments after reference\n", stderr);
+        return -1;
+    }
+    out->ref_str = argv[i];
+    return 0;
+}
+
+static int do_unpack(const unpack_args_t *args,
+                     char **out_image_dir,
+                     oci_store_t **out_store_keep)
+{
+    char *default_root = NULL;
+    const char *store_root = args->store_root;
+    if (!store_root) {
+        default_root = oci_store_default_root();
+        if (!default_root) {
+            fprintf(stderr,
+                    "error: could not determine default store root (HOME?)\n");
+            return 1;
+        }
+        store_root = default_root;
+    }
+
+    oci_ref_t ref = {0};
+    const char *err = NULL;
+    if (oci_ref_parse(args->ref_str, &ref, &err) < 0) {
+        fprintf(stderr, "error: invalid reference: %s\n",
+                err ? err : "(unknown)");
+        free(default_root);
+        return 1;
+    }
+
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        fprintf(stderr, "error: could not open store at %s: %s\n", store_root,
+                strerror(errno));
+        oci_ref_free(&ref);
+        free(default_root);
+        return 1;
+    }
+
+    oci_unpack_options_t uopts = {
+        .volume_root = args->volume_root,
+        .quiet = args->quiet,
+        .force_relayer = args->force_relayer,
+    };
+    err = NULL;
+    int rc = oci_unpack(store, &ref, &uopts, out_image_dir, &err);
+    if (rc < 0) {
+        fprintf(stderr, "error: unpack failed: %s\n",
+                err ? err : strerror(errno));
+        oci_store_close(store);
+        oci_ref_free(&ref);
+        free(default_root);
+        return 1;
+    }
+    oci_ref_free(&ref);
+    free(default_root);
+    if (out_store_keep)
+        *out_store_keep = store;
+    else
+        oci_store_close(store);
+    return 0;
+}
+
+static int cmd_unpack(int argc, char **argv)
+{
+    unpack_args_t args = {0};
+    int prc = parse_unpack_args(argc, argv, &args, false);
+    if (prc == 1)
+        return print_usage(stdout);
+    if (prc < 0)
+        return 2;
+    char *image_dir = NULL;
+    int rc = do_unpack(&args, &image_dir, NULL);
+    if (rc != 0) {
+        free(image_dir);
+        return rc;
+    }
+    /* stdout: just the absolute path so $(elfuse oci unpack ref) composes. */
+    printf("%s\n", image_dir);
+    free(image_dir);
+    return 0;
+}
+
+static int cmd_clone(int argc, char **argv)
+{
+    unpack_args_t args = {0};
+    int prc = parse_unpack_args(argc, argv, &args, true);
+    if (prc == 1)
+        return print_usage(stdout);
+    if (prc < 0)
+        return 2;
+
+    char *image_dir = NULL;
+    oci_store_t *store = NULL;
+    int rc = do_unpack(&args, &image_dir, &store);
+    if (rc != 0) {
+        free(image_dir);
+        return rc;
+    }
+    oci_store_close(store);
+
+    /* Resolve the volume root the same way unpack did so clone-rootfs
+     * lands in the same sparsebundle.
+     */
+    char *volume_root = NULL;
+    const char *err = NULL;
+    if (oci_volume_ensure(args.volume_root, &volume_root, &err) < 0) {
+        fprintf(stderr, "error: volume_ensure failed: %s\n",
+                err ? err : strerror(errno));
+        free(image_dir);
+        return 1;
+    }
+
+    /* image_dir has a trailing slash; strip it for the clone source. */
+    size_t il = strlen(image_dir);
+    if (il > 1 && image_dir[il - 1] == '/')
+        image_dir[il - 1] = '\0';
+
+    char *run_dir = NULL;
+    err = NULL;
+    if (oci_clone_rootfs(image_dir, volume_root, &run_dir, &err) < 0) {
+        fprintf(stderr, "error: clone failed: %s\n",
+                err ? err : strerror(errno));
+        free(image_dir);
+        free(volume_root);
+        return 1;
+    }
+    /* --keep is forward-looking; Phase 2 does not auto-clean either way. */
+    (void) args.keep_on_exit;
+    printf("%s\n", run_dir);
+    free(run_dir);
+    free(image_dir);
+    free(volume_root);
+    return 0;
+}
+
 static int cmd_not_implemented(const char *name)
 {
     fprintf(stderr,
@@ -376,6 +611,10 @@ int oci_cli_main(int argc, char **argv)
         return cmd_inspect(argc - 1, argv + 1);
     if (!strcmp(sub, "pull"))
         return cmd_pull(argc - 1, argv + 1);
+    if (!strcmp(sub, "unpack"))
+        return cmd_unpack(argc - 1, argv + 1);
+    if (!strcmp(sub, "clone"))
+        return cmd_clone(argc - 1, argv + 1);
     if (!strcmp(sub, "prune"))
         return cmd_not_implemented("prune");
     if (!strcmp(sub, "list") || !strcmp(sub, "ls"))
