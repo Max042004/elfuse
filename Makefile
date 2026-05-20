@@ -90,10 +90,34 @@ $(CJSON_OBJ): $(CJSON_DIR)/cJSON.c $(CJSON_DIR)/cJSON.h | $(BUILD_DIR)
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) -c -o $@ $<
 
+# Vendored zstd v1.5.6 (decode-only). Phase 2 OCI layer unpack consumes
+# zstd-compressed layer media types. Compression, dictBuilder, deprecated,
+# and legacy v01-v06 paths are NOT vendored; do not call ZSTD_compress*.
+# Only src/oci/decompress.c includes externals/zstd/lib/zstd.h.
+ZSTD_DIR := externals/zstd
+ZSTD_SRCS := $(wildcard $(ZSTD_DIR)/lib/common/*.c) \
+             $(wildcard $(ZSTD_DIR)/lib/decompress/*.c)
+ZSTD_OBJS := $(patsubst $(ZSTD_DIR)/%.c,$(BUILD_DIR)/externals/zstd/%.o,$(ZSTD_SRCS))
+OBJS += $(ZSTD_OBJS)
+
+ZSTD_CFLAGS := -DZSTD_DISABLE_ASM=1 -DZSTD_LEGACY_SUPPORT=0 \
+               -DZSTD_MULTITHREAD=0 -DZSTDLIB_VISIBILITY= \
+               -Wno-pedantic -Wno-shadow -Wno-strict-prototypes \
+               -Wno-missing-prototypes -Wno-unused-parameter \
+               -Wno-cast-align -Wno-implicit-fallthrough \
+               -I$(ZSTD_DIR)/lib -I$(ZSTD_DIR)/lib/common
+
+$(BUILD_DIR)/externals/zstd/%.o: $(ZSTD_DIR)/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c -o $@ $<
+
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
-HVF_LDFLAGS := -framework Hypervisor -arch arm64 -lcurl
+# -lz: gzip-compressed OCI layers route through zlib (system library).
+# -lcurl: HTTPS fetch for the Phase 1 oci pull path.
+HVF_LDFLAGS := -framework Hypervisor -arch arm64 -lcurl -lz
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.

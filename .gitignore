@@ -2,10 +2,11 @@ build/
 archive/
 # externals/ holds downloaded fixtures (kernel, rootfs, packages) that are
 # fetched on demand; tracking them in git would balloon the repo. The
-# vendored cJSON tree is an exception: it ships with the source so the
-# OCI parser builds out of the box.
+# vendored cJSON and zstd trees are exceptions: they ship with the source
+# so the OCI parser and layer unpacker build out of the box.
 externals/*
 !externals/cjson/
+!externals/zstd/
 lib/modules/
 *.o
 *.bin
