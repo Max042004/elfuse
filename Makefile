@@ -76,7 +76,8 @@ SRCS := \
     oci/inspect.c \
     oci/tar.c \
     oci/decompress.c \
-    oci/layer-meta.c
+    oci/layer-meta.c \
+    oci/layer-apply.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -250,6 +251,13 @@ $(BUILD_DIR)/oci/decompress.o: CFLAGS += -I$(ZSTD_DIR)/lib
 ## C; links against cJSON for the JSON round-trip plus the layer-meta
 ## translation unit.
 $(BUILD_DIR)/test-oci-meta: $(BUILD_DIR)/test-oci-meta.o $(BUILD_DIR)/oci/layer-meta.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI layer applier unit test (native macOS, no HVF). Builds
+## tar payloads in memory, drives them through oci_layer_apply into a
+## tmp tree, and verifies filesystem state via lstat/readlink.
+$(BUILD_DIR)/test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/tar.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

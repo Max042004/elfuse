@@ -9,6 +9,7 @@
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
+        test-oci-layer-apply \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -57,6 +58,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-decompress
 	@printf "\n$(BLUE)━━━ OCI sidecar metadata unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-meta
+	@printf "\n$(BLUE)━━━ OCI layer applier unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-layer-apply
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -108,6 +111,10 @@ test-oci-decompress: $(BUILD_DIR)/test-oci-decompress
 ## Run the OCI sidecar metadata unit tests (native, no HVF, no network)
 test-oci-meta: $(BUILD_DIR)/test-oci-meta
 	@$(BUILD_DIR)/test-oci-meta
+
+## Run the OCI layer applier unit tests (native, no HVF, no network)
+test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply
+	@$(BUILD_DIR)/test-oci-layer-apply
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \
