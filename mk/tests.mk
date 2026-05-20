@@ -10,7 +10,7 @@
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-layer-apply test-oci-volume test-oci-clone \
-        test-oci-unpack \
+        test-oci-unpack test-oci-runspec \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -67,6 +67,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-clone
 	@printf "\n$(BLUE)━━━ OCI unpack orchestrator smoke ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-unpack
+	@printf "\n$(BLUE)━━━ OCI runspec resolver unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-runspec
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -138,6 +140,13 @@ test-oci-clone: $(BUILD_DIR)/test-oci-clone
 ## end-to-end fixture is gated behind OCI_VOLUME_TEST=1.
 test-oci-unpack: $(BUILD_DIR)/test-oci-unpack
 	@$(BUILD_DIR)/test-oci-unpack
+
+## Run the OCI runspec resolver unit tests (native, no HVF, no network).
+## Pure data: feeds hand-built oci_image_runtime_t literals plus synthetic
+## CLI flags through oci_runspec_build and asserts argv / envp / uid / cwd
+## outputs against the Phase 3 override matrix and Env policy.
+test-oci-runspec: $(BUILD_DIR)/test-oci-runspec
+	@$(BUILD_DIR)/test-oci-runspec
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

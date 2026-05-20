@@ -245,6 +245,14 @@ $(BUILD_DIR)/test-oci-tar: $(BUILD_DIR)/test-oci-tar.o $(BUILD_DIR)/oci/tar.o | 
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the OCI runspec unit test (native macOS, no HVF). Pure-data
+## merge of image-config runtime block + CLI overrides; the test feeds
+## oci_image_runtime_t literals directly through oci_runspec_build with
+## no filesystem or libcurl dependency.
+$(BUILD_DIR)/test-oci-runspec: $(BUILD_DIR)/test-oci-runspec.o $(BUILD_DIR)/oci/runspec.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## decompress.c is the only translation unit in elfuse that includes
 ## externals/zstd/lib/zstd.h. Attach the zstd include path as a target-
 ## specific CFLAG so the rest of the codebase never sees zstd headers.
