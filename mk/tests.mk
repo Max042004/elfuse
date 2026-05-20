@@ -9,7 +9,7 @@
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
-        test-oci-layer-apply test-oci-volume \
+        test-oci-layer-apply test-oci-volume test-oci-clone \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
@@ -62,6 +62,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-layer-apply
 	@printf "\n$(BLUE)━━━ OCI volume bootstrap unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-volume
+	@printf "\n$(BLUE)━━━ OCI clone-rootfs unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-clone
 
 ## Run the OCI image reference parser unit tests (native, no HVF)
 test-oci-ref: $(BUILD_DIR)/test-oci-ref
@@ -123,6 +125,11 @@ test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply
 ## hdiutil orchestration is slow.
 test-oci-volume: $(BUILD_DIR)/test-oci-volume
 	@$(BUILD_DIR)/test-oci-volume
+
+## Run the OCI clone-rootfs unit tests (native, no HVF). Skips itself
+## if the test scratch directory does not support clonefile.
+test-oci-clone: $(BUILD_DIR)/test-oci-clone
+	@$(BUILD_DIR)/test-oci-clone
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@tmpdir=$$(mktemp -d); \

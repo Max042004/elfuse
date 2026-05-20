@@ -78,7 +78,8 @@ SRCS := \
     oci/decompress.c \
     oci/layer-meta.c \
     oci/layer-apply.c \
-    oci/volume.c
+    oci/volume.c \
+    oci/clone-rootfs.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -267,6 +268,12 @@ $(BUILD_DIR)/test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply.o $(BUILD_D
 ## costs ~150 ms of hdiutil orchestration on first run. Links
 ## src/core/sysroot.o for the hdiutil wrappers PR #33 introduced.
 $(BUILD_DIR)/test-oci-volume: $(BUILD_DIR)/test-oci-volume.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI clone-rootfs unit test (native macOS, no HVF). The
+## test skips itself if clonefile returns ENOTSUP (non-APFS scratch).
+$(BUILD_DIR)/test-oci-clone: $(BUILD_DIR)/test-oci-clone.o $(BUILD_DIR)/oci/clone-rootfs.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
