@@ -75,7 +75,8 @@ SRCS := \
     oci/pull.c \
     oci/inspect.c \
     oci/tar.c \
-    oci/decompress.c
+    oci/decompress.c \
+    oci/layer-meta.c
 
 SRCS := $(addprefix src/,$(SRCS))
 OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
@@ -244,6 +245,13 @@ $(BUILD_DIR)/test-oci-tar: $(BUILD_DIR)/test-oci-tar.o $(BUILD_DIR)/oci/tar.o | 
 ## externals/zstd/lib/zstd.h. Attach the zstd include path as a target-
 ## specific CFLAG so the rest of the codebase never sees zstd headers.
 $(BUILD_DIR)/oci/decompress.o: CFLAGS += -I$(ZSTD_DIR)/lib
+
+## Build the OCI sidecar metadata unit test (native macOS, no HVF). Pure
+## C; links against cJSON for the JSON round-trip plus the layer-meta
+## translation unit.
+$(BUILD_DIR)/test-oci-meta: $(BUILD_DIR)/test-oci-meta.o $(BUILD_DIR)/oci/layer-meta.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 ## Build the OCI decompression dispatch unit test (native macOS, no HVF).
 ## Links zstd objects + system zlib so gzip and zstd payloads both round-
