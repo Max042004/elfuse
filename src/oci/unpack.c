@@ -169,14 +169,21 @@ static int reverify_layer_digest(oci_blob_store_t *bs,
     return 0;
 }
 
-static int apply_one_layer(oci_blob_store_t *bs,
-                           const oci_descriptor_t *desc,
-                           const char *root_dir,
-                           oci_meta_table_t *meta,
-                           bool quiet,
-                           size_t idx,
-                           const char **err)
+int oci_unpack_layer(oci_blob_store_t *bs,
+                     const oci_descriptor_t *desc,
+                     const char *stage_dir,
+                     oci_layer_apply_stats_t *stats,
+                     oci_meta_table_t *meta,
+                     const char *log_label,
+                     const char **err)
 {
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!bs || !desc || !stage_dir)
+        return set_err(err, "unpack_layer: NULL argument", EINVAL);
+
     if (oci_media_type_is_foreign(desc->media_type))
         return set_err(err, "unpack: layer is foreign / nondistributable",
                        ENOTSUP);
@@ -204,11 +211,11 @@ static int apply_one_layer(oci_blob_store_t *bs,
         return set_err(err, "unpack: tar reader alloc failed", ENOMEM);
     }
 
-    if (!quiet)
-        fprintf(stderr, "  layer %zu: %s\n", idx + 1, desc->digest_str);
+    if (log_label)
+        fprintf(stderr, "  %s: %s\n", log_label, desc->digest_str);
 
-    oci_layer_apply_stats_t stats = {0};
-    int rc = oci_layer_apply(r, root_dir, &stats, meta, err);
+    oci_layer_apply_stats_t local_stats = {0};
+    int rc = oci_layer_apply(r, stage_dir, &local_stats, meta, err);
 
     oci_tar_reader_free(r);
     oci_stream_close(stream);
@@ -216,12 +223,21 @@ static int apply_one_layer(oci_blob_store_t *bs,
 
     if (rc < 0)
         return -1;
-    if (!quiet)
+    if (stats) {
+        stats->files += local_stats.files;
+        stats->dirs += local_stats.dirs;
+        stats->symlinks += local_stats.symlinks;
+        stats->hardlinks += local_stats.hardlinks;
+        stats->whiteouts += local_stats.whiteouts;
+        stats->opaques += local_stats.opaques;
+    }
+    if (log_label)
         fprintf(stderr,
                 "    +files=%zu dirs=%zu symlinks=%zu hardlinks=%zu "
                 "whiteouts=%zu opaques=%zu\n",
-                stats.files, stats.dirs, stats.symlinks, stats.hardlinks,
-                stats.whiteouts, stats.opaques);
+                local_stats.files, local_stats.dirs, local_stats.symlinks,
+                local_stats.hardlinks, local_stats.whiteouts,
+                local_stats.opaques);
     return 0;
 }
 
@@ -445,8 +461,14 @@ int oci_unpack(oci_store_t *store,
     }
 
     for (size_t i = 0; i < manifest.nlayers; i++) {
-        if (apply_one_layer(bs, &manifest.layers[i], stage_dir, meta, quiet, i,
-                            err) < 0) {
+        char label[32];
+        const char *log_label = NULL;
+        if (!quiet) {
+            snprintf(label, sizeof(label), "layer %zu", i + 1);
+            log_label = label;
+        }
+        if (oci_unpack_layer(bs, &manifest.layers[i], stage_dir, NULL, meta,
+                             log_label, err) < 0) {
             oci_meta_table_free(meta);
             free(image_hex);
             oci_manifest_free(&manifest);
