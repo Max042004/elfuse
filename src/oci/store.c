@@ -119,6 +119,30 @@ static const char NO_MIGRATE_ENV[] = "ELFUSE_OCI_NO_MIGRATE";
  */
 static int migrate_legacy_refs(struct oci_store *s);
 
+/* Plan 3 C3.3b: probe <root>/layers/.schema and migrate v1 stores to v2.
+ *
+ * Behaviour matrix at oci_store_open time:
+ *
+ *   - marker present + schemaVersion == 2: no-op.
+ *   - marker present + other schemaVersion or unparseable JSON: fail with
+ *     errno=EINVAL so a forward-incompatible store does not get silently
+ *     repopulated under the wrong shape.
+ *   - marker absent + ELFUSE_OCI_NO_MIGRATE set: no-op (inspection mode;
+ *     analogous to the C2.3 refs/ -> index.json gate).
+ *   - marker absent + <root>/layers/sha256/ empty: write v2 marker.
+ *   - marker absent + <root>/layers/sha256/ populated: wipe every direct
+ *     child entry under layers/sha256/ (C3.2 cumulative-by-diff_id entries
+ *     are not v2-compatible; reachability is recomputable from manifests
+ *     at unpack time) and then write the v2 marker.
+ *
+ * The wipe + write runs under flock(<root>/index.json.lock, LOCK_EX) and
+ * re-stats the marker under hold so a concurrent opener does not double
+ * migrate. The wipe is scoped to <root>/layers/sha256/ children only;
+ * blobs/, images/, tmp/, refs/, index.json, and layers/.staging/ are
+ * never touched.
+ */
+static int ensure_layer_schema_marker(const char *root);
+
 /* Idempotently write <root>/oci-layout. Returns 0 on success or when the
  * marker already exists, -1 on any unexpected IO failure. The write uses a
  * pid + counter-suffixed tmp file plus link(2) so a concurrent opener never
@@ -239,6 +263,12 @@ oci_store_t *oci_store_open(const char *root)
         return NULL;
     }
     if (ensure_layer_dirs(root) < 0) {
+        int saved = errno;
+        oci_blob_store_close(blobs);
+        errno = saved;
+        return NULL;
+    }
+    if (ensure_layer_schema_marker(root) < 0) {
         int saved = errno;
         oci_blob_store_close(blobs);
         errno = saved;
@@ -2277,4 +2307,322 @@ int oci_store_layer_commit(oci_store_t *s,
     *err = "layer_commit: rename to layers/<algo>/<hex>/ failed";
     errno = saved;
     return -1;
+}
+
+/* --- Plan 3 C3.3b: layer cache schema marker --------------------------- */
+
+/* Relative path of the schema marker beneath the store root. */
+static const char LAYER_SCHEMA_REL_PATH[] = "layers/.schema";
+
+/* Schema version this build writes and accepts. v1 was the implicit
+ * C3.2 cumulative-by-diff_id layout (no marker). v2 will be the C3.3
+ * raw per-layer payload plus ChainID stack cache. C3.3b lands the
+ * marker + migration; C3.3c will rewrite the unpack assembly to
+ * populate and consume the v2 cache.
+ */
+#define LAYER_SCHEMA_VERSION_CURRENT 2
+
+/* Body written on first migration to v2. The description field is
+ * informational; readers only key on schemaVersion. Trailing newline
+ * matches the oci-layout marker convention. */
+static const char LAYER_SCHEMA_V2_BODY[] =
+    "{\"schemaVersion\":2,"
+    "\"description\":\"raw per-layer payload + ChainID stack cache\"}\n";
+
+/* Upper bound on the marker file size. The expected body is ~80 bytes;
+ * anything larger is treated as a malformed marker rather than parsed.
+ */
+#define LAYER_SCHEMA_MAX_BYTES 4096
+
+/* Counter used for the marker's tmp file suffix; kept distinct from the
+ * oci-layout counter so the two helpers do not contend on the same
+ * monotonic source.
+ */
+static unsigned long layer_schema_seq(void)
+{
+    static unsigned long n = 0;
+    return __sync_add_and_fetch(&n, 1);
+}
+
+/* Read <root>/layers/.schema and extract the schemaVersion field. On
+ * success returns 0 and writes the parsed integer to *out_version. On
+ * failure returns -1 with errno set (ENOENT when the marker is absent;
+ * EINVAL for unparseable JSON, missing schemaVersion field, wrong type,
+ * non-regular file, or size out of range; other errno values propagated
+ * from open / read / fstat). When non-NULL, *out_reason is populated on
+ * the -1 paths with a static description for the caller to surface via
+ * stderr.
+ */
+static int read_layer_schema_version(const char *root, int *out_version,
+                                     const char **out_reason)
+{
+    if (out_reason)
+        *out_reason = NULL;
+    char path[STORE_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, LAYER_SCHEMA_REL_PATH);
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        if (out_reason)
+            *out_reason = "layers/.schema path exceeds STORE_PATH_MAX";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            if (out_reason)
+                *out_reason = "layers/.schema absent";
+            return -1;
+        }
+        if (out_reason)
+            *out_reason = "open layers/.schema failed";
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int saved = errno;
+        close(fd);
+        if (out_reason)
+            *out_reason = "fstat layers/.schema failed";
+        errno = saved;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        if (out_reason)
+            *out_reason = "layers/.schema is not a regular file";
+        errno = EINVAL;
+        return -1;
+    }
+    if (st.st_size <= 0 || st.st_size > LAYER_SCHEMA_MAX_BYTES) {
+        close(fd);
+        if (out_reason)
+            *out_reason = "layers/.schema size out of range";
+        errno = EINVAL;
+        return -1;
+    }
+    char buf[LAYER_SCHEMA_MAX_BYTES + 1];
+    ssize_t got = read(fd, buf, (size_t) st.st_size);
+    close(fd);
+    if (got != (ssize_t) st.st_size) {
+        if (out_reason)
+            *out_reason = "read layers/.schema failed";
+        errno = EIO;
+        return -1;
+    }
+    buf[got] = '\0';
+    cJSON *json = cJSON_Parse(buf);
+    if (!json) {
+        if (out_reason)
+            *out_reason = "layers/.schema JSON parse failed";
+        errno = EINVAL;
+        return -1;
+    }
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(json, "schemaVersion");
+    if (!cJSON_IsNumber(v)) {
+        cJSON_Delete(json);
+        if (out_reason)
+            *out_reason = "layers/.schema schemaVersion missing or not a number";
+        errno = EINVAL;
+        return -1;
+    }
+    int version = v->valueint;
+    cJSON_Delete(json);
+    *out_version = version;
+    return 0;
+}
+
+/* Recursively remove every direct child of <root>/layers/sha256/, leaving
+ * the layers/sha256/ directory itself in place. Each child is dispatched
+ * through layer_stage_rm so symlinks, regular files, and nested
+ * directories are all handled identically. On the first IO failure the
+ * call returns -1 with errno preserved; *out_removed reflects the entry
+ * count successfully removed before the error. layer_stage_rm is
+ * ENOENT-tolerant so a partial wipe resumes cleanly on a later open.
+ */
+static int wipe_layers_sha256(const char *root, size_t *out_removed)
+{
+    *out_removed = 0;
+    char dir_path[STORE_PATH_MAX];
+    int n = snprintf(dir_path, sizeof(dir_path), "%s/layers/sha256", root);
+    if (n < 0 || (size_t) n >= sizeof(dir_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        if (errno == ENOENT)
+            return 0;
+        return -1;
+    }
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char child[STORE_PATH_MAX];
+        int cn = snprintf(child, sizeof(child), "%s/%s", dir_path, de->d_name);
+        if (cn < 0 || (size_t) cn >= sizeof(child)) {
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+        if (layer_stage_rm(child) < 0) {
+            rc = -1;
+            break;
+        }
+        (*out_removed)++;
+    }
+    closedir(d);
+    return rc;
+}
+
+/* Write <root>/layers/.schema atomically. The body is materialized into a
+ * pid + counter-suffixed tmp file, fsynced, and renamed into place. The
+ * caller must hold flock(<root>/index.json.lock, LOCK_EX) so two openers
+ * cannot race the rename. Returns 0 on success, -1 with errno preserved
+ * on any IO failure (the tmp file is removed before returning).
+ */
+static int write_layer_schema_v2(const char *root)
+{
+    char path[STORE_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, LAYER_SCHEMA_REL_PATH);
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char tmp[STORE_PATH_MAX];
+    n = snprintf(tmp, sizeof(tmp), "%s.tmp-%d-%lu", path, (int) getpid(),
+                 layer_schema_seq());
+    if (n < 0 || (size_t) n >= sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0)
+        return -1;
+    size_t body_len = sizeof(LAYER_SCHEMA_V2_BODY) - 1;
+    if (write(fd, LAYER_SCHEMA_V2_BODY, body_len) != (ssize_t) body_len) {
+        int saved = errno;
+        close(fd);
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    if (fsync(fd) < 0) {
+        int saved = errno;
+        close(fd);
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    if (close(fd) < 0) {
+        int saved = errno;
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    if (rename(tmp, path) < 0) {
+        int saved = errno;
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+static int ensure_layer_schema_marker(const char *root)
+{
+    /* First probe is lock-free so the marker-present fast path does not
+     * pay the flock cost on every open. */
+    int version = 0;
+    const char *reason = NULL;
+    int rc = read_layer_schema_version(root, &version, &reason);
+    if (rc == 0) {
+        if (version == LAYER_SCHEMA_VERSION_CURRENT)
+            return 0;
+        fprintf(stderr,
+                "elfuse oci: unsupported layers schema version %d at %s; "
+                "this build understands up to %d\n",
+                version, root, LAYER_SCHEMA_VERSION_CURRENT);
+        errno = EINVAL;
+        return -1;
+    }
+    if (errno != ENOENT) {
+        int saved = errno;
+        fprintf(stderr, "elfuse oci: layers/.schema unreadable at %s: %s\n",
+                root, reason ? reason : "unknown error");
+        errno = saved;
+        return -1;
+    }
+
+    /* Marker absent. ELFUSE_OCI_NO_MIGRATE leaves the store untouched so
+     * a downgrade test or recovery workflow can inspect any pre-existing
+     * v1 entries without the daemon helpfully rewriting state. */
+    const char *no_migrate = getenv(NO_MIGRATE_ENV);
+    if (no_migrate && *no_migrate)
+        return 0;
+
+    const char *lock_err = NULL;
+    int lock_fd = acquire_index_lock(root, &lock_err);
+    if (lock_fd < 0) {
+        int saved = errno;
+        fprintf(stderr, "elfuse oci: %s\n",
+                lock_err ? lock_err : "failed to acquire index.json.lock");
+        errno = saved;
+        return -1;
+    }
+
+    /* Re-stat under hold: a racing opener may already have migrated. */
+    rc = read_layer_schema_version(root, &version, &reason);
+    if (rc == 0) {
+        close(lock_fd);
+        if (version == LAYER_SCHEMA_VERSION_CURRENT)
+            return 0;
+        fprintf(stderr,
+                "elfuse oci: unsupported layers schema version %d at %s; "
+                "this build understands up to %d\n",
+                version, root, LAYER_SCHEMA_VERSION_CURRENT);
+        errno = EINVAL;
+        return -1;
+    }
+    if (errno != ENOENT) {
+        int saved = errno;
+        close(lock_fd);
+        fprintf(stderr, "elfuse oci: layers/.schema unreadable at %s: %s\n",
+                root, reason ? reason : "unknown error");
+        errno = saved;
+        return -1;
+    }
+
+    /* Marker still absent under hold: wipe pre-existing v1 entries and
+     * publish the v2 marker. */
+    size_t removed = 0;
+    if (wipe_layers_sha256(root, &removed) < 0) {
+        int saved = errno;
+        close(lock_fd);
+        fprintf(stderr,
+                "elfuse oci: failed to migrate layer cache schema at %s: "
+                "wipe partial (%zu entr%s removed before error)\n",
+                root, removed, removed == 1 ? "y" : "ies");
+        errno = saved;
+        return -1;
+    }
+    if (removed > 0) {
+        fprintf(stderr,
+                "elfuse oci: layer cache schema v1 detected; cleared %zu "
+                "entr%s from %s/layers/sha256 to migrate to v2 "
+                "(raw + ChainID stack)\n",
+                removed, removed == 1 ? "y" : "ies", root);
+    }
+
+    if (write_layer_schema_v2(root) < 0) {
+        int saved = errno;
+        close(lock_fd);
+        fprintf(stderr,
+                "elfuse oci: failed to write layers/.schema at %s\n", root);
+        errno = saved;
+        return -1;
+    }
+    close(lock_fd);
+    return 0;
 }

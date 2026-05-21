@@ -3534,6 +3534,374 @@ static void test_layer_commit_rename_race_benign(const char *scratch)
     report_pass(name);
 }
 
+/* --- Plan 3 C3.3b: layer cache schema marker tests --------------------- */
+
+static void test_layer_schema_written_on_fresh_open(const char *scratch)
+{
+    const char *name = "layer_schema_written_on_fresh_open";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-schema-fresh", scratch);
+
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    oci_store_close(s);
+
+    char marker_path[2048];
+    snprintf(marker_path, sizeof(marker_path), "%s/layers/.schema", root);
+    struct stat st;
+    if (stat(marker_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail(name, "marker missing or not a regular file");
+        return;
+    }
+    char body[4096];
+    size_t got = 0;
+    if (!read_whole(marker_path, body, sizeof(body), &got) || got == 0) {
+        report_fail(name, "read marker failed");
+        return;
+    }
+    cJSON *json = cJSON_Parse(body);
+    if (!json) {
+        report_fail(name, "marker JSON unparseable");
+        return;
+    }
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(json, "schemaVersion");
+    if (!cJSON_IsNumber(v) || v->valueint != 2) {
+        report_fail(name, "schemaVersion missing or not 2");
+        cJSON_Delete(json);
+        return;
+    }
+    cJSON *d = cJSON_GetObjectItemCaseSensitive(json, "description");
+    if (!cJSON_IsString(d) || !d->valuestring || d->valuestring[0] == '\0') {
+        report_fail(name, "description missing");
+        cJSON_Delete(json);
+        return;
+    }
+    cJSON_Delete(json);
+    report_pass(name);
+}
+
+static void test_layer_schema_idempotent_reopen(const char *scratch)
+{
+    const char *name = "layer_schema_idempotent_reopen";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-schema-idem", scratch);
+
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    oci_store_close(s);
+
+    char marker_path[2048];
+    snprintf(marker_path, sizeof(marker_path), "%s/layers/.schema", root);
+    struct stat before;
+    char before_buf[4096];
+    size_t before_len = 0;
+    if (stat(marker_path, &before) != 0 ||
+        !read_whole(marker_path, before_buf, sizeof(before_buf), &before_len)) {
+        report_fail(name, "pre-reopen snapshot failed");
+        return;
+    }
+
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "reopen failed");
+        return;
+    }
+    oci_store_close(s);
+
+    struct stat after;
+    char after_buf[4096];
+    size_t after_len = 0;
+    if (stat(marker_path, &after) != 0 ||
+        !read_whole(marker_path, after_buf, sizeof(after_buf), &after_len)) {
+        report_fail(name, "post-reopen snapshot failed");
+        return;
+    }
+    if (before.st_ino != after.st_ino || before_len != after_len ||
+        memcmp(before_buf, after_buf, before_len) != 0) {
+        report_fail(name, "marker rewritten on reopen");
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_layer_schema_v1_wipe_on_first_open(const char *scratch)
+{
+    const char *name = "layer_schema_v1_wipe_on_first_open";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-schema-wipe", scratch);
+
+    /* Fresh open materializes the v2 marker plus the layers/ subtree. */
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    oci_store_close(s);
+
+    /* Remove the marker and seed a fake v1 cumulative entry under
+     * layers/sha256/. The nested file makes the recursive rm path do real
+     * work rather than a single rmdir.
+     */
+    char marker_path[2048];
+    snprintf(marker_path, sizeof(marker_path), "%s/layers/.schema", root);
+    if (unlink(marker_path) != 0) {
+        report_fail(name, "unlink marker failed");
+        return;
+    }
+    char v1_hex[65];
+    memset(v1_hex, '3', 64);
+    v1_hex[64] = '\0';
+    char v1_entry[2200];
+    snprintf(v1_entry, sizeof(v1_entry), "%s/layers/sha256/%s", root, v1_hex);
+    if (mkdir(v1_entry, 0755) != 0) {
+        report_fail(name, "mkdir v1 entry failed");
+        return;
+    }
+    char v1_inner[2400];
+    snprintf(v1_inner, sizeof(v1_inner), "%s/marker", v1_entry);
+    int fd = open(v1_inner, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "touch v1 inner failed");
+        return;
+    }
+    close(fd);
+
+    /* Snapshot sibling subtrees so the wipe must not touch them. */
+    char blob_dir[2048];
+    snprintf(blob_dir, sizeof(blob_dir), "%s/blobs/sha256", root);
+    struct stat blob_before;
+    if (stat(blob_dir, &blob_before) != 0) {
+        report_fail(name, "blobs/sha256 missing before reopen");
+        return;
+    }
+    char staging_dir[2048];
+    snprintf(staging_dir, sizeof(staging_dir), "%s/layers/.staging", root);
+    struct stat staging_before;
+    if (stat(staging_dir, &staging_before) != 0) {
+        report_fail(name, "layers/.staging missing before reopen");
+        return;
+    }
+
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "reopen during migration failed");
+        return;
+    }
+    oci_store_close(s);
+
+    /* Marker re-published with schemaVersion 2. */
+    char body[4096];
+    size_t got = 0;
+    if (!read_whole(marker_path, body, sizeof(body), &got) || got == 0) {
+        report_fail(name, "marker missing after migration");
+        return;
+    }
+    cJSON *json = cJSON_Parse(body);
+    if (!json) {
+        report_fail(name, "post-migration marker JSON unparseable");
+        return;
+    }
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(json, "schemaVersion");
+    if (!cJSON_IsNumber(v) || v->valueint != 2) {
+        report_fail(name, "post-migration schemaVersion != 2");
+        cJSON_Delete(json);
+        return;
+    }
+    cJSON_Delete(json);
+
+    /* V1 cumulative entry removed. */
+    struct stat st;
+    errno = 0;
+    if (stat(v1_entry, &st) == 0) {
+        report_fail(name, "v1 entry survived migration");
+        return;
+    }
+    if (errno != ENOENT) {
+        report_fail(name, "v1 entry stat unexpected errno");
+        return;
+    }
+
+    /* Sibling subtrees untouched (inode parity is the cheap check). */
+    struct stat blob_after;
+    if (stat(blob_dir, &blob_after) != 0 ||
+        blob_after.st_ino != blob_before.st_ino) {
+        report_fail(name, "blobs/sha256 inode changed");
+        return;
+    }
+    struct stat staging_after;
+    if (stat(staging_dir, &staging_after) != 0 ||
+        staging_after.st_ino != staging_before.st_ino) {
+        report_fail(name, "layers/.staging inode changed");
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_layer_schema_unknown_version_fail_fast(const char *scratch)
+{
+    const char *name = "layer_schema_unknown_version_fail_fast";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-schema-unknown", scratch);
+
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    oci_store_close(s);
+
+    char marker_path[2048];
+    snprintf(marker_path, sizeof(marker_path), "%s/layers/.schema", root);
+    int fd = open(marker_path, O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "open marker for rewrite failed");
+        return;
+    }
+    static const char body[] = "{\"schemaVersion\":99}\n";
+    size_t body_len = sizeof(body) - 1;
+    if (write(fd, body, body_len) != (ssize_t) body_len) {
+        close(fd);
+        report_fail(name, "write forward marker failed");
+        return;
+    }
+    close(fd);
+
+    errno = 0;
+    s = oci_store_open(root);
+    if (s != NULL) {
+        report_fail(name, "open did not fail on unknown schemaVersion");
+        oci_store_close(s);
+        return;
+    }
+    if (errno != EINVAL) {
+        report_fail(name, "open errno != EINVAL on rejected schemaVersion");
+        return;
+    }
+
+    /* The marker file itself must remain untouched on the rejection path. */
+    char got[4096];
+    size_t got_len = 0;
+    if (!read_whole(marker_path, got, sizeof(got), &got_len) ||
+        got_len != body_len || memcmp(got, body, got_len) != 0) {
+        report_fail(name, "marker content modified by rejected open");
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_layer_schema_no_migrate_env_skips_wipe(const char *scratch)
+{
+    const char *name = "layer_schema_no_migrate_env_skips_wipe";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-schema-no-migrate", scratch);
+
+    /* Save any external value so the rest of the suite is not affected. */
+    char *saved = NULL;
+    const char *cur = getenv("ELFUSE_OCI_NO_MIGRATE");
+    if (cur)
+        saved = strdup(cur);
+
+    /* Pre-seed a v1 entry without going through oci_store_open. This mirrors
+     * how a real downgrade workflow would leave the on-disk state. */
+    if (mkdir(root, 0755) != 0 && errno != EEXIST) {
+        report_fail(name, "mkdir root failed");
+        goto restore;
+    }
+    char layers_dir[2048];
+    snprintf(layers_dir, sizeof(layers_dir), "%s/layers", root);
+    if (mkdir(layers_dir, 0755) != 0 && errno != EEXIST) {
+        report_fail(name, "mkdir layers failed");
+        goto restore;
+    }
+    char sha_dir[2200];
+    snprintf(sha_dir, sizeof(sha_dir), "%s/sha256", layers_dir);
+    if (mkdir(sha_dir, 0755) != 0 && errno != EEXIST) {
+        report_fail(name, "mkdir layers/sha256 failed");
+        goto restore;
+    }
+    char v1_hex[65];
+    memset(v1_hex, '4', 64);
+    v1_hex[64] = '\0';
+    char v1_entry[2400];
+    snprintf(v1_entry, sizeof(v1_entry), "%s/%s", sha_dir, v1_hex);
+    if (mkdir(v1_entry, 0755) != 0 && errno != EEXIST) {
+        report_fail(name, "mkdir v1 entry failed");
+        goto restore;
+    }
+    char v1_inner[2600];
+    snprintf(v1_inner, sizeof(v1_inner), "%s/marker", v1_entry);
+    int fd = open(v1_inner, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "touch v1 inner failed");
+        goto restore;
+    }
+    close(fd);
+
+    /* Open with NO_MIGRATE set: marker stays absent, v1 entry preserved. */
+    setenv("ELFUSE_OCI_NO_MIGRATE", "1", 1);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open under NO_MIGRATE failed");
+        goto restore;
+    }
+    oci_store_close(s);
+
+    char marker_path[2048];
+    snprintf(marker_path, sizeof(marker_path), "%s/layers/.schema", root);
+    struct stat st;
+    errno = 0;
+    if (stat(marker_path, &st) == 0) {
+        report_fail(name, "marker written under NO_MIGRATE");
+        goto restore;
+    }
+    if (errno != ENOENT) {
+        report_fail(name, "marker stat unexpected errno under NO_MIGRATE");
+        goto restore;
+    }
+    if (stat(v1_entry, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "v1 entry wiped under NO_MIGRATE");
+        goto restore;
+    }
+
+    /* Drop the env var and reopen: migration runs normally. */
+    unsetenv("ELFUSE_OCI_NO_MIGRATE");
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "reopen without NO_MIGRATE failed");
+        goto restore;
+    }
+    oci_store_close(s);
+
+    if (stat(marker_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail(name, "marker missing after non-NO_MIGRATE reopen");
+        goto restore;
+    }
+    errno = 0;
+    if (stat(v1_entry, &st) == 0) {
+        report_fail(name, "v1 entry survived non-NO_MIGRATE reopen");
+        goto restore;
+    }
+    if (errno != ENOENT) {
+        report_fail(name, "v1 entry stat unexpected errno post-migration");
+        goto restore;
+    }
+    report_pass(name);
+
+restore:
+    if (saved) {
+        setenv("ELFUSE_OCI_NO_MIGRATE", saved, 1);
+        free(saved);
+    } else {
+        unsetenv("ELFUSE_OCI_NO_MIGRATE");
+    }
+}
+
 int main(void)
 {
     printf("OCI store unit tests\n");
@@ -3586,6 +3954,11 @@ int main(void)
     test_layer_resolve_format(scratch);
     test_layer_has_present_absent(scratch);
     test_layer_commit_rename_race_benign(scratch);
+    test_layer_schema_written_on_fresh_open(scratch);
+    test_layer_schema_idempotent_reopen(scratch);
+    test_layer_schema_v1_wipe_on_first_open(scratch);
+    test_layer_schema_unknown_version_fail_fast(scratch);
+    test_layer_schema_no_migrate_env_skips_wipe(scratch);
 
     wipe_dir(scratch);
     free(scratch);

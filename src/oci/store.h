@@ -82,6 +82,18 @@ typedef struct {
  * issues (missing blob, malformed pin file) are logged to stderr and skipped
  * without failing the open.
  *
+ * The Plan 3 C3.3b layer cache schema marker at <root>/layers/.schema is
+ * also written or validated here. A v1 store (no marker but an existing
+ * layers/sha256/ subtree from C3.2) has its layers/sha256/ children wiped
+ * before the v2 marker is published; the wipe is scoped to layers/sha256/
+ * only so blobs/, images/, refs/, index.json, and layers/.staging/ are
+ * never touched. A marker whose schemaVersion is unknown to this build
+ * (forward incompatibility, corruption, or an experimental schema) is
+ * fatal and returns NULL with errno=EINVAL. ELFUSE_OCI_NO_MIGRATE gates
+ * this migration too: when set and the marker is absent, the wipe and
+ * the marker write are both skipped so a downgrade test can inspect any
+ * v1 entries on disk.
+ *
  * Returns NULL on failure with errno preserved.
  */
 oci_store_t *oci_store_open(const char *root);
