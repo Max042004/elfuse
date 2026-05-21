@@ -7,13 +7,16 @@
  * table so that elfuse oci pull / inspect can reproduce a pull by name. The
  * on-disk layout under <root> is:
  *
+ *   oci-layout                               OCI image-layout 1.0.0 marker
  *   blobs/<algo>/<hex>                       finalized blob (immutable)
  *   tmp/blob-<pid>-<seq>-XXXXXX              in-flight staging
  *   refs/<registry>/<repository>/<tag>       pin file (one line: "<algo>:<hex>")
  *
  * The pin file contains the manifest digest captured at pull time so a
  * subsequent pull by tag can short-circuit when the blob is already present,
- * and elfuse oci inspect can render the manifest offline.
+ * and elfuse oci inspect can render the manifest offline. The oci-layout
+ * marker advertises the store as a standards-compliant image layout so that
+ * external tools (skopeo, umoci) can consume the directory as oci:<root>.
  *
  * Phase 1 keeps <root> as a plain directory. The sparse case-sensitive APFS
  * volume bootstrap (oci-roadmap Q1) is a Phase 2 concern; the volume mount
@@ -27,8 +30,11 @@
 
 typedef struct oci_store oci_store_t;
 
-/* Open or create the store rooted at `root`. Ensures blobs/<algo>/, tmp/, and
- * refs/ exist. Returns NULL on failure with errno preserved.
+/* Open or create the store rooted at `root`. Ensures blobs/<algo>/, tmp/,
+ * refs/, and the OCI image-layout 1.0.0 marker exist. Marker writes are
+ * idempotent: a pre-existing oci-layout file is never rewritten so a third
+ * party that bumped the imageLayoutVersion is preserved. Returns NULL on
+ * failure with errno preserved.
  */
 oci_store_t *oci_store_open(const char *root);
 

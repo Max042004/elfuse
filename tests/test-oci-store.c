@@ -393,6 +393,175 @@ cleanup:
     oci_store_close(s);
 }
 
+/* OCI image-layout 1.0.0 marker payload that oci_store_open writes when the
+ * store root is missing the marker. Kept in sync with src/oci/store.c.
+ */
+static const char EXPECTED_LAYOUT[] = "{\"imageLayoutVersion\":\"1.0.0\"}\n";
+
+static bool read_whole(const char *path, char *buf, size_t cap, size_t *out_len)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return false;
+    ssize_t got = read(fd, buf, cap - 1);
+    close(fd);
+    if (got < 0)
+        return false;
+    buf[got] = '\0';
+    if (out_len)
+        *out_len = (size_t) got;
+    return true;
+}
+
+static void test_layout_marker_fresh(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layout-fresh", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("layout_marker_fresh", "open failed");
+        return;
+    }
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/oci-layout", root);
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail("layout_marker_fresh", "oci-layout file missing");
+        oci_store_close(s);
+        return;
+    }
+    char buf[256];
+    size_t got = 0;
+    if (!read_whole(path, buf, sizeof(buf), &got)) {
+        report_fail("layout_marker_fresh", "could not read marker");
+        oci_store_close(s);
+        return;
+    }
+    if (got != sizeof(EXPECTED_LAYOUT) - 1 ||
+        memcmp(buf, EXPECTED_LAYOUT, got) != 0) {
+        report_fail("layout_marker_fresh", "marker payload mismatch");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("layout_marker_fresh");
+}
+
+static void test_layout_marker_added_on_existing(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layout-backfill", scratch);
+    /* Simulate a pre-marker store: open + close once to materialize the
+     * directory layout, then unlink the marker so the next open must
+     * backfill it from scratch. blobs/sha256/ and refs/ stay in place,
+     * matching a Phase-1 store that predates the marker.
+     */
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("layout_marker_backfill", "initial open failed");
+        return;
+    }
+    oci_store_close(s);
+    char marker[2048];
+    snprintf(marker, sizeof(marker), "%s/oci-layout", root);
+    if (unlink(marker) != 0) {
+        report_fail("layout_marker_backfill", "could not unlink seed marker");
+        return;
+    }
+    struct stat st;
+    if (stat(marker, &st) == 0) {
+        report_fail("layout_marker_backfill", "marker survived unlink");
+        return;
+    }
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail("layout_marker_backfill", "reopen failed");
+        return;
+    }
+    if (stat(marker, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail("layout_marker_backfill", "marker not restored on reopen");
+        oci_store_close(s);
+        return;
+    }
+    char buf[256];
+    size_t got = 0;
+    if (!read_whole(marker, buf, sizeof(buf), &got) ||
+        got != sizeof(EXPECTED_LAYOUT) - 1 ||
+        memcmp(buf, EXPECTED_LAYOUT, got) != 0) {
+        report_fail("layout_marker_backfill", "restored marker payload bad");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("layout_marker_backfill");
+}
+
+static void test_layout_marker_preserved(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layout-preserve", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("layout_marker_preserve", "initial open failed");
+        return;
+    }
+    oci_store_close(s);
+
+    char marker[2048];
+    snprintf(marker, sizeof(marker), "%s/oci-layout", root);
+    /* Overwrite the marker with a future imageLayoutVersion stand-in so a
+     * silent rewrite would clobber it. The store must leave the bytes
+     * untouched on subsequent open: idempotent contract.
+     */
+    static const char OVERRIDE[] = "{\"imageLayoutVersion\":\"9.9.9\"}\n";
+    int fd = open(marker, O_WRONLY | O_TRUNC);
+    if (fd < 0) {
+        report_fail("layout_marker_preserve", "could not reopen marker");
+        return;
+    }
+    if (write(fd, OVERRIDE, sizeof(OVERRIDE) - 1) !=
+        (ssize_t) (sizeof(OVERRIDE) - 1)) {
+        close(fd);
+        report_fail("layout_marker_preserve", "could not seed override");
+        return;
+    }
+    close(fd);
+
+    struct stat before;
+    if (stat(marker, &before) != 0) {
+        report_fail("layout_marker_preserve", "marker missing after override");
+        return;
+    }
+
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail("layout_marker_preserve", "reopen failed");
+        return;
+    }
+
+    struct stat after;
+    if (stat(marker, &after) != 0) {
+        report_fail("layout_marker_preserve", "marker missing after reopen");
+        oci_store_close(s);
+        return;
+    }
+    if (before.st_ino != after.st_ino) {
+        report_fail("layout_marker_preserve", "marker inode changed");
+        oci_store_close(s);
+        return;
+    }
+    char buf[256];
+    size_t got = 0;
+    if (!read_whole(marker, buf, sizeof(buf), &got) ||
+        got != sizeof(OVERRIDE) - 1 || memcmp(buf, OVERRIDE, got) != 0) {
+        report_fail("layout_marker_preserve", "marker bytes changed");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("layout_marker_preserve");
+}
+
 static void test_default_root_from_env(void)
 {
     /* Save and clear environment so the default-root computation is fully
@@ -474,6 +643,9 @@ int main(void)
     test_deep_repository_mkdir(scratch);
     test_overwrite_pin(scratch);
     test_pin_blob_share_root(scratch);
+    test_layout_marker_fresh(scratch);
+    test_layout_marker_added_on_existing(scratch);
+    test_layout_marker_preserved(scratch);
     test_default_root_from_env();
 
     wipe_dir(scratch);

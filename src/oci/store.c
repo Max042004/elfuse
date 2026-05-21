@@ -8,6 +8,13 @@
  * yesterday, and overwriting the pin is the correct semantic. The blob store
  * underneath this layer keeps its link(2) discipline because content-addressed
  * blobs are immutable.
+ *
+ * The store root also carries an OCI image-layout 1.0.0 marker
+ * (<root>/oci-layout) so that external tools that consume the image-layout
+ * spec -- skopeo, umoci, crane -- can recognize the directory without any
+ * elfuse-specific knowledge. Writing the marker is idempotent: it is only
+ * created when missing, and existing markers are never rewritten so a third
+ * party that bumped the imageLayoutVersion is not stomped.
  */
 
 #include "store.h"
@@ -32,6 +39,12 @@ struct oci_store {
     char *root;
     oci_blob_store_t *blobs;
 };
+
+/* OCI image-layout 1.0.0 marker payload. The spec wants a JSON object with
+ * exactly one field: imageLayoutVersion = "1.0.0". The trailing newline is
+ * conventional and matches what umoci / skopeo write.
+ */
+static const char OCI_LAYOUT_BODY[] = "{\"imageLayoutVersion\":\"1.0.0\"}\n";
 
 static int mkdir_one(const char *path)
 {
@@ -72,6 +85,82 @@ static int mkdir_p(const char *path)
     return mkdir_one(buf);
 }
 
+/* Idempotently write <root>/oci-layout. Returns 0 on success or when the
+ * marker already exists, -1 on any unexpected IO failure. The write uses a
+ * pid + counter-suffixed tmp file plus rename so a concurrent opener never
+ * observes a partial JSON document. link(2) is preferred over rename(2) for
+ * the publish step so that two racing openers cannot replace an external
+ * tool's bumped marker with our own; EEXIST is the happy path.
+ */
+static unsigned long layout_seq(void)
+{
+    static unsigned long n = 0;
+    return __sync_add_and_fetch(&n, 1);
+}
+
+static int ensure_oci_layout_marker(const char *root)
+{
+    char path[STORE_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/oci-layout", root);
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) {
+            errno = ENOTDIR;
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT)
+        return -1;
+
+    char tmp[STORE_PATH_MAX];
+    n = snprintf(tmp, sizeof(tmp), "%s.tmp-%d-%lu", path, (int) getpid(),
+                 layout_seq());
+    if (n < 0 || (size_t) n >= sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0)
+        return -1;
+    size_t body_len = sizeof(OCI_LAYOUT_BODY) - 1;
+    if (write(fd, OCI_LAYOUT_BODY, body_len) != (ssize_t) body_len) {
+        int saved = errno;
+        close(fd);
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    if (fsync(fd) < 0) {
+        int saved = errno;
+        close(fd);
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    if (close(fd) < 0) {
+        int saved = errno;
+        unlink(tmp);
+        errno = saved;
+        return -1;
+    }
+    if (link(tmp, path) < 0) {
+        int saved = errno;
+        unlink(tmp);
+        if (saved == EEXIST)
+            return 0;
+        errno = saved;
+        return -1;
+    }
+    unlink(tmp);
+    return 0;
+}
+
 oci_store_t *oci_store_open(const char *root)
 {
     if (!root || !*root) {
@@ -91,6 +180,12 @@ oci_store_t *oci_store_open(const char *root)
     }
     if (mkdir_one(refs) < 0) {
         oci_blob_store_close(blobs);
+        return NULL;
+    }
+    if (ensure_oci_layout_marker(root) < 0) {
+        int saved = errno;
+        oci_blob_store_close(blobs);
+        errno = saved;
         return NULL;
     }
 
