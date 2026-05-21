@@ -8,7 +8,7 @@
         test-full test-multi-vcpu test-rwx \
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
-        test-oci-inspect test-oci-dedup-metrics \
+        test-oci-inspect test-oci-dedup-metrics test-oci-rebuild-cache \
         test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-origin \
         test-oci-layer-apply test-oci-volume test-oci-clone \
@@ -58,6 +58,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-inspect
 	@printf "\n$(BLUE)━━━ OCI cross-image dedup metrics unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-dedup-metrics
+	@printf "\n$(BLUE)━━━ OCI rebuild-cache unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-rebuild-cache
 	@printf "\n$(BLUE)━━━ OCI tar reader unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-tar
 	@printf "\n$(BLUE)━━━ OCI decompression dispatch unit tests ━━━$(RESET)\n"
@@ -127,6 +129,13 @@ test-oci-inspect: $(BUILD_DIR)/test-oci-inspect
 ## and pin + unpacked-tree scratch stores.
 test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics
 	@$(BUILD_DIR)/test-oci-dedup-metrics
+
+## Run the OCI rebuild-cache unit tests (native, no HVF, no network).
+## Phase 1 Plan 3 C3.5: validates oci_rebuild_cache against scratch
+## stores hand-populated via oci_origin_write into a fixture
+## <volume>/images/sha256-<hex>/ tree.
+test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache
+	@$(BUILD_DIR)/test-oci-rebuild-cache
 
 ## Run the OCI tar reader unit tests (native, no HVF, no network)
 test-oci-tar: $(BUILD_DIR)/test-oci-tar

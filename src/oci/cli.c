@@ -24,6 +24,7 @@
 #include "fetch.h"
 #include "inspect.h"
 #include "pull.h"
+#include "rebuild-cache.h"
 #include "ref.h"
 #include "run.h"
 #include "store.h"
@@ -47,6 +48,8 @@ static int print_usage(FILE *out)
         "                           Launch a guest binary from a pulled image\n"
         "  prune                    Remove unreferenced blobs from the local "
         "store\n"
+        "  rebuild-cache            Back-fill stack cache from unpacked "
+        "sysroots\n"
         "  list                     List images in the local store\n"
         "\n"
         "Pull options:\n"
@@ -96,6 +99,12 @@ static int print_usage(FILE *out)
         "blobs;\n"
         "                        (suffixes: K, M, G; KiB-based; 0 = no "
         "budget)\n"
+        "\n"
+        "Rebuild-cache options:\n"
+        "  --store DIR           Override the local store root\n"
+        "  --volume DIR          Override the sysroot APFS volume mount point\n"
+        "  --commit              Actually write stack snapshots "
+        "(default: dry-run)\n"
         "\n"
         "Refs follow the docker/containerd grammar:\n"
         "  alpine, alpine:3.20, user/repo, ghcr.io/owner/img:tag,\n"
@@ -905,6 +914,133 @@ static int cmd_prune(int argc, char **argv)
     return 0;
 }
 
+/* Argument parser state for oci rebuild-cache. Mirrors prune_args_t in
+ * shape because both subcommands carry --store / --volume / --commit; the
+ * two parsers stay disjoint so a future option addition to either does not
+ * surprise the other.
+ */
+typedef struct {
+    const char *store_root;
+    const char *volume_root;
+    bool commit;
+} rebuild_cache_args_t;
+
+static int parse_rebuild_cache_args(int argc, char **argv,
+                                    rebuild_cache_args_t *out)
+{
+    int i = 1;
+    while (i < argc) {
+        const char *a = argv[i];
+        if (a[0] != '-')
+            break;
+        if (!strcmp(a, "--")) {
+            i++;
+            break;
+        }
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            return 1;
+        } else if (!strcmp(a, "--commit")) {
+            out->commit = true;
+        } else if (!strcmp(a, "--store")) {
+            if (++i >= argc) {
+                fputs("error: --store needs an argument\n", stderr);
+                return -1;
+            }
+            out->store_root = argv[i];
+        } else if (!strcmp(a, "--volume")) {
+            if (++i >= argc) {
+                fputs("error: --volume needs an argument\n", stderr);
+                return -1;
+            }
+            out->volume_root = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown rebuild-cache option: %s\n", a);
+            return -1;
+        }
+        i++;
+    }
+    if (i != argc) {
+        fputs("error: rebuild-cache takes no positional arguments\n", stderr);
+        return -1;
+    }
+    return 0;
+}
+
+static int cmd_rebuild_cache(int argc, char **argv)
+{
+    rebuild_cache_args_t args = {0};
+    int prc = parse_rebuild_cache_args(argc, argv, &args);
+    if (prc == 1)
+        return print_usage(stdout);
+    if (prc < 0)
+        return 2;
+
+    char *default_root = NULL;
+    const char *store_root = args.store_root;
+    if (!store_root) {
+        default_root = oci_store_default_root();
+        if (!default_root) {
+            fprintf(stderr,
+                    "error: could not determine default store root "
+                    "(HOME not set?)\n");
+            return 1;
+        }
+        store_root = default_root;
+    }
+
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        fprintf(stderr, "error: could not open store at %s: %s\n", store_root,
+                strerror(errno));
+        free(default_root);
+        return 1;
+    }
+
+    oci_rebuild_cache_options_t opts = {
+        .commit = args.commit,
+    };
+    const char *err = NULL;
+    int rc = oci_rebuild_cache(store, args.volume_root, &opts, &err);
+    if (rc < 0) {
+        fprintf(stderr, "error: rebuild-cache failed: %s\n",
+                err ? err : strerror(errno));
+        oci_store_close(store);
+        free(default_root);
+        return 1;
+    }
+
+    size_t skipped_bad = opts.trees_skipped_no_origin +
+                         opts.trees_skipped_bad_origin +
+                         opts.trees_skipped_empty_diffids;
+
+    if (args.commit) {
+        printf("rebuild-cache:\n");
+        printf("  scanned:        %zu unpacked trees\n", opts.trees_scanned);
+        printf("  rebuilt:        %zu trees (%zu stack entries)\n",
+               opts.trees_rebuilt, opts.stack_entries_added);
+        printf("  already cached: %zu trees\n", opts.trees_skipped_cached);
+        if (skipped_bad > 0)
+            printf("  skipped (bad):  %zu trees\n", skipped_bad);
+        if (opts.trees_failed > 0)
+            printf("  failed:         %zu trees\n", opts.trees_failed);
+    } else {
+        printf("rebuild-cache (dry-run):\n");
+        printf("  scanned:        %zu unpacked trees\n", opts.trees_scanned);
+        printf("  would rebuild:  %zu trees (%zu stack entries)\n",
+               opts.trees_rebuilt, opts.stack_entries_added);
+        printf("  already cached: %zu trees\n", opts.trees_skipped_cached);
+        if (skipped_bad > 0)
+            printf("  skipped (bad):  %zu trees\n", skipped_bad);
+        if (opts.trees_failed > 0)
+            printf("  failed:         %zu trees\n", opts.trees_failed);
+        printf("(dry-run; pass --commit to write)\n");
+    }
+
+    oci_store_close(store);
+    free(default_root);
+    return 0;
+}
+
 int oci_cli_main(int argc, char **argv)
 {
     if (argc < 2)
@@ -925,6 +1061,8 @@ int oci_cli_main(int argc, char **argv)
         return oci_cli_run(argc - 1, argv + 1);
     if (!strcmp(sub, "prune"))
         return cmd_prune(argc - 1, argv + 1);
+    if (!strcmp(sub, "rebuild-cache"))
+        return cmd_rebuild_cache(argc - 1, argv + 1);
     if (!strcmp(sub, "list") || !strcmp(sub, "ls"))
         return cmd_not_implemented("list");
 

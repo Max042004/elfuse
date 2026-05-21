@@ -86,6 +86,7 @@ SRCS := \
     oci/volume-list.c \
     oci/clone-rootfs.c \
     oci/unpack.c \
+    oci/rebuild-cache.c \
     oci/runspec.c \
     oci/path-resolve.c \
     oci/run.c
@@ -252,6 +253,16 @@ $(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/
 ## via oci_blob_store_put_bytes + oci_store_put_ref. Same dependency set
 ## as test-oci-inspect, plus oci/dedup-metrics.o.
 $(BUILD_DIR)/test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics.o $(BUILD_DIR)/oci/dedup-metrics.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI rebuild-cache unit test (native macOS, no HVF). Drives
+## oci_rebuild_cache against scratch stores hand-populated via oci_origin_write
+## into a fixture <volume>/images/sha256-<hex>/ tree, then asserts that
+## <store>/layers/stacks/sha256/<chain>/ entries are created (commit) or left
+## absent (dry-run). Same dependency set as test-oci-store plus oci/rebuild-
+## cache.o.
+$(BUILD_DIR)/test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache.o $(BUILD_DIR)/oci/rebuild-cache.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

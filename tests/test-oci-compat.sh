@@ -342,6 +342,27 @@ case "${bad_size_out}" in
         ;;
 esac
 
+# ── Rebuild-cache CLI smoke (C3.5) ───────────────────────────────────
+
+# A volume without any unpacked trees still parses cleanly and reports
+# scanned=0. The store under SCRATCH/store has no images/, so the walker
+# treats it as the empty case and rc must be 0.
+rebuild_out=$("${ELFUSE}" oci rebuild-cache --store "${STORE}" \
+                                            --volume "${SCRATCH}" 2>&1)
+rc=$?
+case "${rebuild_out}" in
+    *"rebuild-cache (dry-run):"*"scanned:"*"0 unpacked trees"*"dry-run; pass --commit to write"*)
+        if [ "${rc}" = 0 ]; then
+            ok "rebuild-cache-smoke: dry-run on empty volume reports scanned=0"
+        else
+            bad "rebuild-cache-smoke: dry-run rc" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "rebuild-cache-smoke: dry-run output" "${rebuild_out}"
+        ;;
+esac
+
 # ── Heavy mode (full E2E launches) ───────────────────────────────────
 
 if [ -n "${OCI_COMPAT_TEST:-}" ]; then
