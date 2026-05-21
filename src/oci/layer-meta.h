@@ -65,20 +65,39 @@ int oci_meta_lookup(const oci_meta_table_t *t,
 /* Number of live entries. */
 size_t oci_meta_count(const oci_meta_table_t *t);
 
-/* Serialize the table to <root_dir>/.elfuse-meta.json via atomic
- * rename. Returns 0 on success, -1 on failure with errno and *err
- * set. Passing an empty table writes a valid file containing an empty
- * entries array.
+/* Serialize the table to <root_dir>/<filename> via atomic rename.
+ * Returns 0 on success, -1 on failure with errno and *err set. Passing
+ * an empty table writes a valid file containing an empty entries array.
+ *
+ * filename must be a relative basename (no embedded '/'); EINVAL is
+ * returned otherwise. The Plan 3 C3.3c raw per-layer cache writes
+ * ".elfuse-meta.layer.json" so that the assembled stack snapshot can
+ * keep the default ".elfuse-meta.json" name for the cumulative table
+ * without collisions during clonefile-stacked assembly.
+ */
+int oci_meta_write_named(const oci_meta_table_t *t,
+                         const char *root_dir,
+                         const char *filename,
+                         const char **err);
+
+/* Parse <root_dir>/<filename> and populate a fresh table. Caller takes
+ * ownership via *out (freed with oci_meta_table_free). Missing file
+ * returns -1 with errno=ENOENT; malformed JSON or version mismatch
+ * returns -1 with errno=EINVAL. filename constraints match
+ * oci_meta_write_named (relative basename, no embedded '/').
+ */
+int oci_meta_read_named(const char *root_dir,
+                        const char *filename,
+                        oci_meta_table_t **out,
+                        const char **err);
+
+/* Thin wrappers passing the default ".elfuse-meta.json" filename. Used
+ * by the cumulative-sidecar paths (stack snapshot, final unpack tree).
  */
 int oci_meta_write(const oci_meta_table_t *t,
                    const char *root_dir,
                    const char **err);
 
-/* Parse <root_dir>/.elfuse-meta.json and populate a fresh table.
- * Caller takes ownership via *out (freed with oci_meta_table_free).
- * Missing file returns -1 with errno=ENOENT; malformed JSON or
- * version mismatch returns -1 with errno=EINVAL.
- */
 int oci_meta_read(const char *root_dir,
                   oci_meta_table_t **out,
                   const char **err);

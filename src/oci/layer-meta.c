@@ -167,9 +167,20 @@ static char *build_path(const char *root_dir, const char *name, bool tmp)
     return p;
 }
 
-int oci_meta_write(const oci_meta_table_t *t,
-                   const char *root_dir,
-                   const char **err)
+static bool valid_basename(const char *filename)
+{
+    if (!filename || !*filename)
+        return false;
+    for (const char *p = filename; *p; p++)
+        if (*p == '/')
+            return false;
+    return true;
+}
+
+int oci_meta_write_named(const oci_meta_table_t *t,
+                         const char *root_dir,
+                         const char *filename,
+                         const char **err)
 {
     static const char *dummy_err;
     if (!err)
@@ -177,6 +188,11 @@ int oci_meta_write(const oci_meta_table_t *t,
     *err = NULL;
     if (!root_dir) {
         *err = "meta write: NULL root";
+        errno = EINVAL;
+        return -1;
+    }
+    if (!valid_basename(filename)) {
+        *err = "meta write: filename must be a non-empty basename";
         errno = EINVAL;
         return -1;
     }
@@ -229,8 +245,8 @@ int oci_meta_write(const oci_meta_table_t *t,
     }
     size_t jlen = strlen(json);
 
-    char *tmp_path = build_path(root_dir, OCI_META_FILE, true);
-    char *final_path = build_path(root_dir, OCI_META_FILE, false);
+    char *tmp_path = build_path(root_dir, filename, true);
+    char *final_path = build_path(root_dir, filename, false);
     if (!tmp_path || !final_path) {
         free(tmp_path);
         free(final_path);
@@ -276,9 +292,10 @@ fail_paths:
     return -1;
 }
 
-int oci_meta_read(const char *root_dir,
-                  oci_meta_table_t **out,
-                  const char **err)
+int oci_meta_read_named(const char *root_dir,
+                        const char *filename,
+                        oci_meta_table_t **out,
+                        const char **err)
 {
     static const char *dummy_err;
     if (!err)
@@ -290,8 +307,13 @@ int oci_meta_read(const char *root_dir,
         return -1;
     }
     *out = NULL;
+    if (!valid_basename(filename)) {
+        *err = "meta read: filename must be a non-empty basename";
+        errno = EINVAL;
+        return -1;
+    }
 
-    char *path = build_path(root_dir, OCI_META_FILE, false);
+    char *path = build_path(root_dir, filename, false);
     if (!path) {
         *err = "meta read: path allocation failed";
         errno = ENOMEM;
@@ -395,6 +417,20 @@ int oci_meta_read(const char *root_dir,
     cJSON_Delete(root);
     *out = table;
     return 0;
+}
+
+int oci_meta_write(const oci_meta_table_t *t,
+                   const char *root_dir,
+                   const char **err)
+{
+    return oci_meta_write_named(t, root_dir, OCI_META_FILE, err);
+}
+
+int oci_meta_read(const char *root_dir,
+                  oci_meta_table_t **out,
+                  const char **err)
+{
+    return oci_meta_read_named(root_dir, OCI_META_FILE, out, err);
 }
 
 int oci_meta_merge(oci_meta_table_t *dst, const oci_meta_table_t *src)

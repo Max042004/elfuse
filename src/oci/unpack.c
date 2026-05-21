@@ -211,146 +211,33 @@ static int rm_recursive(const char *path)
     return rc;
 }
 
-/* Restore stage_dir from a cumulative cache snapshot. Performs rm -rf
- * stage_dir followed by clonefile(cache_dir, stage_dir, CLONE_NOFOLLOW)
- * which atomically recreates stage_dir with the snapshot contents. If a
- * meta table is supplied, the cached .elfuse-meta.json (if present) is
- * read back and merged into it so subsequent extracts in the same image
- * accumulate on top of the cumulative meta the snapshot persisted.
- * A missing sidecar inside the cache (older snapshot, or a layer that
- * never recorded meta) is benign: nothing to merge, return 0.
+/* Shared reverify + decompress + apply pipeline for the two
+ * single-layer entry points. UNPACK_MODE_OVERLAY drives
+ * oci_layer_apply (whiteout / opaque interpreted against root_dir);
+ * UNPACK_MODE_RAW drives oci_layer_apply_raw_tar (whiteout markers
+ * preserved as zero-byte regular files for the C3.3c raw per-layer
+ * cache populate path).
  */
-static int restore_layer_cache(const char *stage_dir,
-                               const char *cache_dir,
-                               oci_meta_table_t *meta,
-                               const char **err)
-{
-    if (rm_recursive(stage_dir) < 0)
-        return set_err(err, "unpack: cache restore rm stage_dir failed", errno);
-    if (clonefile(cache_dir, stage_dir, CLONE_NOFOLLOW) < 0) {
-        if (errno == EXDEV)
-            return set_err(err,
-                           "unpack: cache restore EXDEV (store and stage "
-                           "must share an APFS volume)",
-                           EXDEV);
-        return set_err(err, "unpack: cache restore clonefile failed", errno);
-    }
-    if (!meta)
-        return 0;
-    oci_meta_table_t *cached = NULL;
-    const char *merr = NULL;
-    if (oci_meta_read(stage_dir, &cached, &merr) < 0) {
-        if (errno == ENOENT) {
-            errno = 0;
-            return 0;
-        }
-        return set_err(err, merr ? merr : "unpack: cache meta read failed",
-                       errno);
-    }
-    int rc = oci_meta_merge(meta, cached);
-    int saved = errno;
-    oci_meta_table_free(cached);
-    if (rc < 0) {
-        errno = saved;
-        return set_err(err, "unpack: cache meta merge failed", saved);
-    }
-    return 0;
-}
+typedef enum {
+    UNPACK_MODE_OVERLAY,
+    UNPACK_MODE_RAW,
+} unpack_mode_t;
 
-/* Snapshot stage_dir into the layer cache for diff_id. First flushes the
- * caller-supplied meta table (if any) into stage_dir so the snapshot
- * contains the cumulative .elfuse-meta.json that a subsequent cache hit
- * can merge back. Then clonefile(stage_dir, layers/.staging/...) +
- * oci_store_layer_commit publishes the snapshot atomically. A rename race
- * with another writer is handled inside oci_store_layer_commit (loser's
- * staging tree is removed and 0 is returned).
- */
-static int snapshot_layer_cache(const char *stage_dir,
-                                oci_store_t *cache_store,
-                                const char *diff_id,
-                                oci_meta_table_t *meta,
-                                const char **err)
+static int unpack_layer_impl(oci_blob_store_t *bs,
+                             const oci_descriptor_t *desc,
+                             const char *root_dir,
+                             unpack_mode_t mode,
+                             oci_layer_apply_stats_t *stats,
+                             oci_meta_table_t *meta,
+                             const char *log_label,
+                             const char **err)
 {
-    if (meta) {
-        const char *merr = NULL;
-        if (oci_meta_write(meta, stage_dir, &merr) < 0)
-            return set_err(err,
-                           merr ? merr : "unpack: cache meta write failed",
-                           errno);
-    }
-    char stage_path[UN_PATH_MAX];
-    if (oci_store_layer_stage_path(cache_store, diff_id, stage_path,
-                                   sizeof(stage_path)) < 0)
-        return set_err(err, "unpack: layer stage_path resolve failed", errno);
-    if (clonefile(stage_dir, stage_path, CLONE_NOFOLLOW) < 0) {
-        if (errno == EXDEV)
-            return set_err(err,
-                           "unpack: cache snapshot EXDEV (store and stage "
-                           "must share an APFS volume)",
-                           EXDEV);
-        return set_err(err, "unpack: cache snapshot clonefile failed", errno);
-    }
-    const char *cerr = NULL;
-    if (oci_store_layer_commit(cache_store, stage_path, diff_id, &cerr) < 0) {
-        int saved = errno;
-        (void) rm_recursive(stage_path);
-        errno = saved;
-        return set_err(err, cerr ? cerr : "unpack: layer commit failed", saved);
-    }
-    return 0;
-}
-
-int oci_unpack_layer(oci_blob_store_t *bs,
-                     const oci_descriptor_t *desc,
-                     const char *stage_dir,
-                     const oci_unpack_layer_options_t *opts,
-                     oci_layer_apply_stats_t *stats,
-                     oci_meta_table_t *meta,
-                     const char *log_label,
-                     const char **err)
-{
-    static const char *dummy_err;
-    if (!err)
-        err = &dummy_err;
-    *err = NULL;
-    if (!bs || !desc || !stage_dir)
+    if (!bs || !desc || !root_dir)
         return set_err(err, "unpack_layer: NULL argument", EINVAL);
 
     if (oci_media_type_is_foreign(desc->media_type))
         return set_err(err, "unpack: layer is foreign / nondistributable",
                        ENOTSUP);
-
-    bool cache_enabled = opts && opts->cache_store && opts->diff_id;
-
-    /* Cache-hit fast path: the cached snapshot already encodes both the
-     * filesystem state and the cumulative meta sidecar through this layer,
-     * so the helper short-circuits the entire reverify + decompress +
-     * apply chain. Reverify is intentionally skipped here: the cache entry
-     * was populated by a prior successful unpack that already validated
-     * the compressed blob.
-     */
-    if (cache_enabled) {
-        int hit = oci_store_layer_has(opts->cache_store, opts->diff_id);
-        if (hit < 0)
-            return set_err(err, "unpack: cache lookup failed", errno);
-        if (hit == 1) {
-            char cache_dir[UN_PATH_MAX];
-            if (oci_store_layer_resolve(opts->cache_store, opts->diff_id,
-                                        cache_dir, sizeof(cache_dir)) < 0)
-                return set_err(err,
-                               "unpack: cache path resolve failed", errno);
-            /* Strip the trailing '/' clonefile would reject as a duplicate. */
-            size_t cdl = strlen(cache_dir);
-            if (cdl > 0 && cache_dir[cdl - 1] == '/')
-                cache_dir[cdl - 1] = '\0';
-            if (restore_layer_cache(stage_dir, cache_dir, meta, err) < 0)
-                return -1;
-            if (log_label)
-                fprintf(stderr, "  %s: %s (cached)\n", log_label,
-                        desc->digest_str);
-            return 0;
-        }
-    }
 
     if (reverify_layer_digest(bs, desc, err) < 0)
         return -1;
@@ -380,7 +267,11 @@ int oci_unpack_layer(oci_blob_store_t *bs,
         fprintf(stderr, "  %s: %s\n", log_label, desc->digest_str);
 
     oci_layer_apply_stats_t local_stats = {0};
-    int rc = oci_layer_apply(r, stage_dir, &local_stats, meta, err);
+    int rc;
+    if (mode == UNPACK_MODE_OVERLAY)
+        rc = oci_layer_apply(r, root_dir, &local_stats, meta, err);
+    else
+        rc = oci_layer_apply_raw_tar(r, root_dir, &local_stats, meta, err);
 
     oci_tar_reader_free(r);
     oci_stream_close(stream);
@@ -403,16 +294,274 @@ int oci_unpack_layer(oci_blob_store_t *bs,
                 local_stats.files, local_stats.dirs, local_stats.symlinks,
                 local_stats.hardlinks, local_stats.whiteouts,
                 local_stats.opaques);
+    return 0;
+}
 
-    /* Cache-miss snapshot: persist the cumulative state for future hits.
-     * Errors propagate so a misconfigured store (EXDEV across filesystems,
-     * out-of-space, etc) does not silently degrade the cache.
-     */
-    if (cache_enabled &&
-        snapshot_layer_cache(stage_dir, opts->cache_store, opts->diff_id, meta,
-                             err) < 0)
+int oci_unpack_layer(oci_blob_store_t *bs,
+                     const oci_descriptor_t *desc,
+                     const char *stage_dir,
+                     oci_layer_apply_stats_t *stats,
+                     oci_meta_table_t *meta,
+                     const char *log_label,
+                     const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    return unpack_layer_impl(bs, desc, stage_dir, UNPACK_MODE_OVERLAY, stats,
+                             meta, log_label, err);
+}
+
+int oci_unpack_layer_raw(oci_blob_store_t *bs,
+                         const oci_descriptor_t *desc,
+                         const char *raw_dir,
+                         oci_layer_apply_stats_t *stats,
+                         oci_meta_table_t *meta,
+                         const char *log_label,
+                         const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    return unpack_layer_impl(bs, desc, raw_dir, UNPACK_MODE_RAW, stats, meta,
+                             log_label, err);
+}
+
+/* --- C3.3c-ii two-pass overlay assembler ------------------------------- */
+
+#define UN_RAW_META_SIDECAR ".elfuse-meta.layer.json"
+
+static bool is_whiteout_name(const char *name)
+{
+    return strncmp(name, ".wh.", 4) == 0;
+}
+
+/* Remove every direct child of path, leaving path itself in place. Used
+ * to honour the OCI ".wh..wh..opq" opaque marker: the parent directory
+ * stays so this layer's siblings can land on top.
+ */
+static int clear_dir_contents(const char *path, const char **err)
+{
+    DIR *d = opendir(path);
+    if (!d) {
+        if (errno == ENOENT)
+            return 0;
+        return set_err(err, "assemble: clear opendir failed", errno);
+    }
+    struct dirent *de;
+    int rc = 0;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char child[UN_PATH_MAX];
+        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (n < 0 || (size_t) n >= sizeof(child)) {
+            rc = set_err(err, "assemble: clear path overflow", ENAMETOOLONG);
+            break;
+        }
+        if (rm_recursive(child) < 0) {
+            rc = set_err(err, "assemble: clear rm child failed", errno);
+            break;
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
+static int assembly_walk_whiteouts(const char *raw_dir,
+                                   const char *stage_dir,
+                                   const char **err)
+{
+    DIR *d = opendir(raw_dir);
+    if (!d)
+        return set_err(err, "assemble: whiteout opendir failed", errno);
+    struct dirent *de;
+    int rc = 0;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (strcmp(de->d_name, UN_RAW_META_SIDECAR) == 0)
+            continue;
+        char raw_child[UN_PATH_MAX];
+        char stage_child[UN_PATH_MAX];
+        int n1 = snprintf(raw_child, sizeof(raw_child), "%s/%s", raw_dir,
+                          de->d_name);
+        int n2 = snprintf(stage_child, sizeof(stage_child), "%s/%s", stage_dir,
+                          de->d_name);
+        if (n1 < 0 || (size_t) n1 >= sizeof(raw_child) ||
+            n2 < 0 || (size_t) n2 >= sizeof(stage_child)) {
+            rc = set_err(err, "assemble: whiteout path overflow",
+                         ENAMETOOLONG);
+            break;
+        }
+        struct stat st;
+        if (lstat(raw_child, &st) < 0) {
+            rc = set_err(err, "assemble: whiteout lstat failed", errno);
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            /* Recurse: subdirectories may carry their own markers. The
+             * stage_child counterpart may not exist yet (pass 2 creates
+             * the missing directories), which is fine: descending into
+             * the raw side still finds the markers, and the rm-r /
+             * clear-contents calls below tolerate a missing target.
+             */
+            if (assembly_walk_whiteouts(raw_child, stage_child, err) < 0) {
+                rc = -1;
+                break;
+            }
+            continue;
+        }
+        if (!S_ISREG(st.st_mode))
+            continue;
+        if (strcmp(de->d_name, ".wh..wh..opq") == 0) {
+            if (clear_dir_contents(stage_dir, err) < 0) {
+                rc = -1;
+                break;
+            }
+            continue;
+        }
+        if (is_whiteout_name(de->d_name)) {
+            char target[UN_PATH_MAX];
+            int nt = snprintf(target, sizeof(target), "%s/%s", stage_dir,
+                              de->d_name + 4);
+            if (nt < 0 || (size_t) nt >= sizeof(target)) {
+                rc = set_err(err, "assemble: whiteout target overflow",
+                             ENAMETOOLONG);
+                break;
+            }
+            if (rm_recursive(target) < 0) {
+                rc = set_err(err, "assemble: whiteout rm failed", errno);
+                break;
+            }
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
+static int assembly_walk_content(const char *raw_dir,
+                                 const char *stage_dir,
+                                 const char **err)
+{
+    DIR *d = opendir(raw_dir);
+    if (!d)
+        return set_err(err, "assemble: content opendir failed", errno);
+    struct dirent *de;
+    int rc = 0;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (strcmp(de->d_name, UN_RAW_META_SIDECAR) == 0)
+            continue;
+        if (is_whiteout_name(de->d_name))
+            continue;
+        char raw_child[UN_PATH_MAX];
+        char stage_child[UN_PATH_MAX];
+        int n1 = snprintf(raw_child, sizeof(raw_child), "%s/%s", raw_dir,
+                          de->d_name);
+        int n2 = snprintf(stage_child, sizeof(stage_child), "%s/%s", stage_dir,
+                          de->d_name);
+        if (n1 < 0 || (size_t) n1 >= sizeof(raw_child) ||
+            n2 < 0 || (size_t) n2 >= sizeof(stage_child)) {
+            rc = set_err(err, "assemble: content path overflow",
+                         ENAMETOOLONG);
+            break;
+        }
+        struct stat raw_st;
+        if (lstat(raw_child, &raw_st) < 0) {
+            rc = set_err(err, "assemble: content lstat failed", errno);
+            break;
+        }
+        if (S_ISDIR(raw_st.st_mode)) {
+            struct stat dst;
+            if (lstat(stage_child, &dst) < 0) {
+                if (errno != ENOENT) {
+                    rc = set_err(err, "assemble: stage dir stat failed",
+                                 errno);
+                    break;
+                }
+                if (mkdir(stage_child, 0755) < 0) {
+                    rc = set_err(err, "assemble: stage mkdir failed", errno);
+                    break;
+                }
+            } else if (!S_ISDIR(dst.st_mode)) {
+                /* Lower-layer non-dir collides with this layer's dir.
+                 * Overlay semantics: this layer's dir wins. unlink the
+                 * lower entry and create the dir.
+                 */
+                if (unlink(stage_child) < 0) {
+                    rc = set_err(err,
+                                 "assemble: stage unlink-for-dir failed",
+                                 errno);
+                    break;
+                }
+                if (mkdir(stage_child, 0755) < 0) {
+                    rc = set_err(err,
+                                 "assemble: stage mkdir-replace failed",
+                                 errno);
+                    break;
+                }
+            }
+            if (assembly_walk_content(raw_child, stage_child, err) < 0) {
+                rc = -1;
+                break;
+            }
+            continue;
+        }
+        /* Regular file or symlink (or any other non-directory): unlink
+         * any existing destination then clonefile NOFOLLOW so APFS COW
+         * keeps the byte cost flat. Per D8, hardlink relationships from
+         * the tar are not reconstructed (each clonefile produces an
+         * independent inode).
+         */
+        struct stat dst;
+        if (lstat(stage_child, &dst) == 0) {
+            if (rm_recursive(stage_child) < 0) {
+                rc = set_err(err, "assemble: unlink dst failed", errno);
+                break;
+            }
+        } else if (errno != ENOENT) {
+            rc = set_err(err, "assemble: dst lstat failed", errno);
+            break;
+        }
+        if (clonefile(raw_child, stage_child, CLONE_NOFOLLOW) < 0) {
+            if (errno == EXDEV) {
+                rc = set_err(err,
+                             "assemble: clonefile EXDEV (raw cache and "
+                             "stage must share an APFS volume)", EXDEV);
+                break;
+            }
+            rc = set_err(err, "assemble: clonefile failed", errno);
+            break;
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
+int oci_unpack_assemble_layer(const char *raw_dir,
+                              const char *stage_dir,
+                              const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!raw_dir || !stage_dir)
+        return set_err(err, "assemble: NULL argument", EINVAL);
+    struct stat st;
+    if (lstat(raw_dir, &st) < 0 || !S_ISDIR(st.st_mode))
+        return set_err(err, "assemble: raw_dir is not a directory", ENOTDIR);
+    if (lstat(stage_dir, &st) < 0 || !S_ISDIR(st.st_mode))
+        return set_err(err, "assemble: stage_dir is not a directory",
+                       ENOTDIR);
+    if (assembly_walk_whiteouts(raw_dir, stage_dir, err) < 0)
         return -1;
-
+    if (assembly_walk_content(raw_dir, stage_dir, err) < 0)
+        return -1;
     return 0;
 }
 
@@ -675,49 +824,272 @@ int oci_unpack(oci_store_t *store,
         goto fail_stage_dir;
     }
 
-    oci_meta_table_t *meta = oci_meta_table_new();
-    if (!meta) {
-        oci_image_config_free(&cfg);
-        free(image_hex);
-        oci_manifest_free(&manifest);
+    /* C3.3c-ii orchestrator state. cum_meta accumulates the running
+     * cumulative meta table (uid/gid/mode per guest path); layer_meta
+     * is reset to a fresh table at the start of every loop iteration;
+     * chains holds the precomputed OCI ChainID strings for every
+     * layer so the stack-cache prefix search is one stat(2) per layer.
+     */
+    oci_meta_table_t *cum_meta = NULL;
+    oci_meta_table_t *layer_meta = NULL;
+    char (*chains)[OCI_DIGEST_HEX_MAX + 16] = NULL;
+
+    cum_meta = oci_meta_table_new();
+    if (!cum_meta) {
         set_err(err, "unpack: meta table alloc failed", ENOMEM);
-        goto fail_stage_dir;
+        goto fail_orch;
     }
 
-    for (size_t i = 0; i < manifest.nlayers; i++) {
+    if (manifest.nlayers > 0) {
+        chains = malloc(manifest.nlayers * sizeof(*chains));
+        if (!chains) {
+            set_err(err, "unpack: chain array alloc failed", ENOMEM);
+            goto fail_orch;
+        }
+        const char *prev = NULL;
+        for (size_t i = 0; i < manifest.nlayers; i++) {
+            if (oci_chainid_compute(prev, cfg.rootfs_diff_ids[i], chains[i],
+                                    sizeof(chains[i])) < 0) {
+                set_err(err, "unpack: chain compute failed",
+                        errno ? errno : EINVAL);
+                goto fail_orch;
+            }
+            prev = chains[i];
+        }
+    }
+
+    /* Search the stack cache backwards for the longest matching prefix
+     * snapshot. On hit, clonefile-restore the assembled stage_dir
+     * straight from cache and continue with the trailing layers only.
+     * No hit -> stage_dir stays at the empty mkdir_p state and the
+     * orchestrator iterates over every layer.
+     */
+    size_t start_i = 0;
+    for (size_t k = manifest.nlayers; k-- > 0;) {
+        int hit = oci_store_stack_has(store, chains[k]);
+        if (hit < 0) {
+            set_err(err, "unpack: stack lookup failed", errno);
+            goto fail_orch;
+        }
+        if (hit != 1)
+            continue;
+        char stack_dir[UN_PATH_MAX];
+        if (oci_store_stack_resolve(store, chains[k], stack_dir,
+                                    sizeof(stack_dir)) < 0) {
+            set_err(err, "unpack: stack resolve failed", errno);
+            goto fail_orch;
+        }
+        size_t sl = strlen(stack_dir);
+        if (sl > 0 && stack_dir[sl - 1] == '/')
+            stack_dir[sl - 1] = '\0';
+        /* clonefile rejects a pre-existing destination. The freshly
+         * mkdir_p'd stage_dir is empty but exists; rm it so the
+         * clonefile call can recreate it from the snapshot.
+         */
+        if (rm_recursive(stage_dir) < 0) {
+            set_err(err, "unpack: stage rm-for-stack failed", errno);
+            goto fail_orch;
+        }
+        if (clonefile(stack_dir, stage_dir, CLONE_NOFOLLOW) < 0) {
+            int saved = errno;
+            set_err(err,
+                    saved == EXDEV
+                        ? "unpack: stack restore EXDEV (store and stage "
+                          "must share an APFS volume)"
+                        : "unpack: stack restore clonefile failed",
+                    saved);
+            goto fail_orch;
+        }
+        /* Re-load the cumulative meta sidecar the stack snapshot
+         * persisted so trailing layers accumulate on top. A missing
+         * sidecar (older snapshot) is benign: cum_meta stays empty.
+         */
+        oci_meta_table_t *restored = NULL;
+        const char *merr = NULL;
+        if (oci_meta_read(stage_dir, &restored, &merr) < 0) {
+            if (errno != ENOENT) {
+                set_err(err,
+                        merr ? merr : "unpack: stack meta read failed",
+                        errno);
+                goto fail_orch;
+            }
+            errno = 0;
+        } else {
+            int mrc = oci_meta_merge(cum_meta, restored);
+            int saved = errno;
+            oci_meta_table_free(restored);
+            if (mrc < 0) {
+                set_err(err, "unpack: stack meta merge failed", saved);
+                goto fail_orch;
+            }
+        }
+        start_i = k + 1;
+        if (!quiet)
+            fprintf(stderr,
+                    "elfuse oci unpack: stack hit at chain %zu/%zu\n",
+                    start_i, manifest.nlayers);
+        break;
+    }
+
+    if (!quiet && manifest.nlayers > 0)
+        fprintf(stderr,
+                "elfuse oci unpack: applying %zu layer(s) (cache start %zu)\n",
+                manifest.nlayers - start_i, start_i);
+
+    for (size_t i = start_i; i < manifest.nlayers; i++) {
         char label[32];
         const char *log_label = NULL;
         if (!quiet) {
             snprintf(label, sizeof(label), "layer %zu", i + 1);
             log_label = label;
         }
-        oci_unpack_layer_options_t lopts = {
-            .cache_store = store,
-            .diff_id = cfg.rootfs_diff_ids[i],
-        };
-        if (oci_unpack_layer(bs, &manifest.layers[i], stage_dir, &lopts, NULL,
-                             meta, log_label, err) < 0) {
-            oci_meta_table_free(meta);
-            oci_image_config_free(&cfg);
-            free(image_hex);
-            oci_manifest_free(&manifest);
-            goto fail_stage_dir;
+
+        layer_meta = oci_meta_table_new();
+        if (!layer_meta) {
+            set_err(err, "unpack: layer meta alloc failed", ENOMEM);
+            goto fail_orch;
+        }
+
+        const char *diff_id = cfg.rootfs_diff_ids[i];
+        char raw_cache_dir[UN_PATH_MAX];
+        int raw_hit = oci_store_layer_has(store, diff_id);
+        if (raw_hit < 0) {
+            set_err(err, "unpack: raw cache lookup failed", errno);
+            goto fail_orch;
+        }
+        if (raw_hit == 1) {
+            if (oci_store_layer_resolve(store, diff_id, raw_cache_dir,
+                                        sizeof(raw_cache_dir)) < 0) {
+                set_err(err, "unpack: raw cache resolve failed", errno);
+                goto fail_orch;
+            }
+            size_t rl = strlen(raw_cache_dir);
+            if (rl > 0 && raw_cache_dir[rl - 1] == '/')
+                raw_cache_dir[rl - 1] = '\0';
+            /* Load the per-layer sidecar so cum_meta picks up the
+             * uid/gid/mode entries the cache writer recorded at
+             * populate time. Missing sidecar is benign (older or
+             * hand-seeded entry).
+             */
+            oci_meta_table_t *loaded = NULL;
+            const char *merr = NULL;
+            if (oci_meta_read_named(raw_cache_dir, UN_RAW_META_SIDECAR,
+                                    &loaded, &merr) < 0) {
+                if (errno != ENOENT) {
+                    set_err(err,
+                            merr ? merr : "unpack: raw meta read failed",
+                            errno);
+                    goto fail_orch;
+                }
+                errno = 0;
+            } else {
+                oci_meta_table_free(layer_meta);
+                layer_meta = loaded;
+            }
+            if (log_label)
+                fprintf(stderr, "  %s: %s (raw cached)\n", log_label,
+                        manifest.layers[i].digest_str);
+        } else {
+            char raw_stage[UN_PATH_MAX];
+            if (oci_store_layer_stage_path(store, diff_id, raw_stage,
+                                           sizeof(raw_stage)) < 0) {
+                set_err(err, "unpack: raw stage_path resolve failed",
+                        errno);
+                goto fail_orch;
+            }
+            if (mkdir(raw_stage, 0755) < 0) {
+                set_err(err, "unpack: raw stage mkdir failed", errno);
+                goto fail_orch;
+            }
+            if (oci_unpack_layer_raw(bs, &manifest.layers[i], raw_stage,
+                                     NULL, layer_meta, log_label, err) < 0) {
+                (void) rm_recursive(raw_stage);
+                goto fail_orch;
+            }
+            const char *mwerr = NULL;
+            if (oci_meta_write_named(layer_meta, raw_stage,
+                                     UN_RAW_META_SIDECAR, &mwerr) < 0) {
+                set_err(err,
+                        mwerr ? mwerr : "unpack: raw meta write failed",
+                        errno);
+                (void) rm_recursive(raw_stage);
+                goto fail_orch;
+            }
+            const char *cerr = NULL;
+            if (oci_store_layer_commit(store, raw_stage, diff_id, &cerr) <
+                0) {
+                int saved = errno;
+                set_err(err,
+                        cerr ? cerr : "unpack: raw cache commit failed",
+                        saved);
+                (void) rm_recursive(raw_stage);
+                goto fail_orch;
+            }
+            if (oci_store_layer_resolve(store, diff_id, raw_cache_dir,
+                                        sizeof(raw_cache_dir)) < 0) {
+                set_err(err, "unpack: raw cache resolve failed", errno);
+                goto fail_orch;
+            }
+            size_t rl = strlen(raw_cache_dir);
+            if (rl > 0 && raw_cache_dir[rl - 1] == '/')
+                raw_cache_dir[rl - 1] = '\0';
+        }
+
+        if (oci_unpack_assemble_layer(raw_cache_dir, stage_dir, err) < 0)
+            goto fail_orch;
+
+        int mrc = oci_meta_merge(cum_meta, layer_meta);
+        int saved_errno = errno;
+        oci_meta_table_free(layer_meta);
+        layer_meta = NULL;
+        if (mrc < 0) {
+            set_err(err, "unpack: cum meta merge failed", saved_errno);
+            goto fail_orch;
+        }
+
+        /* Snapshot stage_dir into the per-prefix stack cache so future
+         * unpacks sharing this chain prefix short-circuit. Failure here
+         * is fatal: silently degrading the cache would defeat the
+         * dedup path.
+         */
+        if (oci_meta_write(cum_meta, stage_dir, err) < 0)
+            goto fail_orch;
+        char stack_stage[UN_PATH_MAX];
+        if (oci_store_stack_stage_path(store, chains[i], stack_stage,
+                                       sizeof(stack_stage)) < 0) {
+            set_err(err, "unpack: stack stage_path resolve failed", errno);
+            goto fail_orch;
+        }
+        if (clonefile(stage_dir, stack_stage, CLONE_NOFOLLOW) < 0) {
+            int saved = errno;
+            set_err(err,
+                    saved == EXDEV
+                        ? "unpack: stack snapshot EXDEV (store and stage "
+                          "must share an APFS volume)"
+                        : "unpack: stack snapshot clonefile failed",
+                    saved);
+            goto fail_orch;
+        }
+        const char *scerr = NULL;
+        if (oci_store_stack_commit(store, stack_stage, chains[i], &scerr) <
+            0) {
+            int saved = errno;
+            (void) rm_recursive(stack_stage);
+            set_err(err, scerr ? scerr : "unpack: stack commit failed",
+                    saved);
+            goto fail_orch;
         }
     }
 
-    /* Persist the cumulative meta sidecar after the loop. Cache miss paths
-     * inside oci_unpack_layer already flushed an intermediate sidecar for
-     * snapshot purposes; this final write makes the on-disk state agree
-     * with the in-memory table regardless of which path each layer took.
+    /* The per-iteration writes already produced an up-to-date sidecar
+     * on disk. On the full-stack-hit path (no iterations ran) the
+     * clonefile-restored stage_dir also already carries the snapshot's
+     * sidecar, so a final write would only re-emit identical bytes.
      */
-    if (oci_meta_write(meta, stage_dir, err) < 0) {
-        oci_meta_table_free(meta);
-        oci_image_config_free(&cfg);
-        free(image_hex);
-        oci_manifest_free(&manifest);
-        goto fail_stage_dir;
-    }
-    oci_meta_table_free(meta);
+    oci_meta_table_free(cum_meta);
+    cum_meta = NULL;
+    free(chains);
+    chains = NULL;
 
     /* Origin sidecar: records manifest_digest + config_digest + diff_ids
      * the Plan 1 keep-set walker reads. A failure here aborts the commit
@@ -774,6 +1146,13 @@ int oci_unpack(oci_store_t *store,
     free(volume_root);
     return 0;
 
+fail_orch:
+    oci_meta_table_free(layer_meta);
+    oci_meta_table_free(cum_meta);
+    free(chains);
+    oci_image_config_free(&cfg);
+    free(image_hex);
+    oci_manifest_free(&manifest);
 fail_stage_dir: {
     char rm[UN_PATH_MAX];
     snprintf(rm, sizeof(rm), "rm -rf '%s'", stage_dir);
