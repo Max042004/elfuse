@@ -40,7 +40,9 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "blob-store.h"
 #include "digest-set.h"
@@ -200,3 +202,54 @@ int oci_store_collect_roots(oci_store_t *s,
                             oci_digest_set_t *out,
                             const char *volume_root,
                             const char **err);
+
+/* Options + stats for oci_store_prune. Output fields are filled
+ * regardless of dry-run vs commit so callers can render a uniform
+ * report from the same struct.
+ */
+typedef struct {
+    /* Inputs */
+    bool commit;             /* false (default) = dry-run; true = unlink */
+    const char *volume_root; /* NULL = pin-only walk (see collect_roots) */
+
+    /* Outputs */
+    size_t kept_blobs;
+    size_t pruned_blobs;
+    uint64_t pruned_bytes;
+} oci_store_prune_options_t;
+
+/* Garbage-collect dangling blobs from <root>/blobs/<algo>/. The mark
+ * phase calls oci_store_collect_roots(s, &set, opts->volume_root, ...)
+ * so the keep semantics match exactly: pinned manifests plus the
+ * config + layer blobs they reference, image-index sub-manifests,
+ * and every blob reachable from an unpacked sysroot's
+ * .elfuse-origin.json. The sweep phase walks blobs/sha256/ and
+ * blobs/sha512/, comparing each <algo>:<hex> against the keep set;
+ * any blob whose digest is not reachable is counted as
+ * pruned_blobs and (when opts->commit is true) unlinked.
+ *
+ * The whole operation runs under flock(<root>/index.json.lock,
+ * LOCK_EX), which is the same write lock oci_store_put_ref holds.
+ * That bounds the race where a concurrent pull writes a new pin
+ * after collect_roots already snapshotted index.json: the pull
+ * cannot acquire the lock until prune releases it, so a pinned
+ * manifest is either visible to mark or its put_ref has not started
+ * yet (and the corresponding blob commit either has not happened or
+ * is treated as a transient resource the caller will re-fetch).
+ *
+ * On entry opts->kept_blobs / pruned_blobs / pruned_bytes are reset
+ * to zero so the caller does not have to memset between invocations.
+ * Subdirectories under blobs/<algo>/ and files whose names are not
+ * valid lowercase hex for that algorithm are skipped without
+ * surfacing as errors (the directory is part of the OCI image-layout
+ * spec only for regular blob files; anything else is treated as
+ * foreign state we must not touch).
+ *
+ * Returns 0 on success and -1 on failure with errno preserved and
+ * *err (when non-NULL) populated. Mark-phase failure is fatal and
+ * aborts before any unlink so a corrupt or torn manifest cannot
+ * cause prune to delete reachable blobs.
+ */
+int oci_store_prune(oci_store_t *s,
+                    oci_store_prune_options_t *opts,
+                    const char **err);

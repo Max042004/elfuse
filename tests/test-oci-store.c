@@ -25,6 +25,7 @@
  *     suppression works, and a coexisting index.json is left alone
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -2230,6 +2231,640 @@ static void test_collect_missing_manifest_blob_fails(const char *scratch)
     report_pass("collect_missing_manifest_blob_fails");
 }
 
+/* ── C1.3 oci_store_prune tests ───────────────────────────────────── */
+
+/* Count regular files under <root>/blobs/sha256/. Used by every prune
+ * test to assert what the sweep did or did not touch on disk.
+ */
+static size_t count_sha256_blobs(const char *root)
+{
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/blobs/sha256", root);
+    DIR *dp = opendir(dir);
+    if (!dp)
+        return 0;
+    size_t n = 0;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (de->d_name[0] == '.')
+            continue;
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (lstat(p, &st) == 0 && S_ISREG(st.st_mode))
+            n++;
+    }
+    closedir(dp);
+    return n;
+}
+
+/* Stage a payload as a free-standing blob (not referenced by any
+ * manifest) and write the resulting "<algo>:<hex>" digest into
+ * out_digest. The blob lives at <root>/blobs/sha256/<hex>; the caller
+ * uses count_sha256_blobs to assert it survives or is reclaimed.
+ */
+static bool stage_dangling(oci_blob_store_t *blobs, const char *payload,
+                           char *out_digest, size_t cap)
+{
+    return stage_manifest_blob(blobs, payload, strlen(payload), out_digest,
+                               cap);
+}
+
+static void test_prune_dry_run_preserves_disk(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-dry-run", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_dry_run_preserves_disk", "open failed");
+        return;
+    }
+    const char *layers[] = {"prune-dry-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "prune-dry-config", layers, 1, &im)) {
+        report_fail("prune_dry_run_preserves_disk", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/dry:1", &ref)) {
+        report_fail("prune_dry_run_preserves_disk", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("prune_dry_run_preserves_disk",
+                    perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    char dangling_a[OCI_DIGEST_HEX_MAX + 16];
+    char dangling_b[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dangling(oci_store_blobs(s), "dangling-a", dangling_a,
+                        sizeof(dangling_a)) ||
+        !stage_dangling(oci_store_blobs(s), "dangling-b", dangling_b,
+                        sizeof(dangling_b))) {
+        report_fail("prune_dry_run_preserves_disk", "stage_dangling failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    size_t before = count_sha256_blobs(root);
+    if (before != 5) {
+        report_fail("prune_dry_run_preserves_disk",
+                    "expected 5 blobs on disk before prune");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {0};
+    const char *err = NULL;
+    int rc = oci_store_prune(s, &opts, &err);
+    if (rc < 0) {
+        report_fail("prune_dry_run_preserves_disk",
+                    err ? err : "prune returned -1");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_blobs != 3 || opts.pruned_blobs != 2 ||
+        opts.pruned_bytes == 0) {
+        report_fail("prune_dry_run_preserves_disk",
+                    "stats mismatch (want kept=3 pruned=2 bytes>0)");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    size_t after = count_sha256_blobs(root);
+    if (after != 5) {
+        report_fail("prune_dry_run_preserves_disk",
+                    "dry-run touched the disk");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("prune_dry_run_preserves_disk");
+}
+
+static void test_prune_commit_unlinks_dangling(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-commit", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_commit_unlinks_dangling", "open failed");
+        return;
+    }
+    const char *layers[] = {"prune-commit-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "prune-commit-config", layers, 1,
+                     &im)) {
+        report_fail("prune_commit_unlinks_dangling", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/commit:1", &ref)) {
+        report_fail("prune_commit_unlinks_dangling", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("prune_commit_unlinks_dangling",
+                    perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    char dangling_a[OCI_DIGEST_HEX_MAX + 16];
+    char dangling_b[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dangling(oci_store_blobs(s), "danga", dangling_a,
+                        sizeof(dangling_a)) ||
+        !stage_dangling(oci_store_blobs(s), "dangb", dangling_b,
+                        sizeof(dangling_b))) {
+        report_fail("prune_commit_unlinks_dangling", "stage_dangling failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    int rc = oci_store_prune(s, &opts, &err);
+    if (rc < 0) {
+        report_fail("prune_commit_unlinks_dangling",
+                    err ? err : "prune returned -1");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_blobs != 3 || opts.pruned_blobs != 2) {
+        report_fail("prune_commit_unlinks_dangling",
+                    "stats mismatch (want kept=3 pruned=2)");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 3) {
+        report_fail("prune_commit_unlinks_dangling",
+                    "dangling blobs survived commit");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    /* Reachable blobs (manifest, config, layer) must all still be on
+     * disk. Check each one explicitly so a future regression that
+     * deletes a reachable blob does not slip past the count check.
+     */
+    char path[1024];
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *keep_digests[3] = {im.manifest_digest, im.config_digest,
+                                   im.layer_digests[0]};
+    for (size_t i = 0; i < 3; i++) {
+        if (!oci_digest_parse(keep_digests[i], &algo, hex)) {
+            report_fail("prune_commit_unlinks_dangling", "digest parse");
+            stage_image_free(&im);
+            oci_store_close(s);
+            return;
+        }
+        snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+        struct stat st;
+        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            report_fail("prune_commit_unlinks_dangling",
+                        "reachable blob missing after commit");
+            stage_image_free(&im);
+            oci_store_close(s);
+            return;
+        }
+    }
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("prune_commit_unlinks_dangling");
+}
+
+static void test_prune_no_pins_no_volume(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-no-pins", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_no_pins_no_volume", "open failed");
+        return;
+    }
+    char digest[OCI_DIGEST_HEX_MAX + 16];
+    for (int i = 0; i < 5; i++) {
+        char payload[32];
+        snprintf(payload, sizeof(payload), "free-blob-%d", i);
+        if (!stage_dangling(oci_store_blobs(s), payload, digest,
+                            sizeof(digest))) {
+            report_fail("prune_no_pins_no_volume", "stage_dangling failed");
+            oci_store_close(s);
+            return;
+        }
+    }
+    if (count_sha256_blobs(root) != 5) {
+        report_fail("prune_no_pins_no_volume", "expected 5 staged dangling");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    int rc = oci_store_prune(s, &opts, &err);
+    if (rc < 0) {
+        report_fail("prune_no_pins_no_volume",
+                    err ? err : "prune returned -1");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_blobs != 0 || opts.pruned_blobs != 5) {
+        report_fail("prune_no_pins_no_volume",
+                    "stats mismatch (want kept=0 pruned=5)");
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 0) {
+        report_fail("prune_no_pins_no_volume",
+                    "blobs/sha256/ not empty after commit");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_no_pins_no_volume");
+}
+
+static void test_prune_with_unpacked_tree(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-unpacked", scratch);
+    char volume[1024];
+    snprintf(volume, sizeof(volume), "%s/case-prune-unpacked-vol", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_with_unpacked_tree", "open failed");
+        return;
+    }
+    const char *layers[] = {"unp-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "unp-config", layers, 1, &im)) {
+        report_fail("prune_with_unpacked_tree", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    /* No pin: only the unpacked sysroot keeps the image reachable. */
+    if (!seed_unpacked_tree(
+            volume,
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            &im)) {
+        report_fail("prune_with_unpacked_tree", "seed_unpacked_tree failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    char dangling_a[OCI_DIGEST_HEX_MAX + 16];
+    char dangling_b[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dangling(oci_store_blobs(s), "danga2", dangling_a,
+                        sizeof(dangling_a)) ||
+        !stage_dangling(oci_store_blobs(s), "dangb2", dangling_b,
+                        sizeof(dangling_b))) {
+        report_fail("prune_with_unpacked_tree", "stage_dangling failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {.commit = true, .volume_root = volume};
+    const char *err = NULL;
+    int rc = oci_store_prune(s, &opts, &err);
+    if (rc < 0) {
+        report_fail("prune_with_unpacked_tree",
+                    err ? err : "prune returned -1");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_blobs != 3 || opts.pruned_blobs != 2) {
+        report_fail("prune_with_unpacked_tree",
+                    "stats mismatch (want kept=3 pruned=2)");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 3) {
+        report_fail("prune_with_unpacked_tree", "blob count != 3 after commit");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("prune_with_unpacked_tree");
+}
+
+static void test_prune_collect_failure_aborts(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-collect-fail", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_collect_failure_aborts", "open failed");
+        return;
+    }
+    const char *layers[] = {"collect-fail-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "collect-fail-config", layers, 1,
+                     &im)) {
+        report_fail("prune_collect_failure_aborts", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/cf:1", &ref)) {
+        report_fail("prune_collect_failure_aborts", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("prune_collect_failure_aborts",
+                    perr ? perr : "put failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    char dangling_a[OCI_DIGEST_HEX_MAX + 16];
+    char dangling_b[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dangling(oci_store_blobs(s), "abort-a", dangling_a,
+                        sizeof(dangling_a)) ||
+        !stage_dangling(oci_store_blobs(s), "abort-b", dangling_b,
+                        sizeof(dangling_b))) {
+        report_fail("prune_collect_failure_aborts", "stage_dangling failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    /* Unlink the pinned manifest blob so collect_roots fails on its
+     * mark walk. prune must not enter the sweep phase after that.
+     */
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    oci_digest_algo_t algo;
+    if (!oci_digest_parse(im.manifest_digest, &algo, hex)) {
+        report_fail("prune_collect_failure_aborts", "digest parse");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+    if (unlink(path) < 0) {
+        report_fail("prune_collect_failure_aborts", "unlink manifest blob");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    size_t before = count_sha256_blobs(root);
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    int rc = oci_store_prune(s, &opts, &err);
+    if (rc != -1) {
+        report_fail("prune_collect_failure_aborts",
+                    "expected -1 on mark failure");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 0) {
+        report_fail("prune_collect_failure_aborts",
+                    "sweep ran despite mark failure");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != before) {
+        report_fail("prune_collect_failure_aborts",
+                    "disk state changed despite mark failure");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("prune_collect_failure_aborts");
+}
+
+static void test_prune_idempotent(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-idempotent", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_idempotent", "open failed");
+        return;
+    }
+    const char *layers[] = {"idem-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "idem-config", layers, 1, &im)) {
+        report_fail("prune_idempotent", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/idem:1", &ref)) {
+        report_fail("prune_idempotent", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("prune_idempotent", perr ? perr : "put failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    /* First sweep is a no-op already (no dangling), but run it
+     * anyway so the second call has a known baseline.
+     */
+    oci_store_prune_options_t opts1 = {.commit = true};
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts1, &err) < 0) {
+        report_fail("prune_idempotent", err ? err : "first prune failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_store_prune_options_t opts2 = {.commit = true};
+    if (oci_store_prune(s, &opts2, &err) < 0) {
+        report_fail("prune_idempotent", err ? err : "second prune failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts2.kept_blobs != 3 || opts2.pruned_blobs != 0 ||
+        opts2.pruned_bytes != 0) {
+        report_fail("prune_idempotent",
+                    "second prune saw work to do");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("prune_idempotent");
+}
+
+static void test_prune_decoy_subdir_ignored(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-decoy", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_decoy_subdir_ignored", "open failed");
+        return;
+    }
+    const char *layers[] = {"decoy-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "decoy-config", layers, 1, &im)) {
+        report_fail("prune_decoy_subdir_ignored", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/decoy:1", &ref)) {
+        report_fail("prune_decoy_subdir_ignored", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("prune_decoy_subdir_ignored", perr ? perr : "put failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    /* Drop a decoy subdirectory and a non-hex regular file in
+     * blobs/sha256/. Both must be ignored by sweep: a subdirectory
+     * cannot be a blob and a wrongly-named file is not addressable as
+     * a digest. Either being touched would break interoperability
+     * with external tools that scribble metadata in the same dir.
+     */
+    char decoy_dir[1024];
+    snprintf(decoy_dir, sizeof(decoy_dir), "%s/blobs/sha256/decoydir", root);
+    if (mkdir(decoy_dir, 0755) < 0) {
+        report_fail("prune_decoy_subdir_ignored", "mkdir decoy");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char decoy_file[1024];
+    snprintf(decoy_file, sizeof(decoy_file), "%s/blobs/sha256/not-a-blob",
+             root);
+    int fd = open(decoy_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail("prune_decoy_subdir_ignored", "create decoy file");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    (void) write(fd, "x", 1);
+    close(fd);
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    int rc = oci_store_prune(s, &opts, &err);
+    if (rc < 0) {
+        report_fail("prune_decoy_subdir_ignored",
+                    err ? err : "prune returned -1");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_blobs != 3 || opts.pruned_blobs != 0) {
+        report_fail("prune_decoy_subdir_ignored",
+                    "stats mismatch (want kept=3 pruned=0)");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    struct stat st;
+    if (lstat(decoy_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail("prune_decoy_subdir_ignored",
+                    "decoy subdir disappeared");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (lstat(decoy_file, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail("prune_decoy_subdir_ignored",
+                    "decoy file disappeared");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("prune_decoy_subdir_ignored");
+}
+
+static void test_prune_invalid_args_rejected(const char *scratch)
+{
+    (void) scratch;
+    const char *err = NULL;
+    int rc = oci_store_prune(NULL, NULL, &err);
+    if (rc != -1 || errno != EINVAL) {
+        report_fail("prune_invalid_args_rejected",
+                    "NULL args should fail with EINVAL");
+        return;
+    }
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-null-opts", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_invalid_args_rejected", "open failed");
+        return;
+    }
+    err = NULL;
+    rc = oci_store_prune(s, NULL, &err);
+    if (rc != -1 || errno != EINVAL) {
+        report_fail("prune_invalid_args_rejected",
+                    "NULL opts should fail with EINVAL");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_invalid_args_rejected");
+}
+
 int main(void)
 {
     printf("OCI store unit tests\n");
@@ -2264,6 +2899,14 @@ int main(void)
     test_collect_pin_plus_unpacked(scratch);
     test_collect_origin_corrupt_fails(scratch);
     test_collect_missing_manifest_blob_fails(scratch);
+    test_prune_dry_run_preserves_disk(scratch);
+    test_prune_commit_unlinks_dangling(scratch);
+    test_prune_no_pins_no_volume(scratch);
+    test_prune_with_unpacked_tree(scratch);
+    test_prune_collect_failure_aborts(scratch);
+    test_prune_idempotent(scratch);
+    test_prune_decoy_subdir_ignored(scratch);
+    test_prune_invalid_args_rejected(scratch);
 
     wipe_dir(scratch);
     free(scratch);

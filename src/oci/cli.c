@@ -79,6 +79,13 @@ static int print_usage(FILE *out)
         "  --keep                Do not register the run dir for cleanup "
         "(no-op)\n"
         "\n"
+        "Prune options:\n"
+        "  --store DIR           Override the local store root\n"
+        "  --volume DIR          Treat unpacked sysroots under DIR/images/ as "
+        "roots\n"
+        "  --commit              Actually unlink dangling blobs "
+        "(default: dry-run)\n"
+        "\n"
         "Refs follow the docker/containerd grammar:\n"
         "  alpine, alpine:3.20, user/repo, ghcr.io/owner/img:tag,\n"
         "  repo@sha256:<hex>, repo:tag@sha256:<hex>\n",
@@ -602,6 +609,119 @@ static int cmd_not_implemented(const char *name)
     return 2;
 }
 
+/* Argument parser state for `oci prune`. The flag set is intentionally
+ * minimal: dry-run is the default (so the operator can review what would
+ * be reclaimed before committing) and --commit is the only switch that
+ * actually unlinks. --volume mirrors the same flag in unpack/clone so
+ * the same volume root the user uses for unpacked sysroots also feeds
+ * the keep-set walk; without --volume only pins contribute.
+ */
+typedef struct {
+    const char *store_root;
+    const char *volume_root;
+    bool commit;
+} prune_args_t;
+
+static int parse_prune_args(int argc, char **argv, prune_args_t *out)
+{
+    int i = 1;
+    while (i < argc) {
+        const char *a = argv[i];
+        if (a[0] != '-')
+            break;
+        if (!strcmp(a, "--")) {
+            i++;
+            break;
+        }
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            return 1;
+        } else if (!strcmp(a, "--commit")) {
+            out->commit = true;
+        } else if (!strcmp(a, "--store")) {
+            if (++i >= argc) {
+                fputs("error: --store needs an argument\n", stderr);
+                return -1;
+            }
+            out->store_root = argv[i];
+        } else if (!strcmp(a, "--volume")) {
+            if (++i >= argc) {
+                fputs("error: --volume needs an argument\n", stderr);
+                return -1;
+            }
+            out->volume_root = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown prune option: %s\n", a);
+            return -1;
+        }
+        i++;
+    }
+    if (i != argc) {
+        fputs("error: prune takes no positional arguments\n", stderr);
+        return -1;
+    }
+    return 0;
+}
+
+static int cmd_prune(int argc, char **argv)
+{
+    prune_args_t args = {0};
+    int prc = parse_prune_args(argc, argv, &args);
+    if (prc == 1)
+        return print_usage(stdout);
+    if (prc < 0)
+        return 2;
+
+    char *default_root = NULL;
+    const char *store_root = args.store_root;
+    if (!store_root) {
+        default_root = oci_store_default_root();
+        if (!default_root) {
+            fprintf(stderr,
+                    "error: could not determine default store root "
+                    "(HOME not set?)\n");
+            return 1;
+        }
+        store_root = default_root;
+    }
+
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        fprintf(stderr, "error: could not open store at %s: %s\n", store_root,
+                strerror(errno));
+        free(default_root);
+        return 1;
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = args.commit,
+        .volume_root = args.volume_root,
+    };
+    const char *err = NULL;
+    int rc = oci_store_prune(store, &opts, &err);
+    if (rc < 0) {
+        fprintf(stderr, "error: prune failed: %s\n",
+                err ? err : strerror(errno));
+        oci_store_close(store);
+        free(default_root);
+        return 1;
+    }
+
+    if (args.commit) {
+        printf("reclaimed: %zu blobs (%llu bytes)\n", opts.pruned_blobs,
+               (unsigned long long) opts.pruned_bytes);
+        printf("kept:      %zu blobs\n", opts.kept_blobs);
+    } else {
+        printf("reclaimable: %zu blobs (%llu bytes)\n", opts.pruned_blobs,
+               (unsigned long long) opts.pruned_bytes);
+        printf("kept:        %zu blobs\n", opts.kept_blobs);
+        printf("(dry-run; pass --commit to delete)\n");
+    }
+
+    oci_store_close(store);
+    free(default_root);
+    return 0;
+}
+
 int oci_cli_main(int argc, char **argv)
 {
     if (argc < 2)
@@ -621,7 +741,7 @@ int oci_cli_main(int argc, char **argv)
     if (!strcmp(sub, "run"))
         return oci_cli_run(argc - 1, argv + 1);
     if (!strcmp(sub, "prune"))
-        return cmd_not_implemented("prune");
+        return cmd_prune(argc - 1, argv + 1);
     if (!strcmp(sub, "list") || !strcmp(sub, "ls"))
         return cmd_not_implemented("list");
 

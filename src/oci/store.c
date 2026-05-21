@@ -1629,3 +1629,196 @@ static int migrate_legacy_refs(struct oci_store *s)
     }
     return 0;
 }
+
+/* Algorithm set this build expects to find under blobs/. Other algorithm
+ * subdirectories (a future operator hand-created sha384/, for instance)
+ * are left untouched: sweep only inspects directories it recognises.
+ */
+static const oci_digest_algo_t PRUNE_ALGOS[] = {
+    OCI_DIGEST_SHA256,
+    OCI_DIGEST_SHA512,
+};
+
+/* Sweep one blobs/<algo>/ directory. For every regular file whose name is
+ * a valid lowercase hex digest of the right length, build the canonical
+ * "<algo>:<hex>" digest string and consult the keep set; anything not in
+ * the set is counted as pruned, and when commit is true also unlink()ed.
+ * lstat ENOENT mid-walk is treated as a concurrent prune and counted
+ * silently. Subdirectories and otherwise-shaped entries (tmp leftovers,
+ * dotfiles, files with non-hex names) are skipped without surfacing as
+ * errors because the OCI image-layout spec only blesses the regular-blob
+ * shape; foreign state is not ours to delete.
+ *
+ * Returns 0 on success and -1 with errno preserved on an unrecoverable
+ * IO failure (failed opendir other than ENOENT, failed unlink in commit
+ * mode, etc).
+ */
+static int sweep_algo_dir(oci_store_t *s,
+                          oci_digest_algo_t algo,
+                          const oci_digest_set_t *keep,
+                          bool commit,
+                          oci_store_prune_options_t *stats,
+                          const char **err)
+{
+    const char *algo_name = oci_digest_algo_name(algo);
+    if (!algo_name) {
+        if (err)
+            *err = "prune: unknown digest algorithm";
+        errno = EINVAL;
+        return -1;
+    }
+
+    char dir_path[STORE_PATH_MAX];
+    int n = snprintf(dir_path, sizeof(dir_path), "%s/blobs/%s", s->root,
+                     algo_name);
+    if (n < 0 || (size_t) n >= sizeof(dir_path)) {
+        if (err)
+            *err = "prune: blobs/<algo> path exceeds STORE_PATH_MAX";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    DIR *dp = opendir(dir_path);
+    if (!dp) {
+        if (errno == ENOENT)
+            return 0;
+        if (err)
+            *err = "prune: opendir on blobs/<algo> failed";
+        return -1;
+    }
+
+    int rc = 0;
+    struct dirent *de;
+    size_t hex_len = oci_digest_hex_len(algo);
+    while ((de = readdir(dp)) != NULL) {
+        const char *name = de->d_name;
+        if (name[0] == '.' &&
+            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            continue;
+        if (name[0] == '.')
+            continue;
+        /* Reject anything that is not the expected hex shape before
+         * paying for an lstat. This both filters subdirectories (whose
+         * names rarely happen to be 64 hex chars) and shields the
+         * digest_set lookup from non-blob filenames.
+         */
+        if (strlen(name) != hex_len)
+            continue;
+        if (!oci_digest_hex_valid(algo, name))
+            continue;
+
+        char blob_path[STORE_PATH_MAX];
+        int bn = snprintf(blob_path, sizeof(blob_path), "%s/%s", dir_path,
+                          name);
+        if (bn < 0 || (size_t) bn >= sizeof(blob_path)) {
+            if (err)
+                *err = "prune: blob path exceeds STORE_PATH_MAX";
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+
+        struct stat st;
+        if (lstat(blob_path, &st) < 0) {
+            if (errno == ENOENT)
+                continue;
+            if (err)
+                *err = "prune: lstat on blob failed";
+            rc = -1;
+            break;
+        }
+        if (!S_ISREG(st.st_mode))
+            continue;
+
+        /* Canonical "<algo>:<hex>" for the keep-set lookup. The set
+         * stores digests in this form (see digest-set.h note about
+         * pre-validated input from oci_digest_parse).
+         */
+        char digest[OCI_DIGEST_HEX_MAX + 16];
+        int dn = snprintf(digest, sizeof(digest), "%s:%s", algo_name, name);
+        if (dn < 0 || (size_t) dn >= sizeof(digest)) {
+            if (err)
+                *err = "prune: digest string buffer too small";
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+
+        if (oci_digest_set_contains(keep, digest)) {
+            stats->kept_blobs++;
+            continue;
+        }
+
+        stats->pruned_blobs++;
+        stats->pruned_bytes += (uint64_t) st.st_size;
+
+        if (commit) {
+            if (unlink(blob_path) < 0) {
+                /* ENOENT here matches a concurrent prune in another
+                 * process: the count already moved, so the deletion is
+                 * effectively done. Anything else is fatal because
+                 * leaving a partial sweep would let the caller's stats
+                 * report bytes we did not actually reclaim.
+                 */
+                if (errno == ENOENT)
+                    continue;
+                if (err)
+                    *err = "prune: unlink on dangling blob failed";
+                rc = -1;
+                break;
+            }
+        }
+    }
+    closedir(dp);
+    return rc;
+}
+
+int oci_store_prune(oci_store_t *s,
+                    oci_store_prune_options_t *opts,
+                    const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!s || !opts) {
+        if (err)
+            *err = "prune: NULL argument";
+        errno = EINVAL;
+        return -1;
+    }
+
+    opts->kept_blobs = 0;
+    opts->pruned_blobs = 0;
+    opts->pruned_bytes = 0;
+
+    /* Serialize against oci_store_put_ref so a pull cannot publish a
+     * new pin between collect_roots and sweep. Mark and sweep both run
+     * under the lock.
+     */
+    int lock_fd = acquire_index_lock(s->root, err);
+    if (lock_fd < 0)
+        return -1;
+
+    oci_digest_set_t keep = {0};
+    if (oci_store_collect_roots(s, &keep, opts->volume_root, err) < 0) {
+        int saved = errno;
+        close(lock_fd);
+        errno = saved;
+        return -1;
+    }
+
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(PRUNE_ALGOS) / sizeof(PRUNE_ALGOS[0]); i++) {
+        if (sweep_algo_dir(s, PRUNE_ALGOS[i], &keep, opts->commit, opts, err) <
+            0) {
+            rc = -1;
+            break;
+        }
+    }
+    int saved = errno;
+    oci_digest_set_free(&keep);
+    close(lock_fd);
+    errno = saved;
+    return rc;
+}

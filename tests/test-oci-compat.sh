@@ -170,6 +170,78 @@ case "${inspect_out}" in
     *) bad "fixture: inspect User" "no 1234:5678" ;;
 esac
 
+# ── Prune CLI smoke ──────────────────────────────────────────────────
+
+# The fixture above produced 3 reachable blobs (layer + config + manifest).
+# Drop two extra dangling blobs into blobs/sha256/ via dd + sha256sum
+# substitutes; this proves the end-to-end CLI dispatch (parser, store
+# open, mark, sweep, output formatter) runs without any C-level
+# unit-test scaffolding.
+mkdir -p "${SCRATCH}/danglings"
+echo "compat-dangling-one" > "${SCRATCH}/danglings/a"
+echo "compat-dangling-two" > "${SCRATCH}/danglings/b"
+for f in "${SCRATCH}/danglings/a" "${SCRATCH}/danglings/b"; do
+    if command -v shasum >/dev/null 2>&1; then
+        hex=$(shasum -a 256 "$f" | awk '{print $1}')
+    else
+        hex=$(sha256sum "$f" | awk '{print $1}')
+    fi
+    cp "$f" "${STORE}/blobs/sha256/${hex}"
+done
+
+blob_before_prune=$(find "${STORE}/blobs/sha256" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ "${blob_before_prune}" = 5 ]; then
+    ok "prune-smoke: 5 blobs before prune (3 reachable + 2 dangling)"
+else
+    bad "prune-smoke: pre-state" "got ${blob_before_prune} (want 5)"
+fi
+
+# Dry-run must not touch disk and must report 2 reclaimable blobs.
+dry_out=$("${ELFUSE}" oci prune --store "${STORE}" 2>&1)
+rc=$?
+case "${dry_out}" in
+    *"reclaimable: 2 blobs"*"kept:"*"3 blobs"*"dry-run"*)
+        if [ "${rc}" = 0 ]; then
+            ok "prune-smoke: dry-run reports 2 reclaimable, 3 kept"
+        else
+            bad "prune-smoke: dry-run" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "prune-smoke: dry-run output" "${dry_out}"
+        ;;
+esac
+
+blob_after_dry=$(find "${STORE}/blobs/sha256" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ "${blob_after_dry}" = 5 ]; then
+    ok "prune-smoke: dry-run did not touch disk"
+else
+    bad "prune-smoke: dry-run disk" "got ${blob_after_dry} (want 5)"
+fi
+
+# Commit reclaims the two dangling blobs.
+commit_out=$("${ELFUSE}" oci prune --store "${STORE}" --commit 2>&1)
+rc=$?
+case "${commit_out}" in
+    *"reclaimed: 2 blobs"*"kept:"*"3 blobs"*)
+        if [ "${rc}" = 0 ]; then
+            ok "prune-smoke: --commit reclaims 2 blobs"
+        else
+            bad "prune-smoke: --commit" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "prune-smoke: --commit output" "${commit_out}"
+        ;;
+esac
+
+blob_after_commit=$(find "${STORE}/blobs/sha256" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ "${blob_after_commit}" = 3 ]; then
+    ok "prune-smoke: --commit unlinked dangling blobs"
+else
+    bad "prune-smoke: --commit disk" "got ${blob_after_commit} (want 3)"
+fi
+
 # ── Heavy mode (full E2E launches) ───────────────────────────────────
 
 if [ -n "${OCI_COMPAT_TEST:-}" ]; then
