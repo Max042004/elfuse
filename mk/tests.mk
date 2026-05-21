@@ -8,7 +8,8 @@
         test-full test-multi-vcpu test-rwx \
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
-        test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
+        test-oci-inspect test-oci-dedup-metrics \
+        test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-origin \
         test-oci-layer-apply test-oci-volume test-oci-clone \
         test-oci-unpack test-oci-runspec test-oci-path-resolve \
@@ -55,6 +56,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-pull
 	@printf "\n$(BLUE)━━━ OCI inspect renderer unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-inspect
+	@printf "\n$(BLUE)━━━ OCI cross-image dedup metrics unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-dedup-metrics
 	@printf "\n$(BLUE)━━━ OCI tar reader unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-tar
 	@printf "\n$(BLUE)━━━ OCI decompression dispatch unit tests ━━━$(RESET)\n"
@@ -118,6 +121,12 @@ test-oci-pull: $(BUILD_DIR)/test-oci-pull
 ## Run the OCI inspect renderer unit tests (native, no HVF, no network)
 test-oci-inspect: $(BUILD_DIR)/test-oci-inspect
 	@$(BUILD_DIR)/test-oci-inspect
+
+## Run the OCI cross-image dedup metrics unit tests (native, no HVF, no network).
+## Phase 1 Plan 3 C3.4: validates oci_dedup_metrics_compute against pin-only
+## and pin + unpacked-tree scratch stores.
+test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics
+	@$(BUILD_DIR)/test-oci-dedup-metrics
 
 ## Run the OCI tar reader unit tests (native, no HVF, no network)
 test-oci-tar: $(BUILD_DIR)/test-oci-tar

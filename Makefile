@@ -76,6 +76,7 @@ SRCS := \
     oci/store.c \
     oci/pull.c \
     oci/inspect.c \
+    oci/dedup-metrics.c \
     oci/tar.c \
     oci/decompress.c \
     oci/layer-meta.c \
@@ -242,7 +243,15 @@ $(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mo
 ## Build the OCI inspect renderer unit test (native macOS, no HVF). Pure
 ## offline: no fetcher, no mock server, no libcurl. Pre-populates the store
 ## via oci_blob_store_put_bytes + oci_store_put_ref.
-$(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/inspect.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/inspect.o $(BUILD_DIR)/oci/dedup-metrics.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI cross-image dedup metrics unit test (native macOS, no HVF).
+## Drives oci_dedup_metrics_compute against scratch stores hand-populated
+## via oci_blob_store_put_bytes + oci_store_put_ref. Same dependency set
+## as test-oci-inspect, plus oci/dedup-metrics.o.
+$(BUILD_DIR)/test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics.o $(BUILD_DIR)/oci/dedup-metrics.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

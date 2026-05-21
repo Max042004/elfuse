@@ -60,6 +60,8 @@ static int print_usage(FILE *out)
         "\n"
         "Inspect options:\n"
         "  --store DIR           Override the local store root\n"
+        "  --volume DIR          Include unpacked sysroots under DIR/images/\n"
+        "                        in the layer reuse comparison\n"
         "  --all-platforms       List every platform entry of an image index\n"
         "                        instead of drilling into linux/arm64\n"
         "\n"
@@ -108,6 +110,7 @@ static int print_usage(FILE *out)
  */
 typedef struct {
     const char *store_root;
+    const char *volume_root;
     bool show_all_platforms;
     const char *ref_str;
 } inspect_args_t;
@@ -133,6 +136,12 @@ static int parse_inspect_args(int argc, char **argv, inspect_args_t *out)
                 return -1;
             }
             out->store_root = argv[i];
+        } else if (!strcmp(a, "--volume")) {
+            if (++i >= argc) {
+                fputs("error: --volume needs an argument\n", stderr);
+                return -1;
+            }
+            out->volume_root = argv[i];
         } else {
             fprintf(stderr, "error: unknown inspect option: %s\n", a);
             return -1;
@@ -206,6 +215,7 @@ static int cmd_inspect(int argc, char **argv)
     oci_inspect_options_t opts = {
         .out = stdout,
         .show_all_platforms = args.show_all_platforms,
+        .volume_root = args.volume_root,
     };
     err = NULL;
     int rc = oci_inspect(store, &ref, &opts, &err);

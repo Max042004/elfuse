@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "blob-store.h"
+#include "dedup-metrics.h"
 #include "digest.h"
 #include "manifest.h"
 #include "media-type.h"
@@ -281,6 +282,65 @@ static void render_manifest(FILE *out,
     try_render_runtime(out, blobs, &mf->config);
 }
 
+/* Render the C3.4 "layer reuse:" section. Compares the target manifest's
+ * diff_id list and ChainID chain against every other image recorded in the
+ * store (pins plus, when volume_root is set, unpacked sysroots) and prints
+ * a two-line summary:
+ *
+ *   layer reuse:
+ *     raw cache:   N/M layers shared with K other image(s)[, X on cache]
+ *     stack cache: deepest shared prefix reaches layer P/M (sha256:...)
+ *
+ * Failure modes are intentionally soft: a missing or malformed image-config
+ * for the target prints "layer reuse: (image-config unavailable)" without
+ * disturbing the surrounding manifest tree output. An empty store (no other
+ * images to compare against) prints "(no other images to compare)" so the
+ * operator can tell "0 shared because nothing to share with" apart from
+ * "0 shared because nothing overlaps".
+ *
+ * Bytes formatting: values >= 1 MiB render as "~X.Y MiB on cache"; smaller
+ * non-zero values render in bytes; zero bytes are omitted (still print the
+ * layer count, just without a bytes clause) because a 0 B clause would imply
+ * the raw cache is populated when it isn't.
+ */
+static void render_layer_reuse(FILE *out,
+                               oci_store_t *store,
+                               const char *manifest_digest,
+                               const char *volume_root)
+{
+    oci_dedup_metrics_t m = {0};
+    const char *err = NULL;
+    if (oci_dedup_metrics_compute(store, manifest_digest, volume_root, &m,
+                                  &err) < 0) {
+        fprintf(out, "layer reuse: (image-config unavailable)\n");
+        return;
+    }
+    if (m.compared_images == 0) {
+        fprintf(out, "layer reuse: (no other images to compare)\n");
+        return;
+    }
+    fprintf(out, "layer reuse:\n");
+    fprintf(out, "  raw cache:   %zu/%zu layers shared with %zu other image(s)",
+            m.shared_layers, m.total_layers, m.compared_images);
+    if (m.shared_bytes >= (uint64_t) 1024 * 1024) {
+        double mib = (double) m.shared_bytes / (1024.0 * 1024.0);
+        fprintf(out, ", ~%.1f MiB on cache", mib);
+    } else if (m.shared_bytes > 0) {
+        fprintf(out, ", %" PRIu64 " B on cache", m.shared_bytes);
+    }
+    fputc('\n', out);
+    if (m.deepest_shared_prefix > 0) {
+        char short_chain[24];
+        short_digest(m.deepest_shared_chainid, short_chain);
+        fprintf(out,
+                "  stack cache: deepest shared prefix reaches layer %zu/%zu"
+                " (%s)\n",
+                m.deepest_shared_prefix, m.total_layers, short_chain);
+    } else {
+        fprintf(out, "  stack cache: no shared prefix\n");
+    }
+}
+
 /* Render the index entry table. Default mode prints only the picked
  * linux/arm64 entry (with a "[arm64]" tag); --all-platforms prints every
  * entry, tagging the picked one so users still see which one elfuse will
@@ -471,6 +531,12 @@ int oci_inspect(oci_store_t *store,
                         0) {
                         render_manifest(out, oci_store_blobs(store), &sub_mf,
                                         picked->desc.digest_str);
+                        if (!opts || !opts->suppress_layer_reuse) {
+                            render_layer_reuse(out, store,
+                                               picked->desc.digest_str,
+                                               opts ? opts->volume_root
+                                                    : NULL);
+                        }
                         oci_manifest_free(&sub_mf);
                     } else {
                         fprintf(out,
@@ -490,6 +556,10 @@ int oci_inspect(oci_store_t *store,
         fprintf(out, "type:       image manifest (%s)\n\n",
                 mmt ? mmt : "unknown");
         render_manifest(out, oci_store_blobs(store), &mf, NULL);
+        if (!opts || !opts->suppress_layer_reuse) {
+            render_layer_reuse(out, store, pinned,
+                               opts ? opts->volume_root : NULL);
+        }
     }
 
     /* errno preserved across cleanup, like slice 5a oci_pull. */

@@ -46,9 +46,21 @@ typedef struct {
     FILE *out;
     /* List every platform entry of an image index instead of only the picked
      * linux/arm64 entry. In this mode oci_inspect does not drill into any
-     * sub-manifest.
+     * sub-manifest and skips the layer reuse section.
      */
     bool show_all_platforms;
+    /* Optional volume root for the unpacked-sysroot walk in the layer reuse
+     * section. NULL means pin-only dedup, matching the C1.2 GC walker
+     * convention. Pure information: dedup metrics never write to disk.
+     */
+    const char *volume_root;
+    /* When true (default), render a "layer reuse:" section after the
+     * manifest layer table. Setting this to false suppresses the section
+     * entirely (useful for tests that only want to verify the renderer
+     * baseline without dedup compute side-effects). The CLI never sets
+     * this to false.
+     */
+    bool suppress_layer_reuse;
 } oci_inspect_options_t;
 
 /* Render the manifest tree the store holds for ref. opts may be NULL for the

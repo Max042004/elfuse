@@ -40,6 +40,7 @@
 #include "oci/blob-store.h"
 #include "oci/digest.h"
 #include "oci/inspect.h"
+#include "oci/origin-meta.h"
 #include "oci/ref.h"
 #include "oci/store.h"
 
@@ -697,6 +698,436 @@ static void case_runtime_empty_env(const char *scratch)
     oci_store_close(store);
 }
 
+/* C3.4 fixtures ------------------------------------------------------- */
+
+/* Compose an image-config blob carrying the given NULL-terminated diff_id
+ * list. The runtime block is intentionally empty so the runtime section
+ * does not appear in inspect output; that keeps the layer reuse assertions
+ * independent of runtime rendering details.
+ */
+static char *put_reuse_config(oci_blob_store_t *blobs, char *const *diff_ids,
+                              size_t *out_len)
+{
+    char *diffs = strdup("");
+    if (!diffs)
+        return NULL;
+    for (size_t i = 0; diff_ids[i]; i++) {
+        size_t need = strlen(diffs) + strlen(diff_ids[i]) + 8;
+        char *grown = malloc(need);
+        if (!grown) {
+            free(diffs);
+            return NULL;
+        }
+        snprintf(grown, need, "%s%s\"%s\"", diffs, i == 0 ? "" : ",",
+                 diff_ids[i]);
+        free(diffs);
+        diffs = grown;
+    }
+    size_t body_len = 0;
+    char *body = vformat(&body_len,
+                         "{\"architecture\":\"arm64\",\"os\":\"linux\","
+                         "\"config\":{},\"rootfs\":{\"type\":\"layers\","
+                         "\"diff_ids\":[%s]}}",
+                         diffs);
+    free(diffs);
+    if (!body)
+        return NULL;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (oci_digest_bytes(OCI_DIGEST_SHA256, body, body_len, hex) == 0) {
+        free(body);
+        return NULL;
+    }
+    if (oci_blob_store_put_bytes(blobs, OCI_DIGEST_SHA256, hex, body,
+                                 body_len) < 0) {
+        free(body);
+        return NULL;
+    }
+    char *digest = malloc(OCI_DIGEST_HEX_MAX + 16);
+    if (!digest) {
+        free(body);
+        return NULL;
+    }
+    snprintf(digest, OCI_DIGEST_HEX_MAX + 16, "sha256:%s", hex);
+    if (out_len)
+        *out_len = body_len;
+    free(body);
+    return digest;
+}
+
+/* Compose a single-layer image-manifest pointing at config_digest. The
+ * layer descriptor digest is synthetic ("sha256:11...1") because the
+ * dedup walker only reads the config blob. */
+static char *put_reuse_manifest(oci_blob_store_t *blobs, const char *config_digest)
+{
+    static const char LAYER_DIGEST[] =
+        "sha256:11111111111111111111111111111111111111111111111111111111"
+        "11111111";
+    size_t body_len = 0;
+    char *body = vformat(
+        &body_len,
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+        "\"digest\":\"%s\",\"size\":1},"
+        "\"layers\":[{\"mediaType\":"
+        "\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"%s\",\"size\":1}]}",
+        config_digest, LAYER_DIGEST);
+    if (!body)
+        return NULL;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    char *digest = malloc(OCI_DIGEST_HEX_MAX + 16);
+    if (!digest) {
+        free(body);
+        return NULL;
+    }
+    if (!put_manifest_blob(blobs, body, body_len, digest,
+                           OCI_DIGEST_HEX_MAX + 16, hex)) {
+        free(body);
+        free(digest);
+        return NULL;
+    }
+    free(body);
+    return digest;
+}
+
+static char *diff_id_n_reuse(int id)
+{
+    char *r = malloc(80);
+    if (!r)
+        return NULL;
+    snprintf(r, 80,
+             "sha256:00000000000000000000000000000000000000000000000000000000"
+             "0000000%x",
+             id & 0xf);
+    return r;
+}
+
+static bool pin_helper(oci_store_t *store, const char *ref_str,
+                       const char *manifest_digest)
+{
+    oci_ref_t ref = {0};
+    if (oci_ref_parse(ref_str, &ref, NULL) < 0)
+        return false;
+    bool ok = oci_store_put_ref(store, &ref, manifest_digest, NULL) == 0;
+    oci_ref_free(&ref);
+    return ok;
+}
+
+/* Case 8: two pinned images share layers -> reuse section renders ----- */
+
+static void case_layer_reuse_shared_section_renders(const char *scratch)
+{
+    const char *name =
+        "inspect: layer reuse section renders shared/total/compared";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-reuse-shared", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    char *d1 = diff_id_n_reuse(1);
+    char *d2 = diff_id_n_reuse(2);
+    char *d3 = diff_id_n_reuse(3);
+    char *d4 = diff_id_n_reuse(4);
+
+    char *target_diffs[] = {d1, d2, d3, NULL};
+    char *target_cfg = put_reuse_config(blobs, target_diffs, NULL);
+    char *target_mf = put_reuse_manifest(blobs, target_cfg);
+
+    char *other_diffs[] = {d1, d2, d4, NULL};
+    char *other_cfg = put_reuse_config(blobs, other_diffs, NULL);
+    char *other_mf = put_reuse_manifest(blobs, other_cfg);
+
+    pin_helper(store, "scratch:target", target_mf);
+    pin_helper(store, "scratch:other", other_mf);
+
+    oci_ref_t ref = {0};
+    oci_ref_parse("scratch:target", &ref, NULL);
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d", r.rc);
+    } else if (!contains(r.out, "layer reuse:")) {
+        report_fail(name, "missing layer reuse section header");
+    } else if (!contains(r.out,
+                         "raw cache:   2/3 layers shared with 1 other image(s)")) {
+        report_fail(name, "raw cache line shape mismatch (got: %s)", r.out);
+    } else if (!contains(r.out, "stack cache: deepest shared prefix reaches"
+                                " layer 2/3")) {
+        report_fail(name, "stack cache line shape mismatch");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(d1);
+    free(d2);
+    free(d3);
+    free(d4);
+    free(target_cfg);
+    free(target_mf);
+    free(other_cfg);
+    free(other_mf);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* Case 9: two pinned images, disjoint diff_ids -> zero shared --------- */
+
+static void case_layer_reuse_zero_shared(const char *scratch)
+{
+    const char *name = "inspect: zero overlap renders 0/N with no prefix";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-reuse-zero", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    char *d1 = diff_id_n_reuse(1);
+    char *d2 = diff_id_n_reuse(2);
+    char *d5 = diff_id_n_reuse(5);
+    char *d6 = diff_id_n_reuse(6);
+
+    char *target_diffs[] = {d1, d2, NULL};
+    char *target_cfg = put_reuse_config(blobs, target_diffs, NULL);
+    char *target_mf = put_reuse_manifest(blobs, target_cfg);
+
+    char *other_diffs[] = {d5, d6, NULL};
+    char *other_cfg = put_reuse_config(blobs, other_diffs, NULL);
+    char *other_mf = put_reuse_manifest(blobs, other_cfg);
+
+    pin_helper(store, "scratch:target", target_mf);
+    pin_helper(store, "scratch:other", other_mf);
+
+    oci_ref_t ref = {0};
+    oci_ref_parse("scratch:target", &ref, NULL);
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d", r.rc);
+    } else if (!contains(r.out, "raw cache:   0/2 layers shared with 1 other image(s)")) {
+        report_fail(name, "raw cache zero-shared shape mismatch");
+    } else if (!contains(r.out, "stack cache: no shared prefix")) {
+        report_fail(name, "missing no-shared-prefix line");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(d1);
+    free(d2);
+    free(d5);
+    free(d6);
+    free(target_cfg);
+    free(target_mf);
+    free(other_cfg);
+    free(other_mf);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* Case 10: only one image in the store -> "no other images to compare" */
+
+static void case_layer_reuse_single_image_in_store(const char *scratch)
+{
+    const char *name = "inspect: single pinned image renders no-others sentinel";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-reuse-single", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    char *d1 = diff_id_n_reuse(1);
+    char *diffs[] = {d1, NULL};
+    char *cfg = put_reuse_config(blobs, diffs, NULL);
+    char *mf = put_reuse_manifest(blobs, cfg);
+    pin_helper(store, "scratch:lonely", mf);
+
+    oci_ref_t ref = {0};
+    oci_ref_parse("scratch:lonely", &ref, NULL);
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d", r.rc);
+    } else if (!contains(r.out, "layer reuse: (no other images to compare)")) {
+        report_fail(name, "missing no-others sentinel");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(d1);
+    free(cfg);
+    free(mf);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* Case 11: target's image-config blob missing -> degrade gracefully --- */
+
+static void case_layer_reuse_config_missing_degrades(const char *scratch)
+{
+    const char *name =
+        "inspect: target image-config blob missing -> degrade sentinel";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-reuse-cfg-missing", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    char *d1 = diff_id_n_reuse(1);
+    char *diffs[] = {d1, NULL};
+    char *cfg = put_reuse_config(blobs, diffs, NULL);
+    char *mf = put_reuse_manifest(blobs, cfg);
+    pin_helper(store, "scratch:degrade", mf);
+
+    /* Unlink the config blob so the dedup walker hits ENOENT on the
+     * target's config read. inspect itself still renders the manifest
+     * tree because try_render_runtime degrades silently.
+     */
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    oci_digest_parse(cfg, &algo, hex);
+    char blob_path[1024];
+    snprintf(blob_path, sizeof(blob_path), "%s/blobs/sha256/%s", root, hex);
+    unlink(blob_path);
+
+    oci_ref_t ref = {0};
+    oci_ref_parse("scratch:degrade", &ref, NULL);
+    inspect_result_t r;
+    run_inspect(store, &ref, NULL, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d (expected 0 even on degrade)", r.rc);
+    } else if (!contains(r.out, "layer reuse: (image-config unavailable)")) {
+        report_fail(name, "missing degrade sentinel");
+    } else if (!contains(r.out, "layers:")) {
+        report_fail(name, "manifest tree should still render");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(d1);
+    free(cfg);
+    free(mf);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* Case 12: --all-platforms suppresses the reuse section --------------- */
+
+static void case_layer_reuse_all_platforms_skips_section(const char *scratch)
+{
+    const char *name =
+        "inspect: --all-platforms on image index suppresses reuse section";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-reuse-all-platforms", scratch);
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    /* Build the same fixture case 3 uses, but assert absence of the
+     * layer reuse section. The drill is skipped under --all-platforms, so
+     * there is no manifest to feed the dedup walker.
+     */
+    size_t m_len = 0;
+    char *m_digest = build_and_store_manifest(blobs, &m_len);
+    size_t idx_len = 0;
+    char *idx_body = build_index_three_platforms(&idx_len, m_digest, m_len);
+    char idx_hex[OCI_DIGEST_HEX_MAX + 1];
+    char idx_digest[OCI_DIGEST_HEX_MAX + 16];
+    put_manifest_blob(blobs, idx_body, idx_len, idx_digest, sizeof(idx_digest),
+                      idx_hex);
+
+    oci_ref_t ref = {0};
+    oci_ref_parse("alpine:3.20", &ref, NULL);
+    oci_store_put_ref(store, &ref, idx_digest, NULL);
+
+    oci_inspect_options_t opts = {.show_all_platforms = true};
+    inspect_result_t r;
+    run_inspect(store, &ref, &opts, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d", r.rc);
+    } else if (contains(r.out, "layer reuse:")) {
+        report_fail(name, "reuse section must not render under --all-platforms");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(m_digest);
+    free(idx_body);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
+/* Case 13: volume_root walk counts an unpacked sysroot -------------- */
+
+static void case_layer_reuse_with_volume_root_counts_unpacked(const char *scratch)
+{
+    const char *name =
+        "inspect: --volume DIR counts unpacked sysroot in reuse compare";
+    char root[1024];
+    char volume[1024];
+    snprintf(root, sizeof(root), "%s/case-reuse-volume-store", scratch);
+    snprintf(volume, sizeof(volume), "%s/case-reuse-volume-vol", scratch);
+    mkdir(volume, 0755);
+
+    oci_store_t *store = oci_store_open(root);
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    char *d1 = diff_id_n_reuse(1);
+    char *d2 = diff_id_n_reuse(2);
+    char *diffs[] = {d1, d2, NULL};
+    char *cfg = put_reuse_config(blobs, diffs, NULL);
+    char *mf = put_reuse_manifest(blobs, cfg);
+    pin_helper(store, "scratch:target", mf);
+
+    /* Unpacked tree shares d2; its synthetic manifest_digest is NOT on
+     * disk, exercising the origin-sidecar-only path.
+     */
+    char *d7 = diff_id_n_reuse(7);
+    char *other_diffs[] = {d2, d7, NULL};
+    static const char OM[] =
+        "sha256:dead00000000000000000000000000000000000000000000000000000000beef";
+    static const char OC[] =
+        "sha256:cafe00000000000000000000000000000000000000000000000000000000babe";
+    char images_dir[1024];
+    snprintf(images_dir, sizeof(images_dir), "%s/images", volume);
+    mkdir(images_dir, 0755);
+    char tree[1024];
+    snprintf(tree, sizeof(tree),
+             "%s/sha256-fa00000000000000000000000000000000000000000000000000000000000001",
+             images_dir);
+    mkdir(tree, 0755);
+    oci_origin_write(tree, OM, OC, other_diffs, NULL);
+
+    oci_ref_t ref = {0};
+    oci_ref_parse("scratch:target", &ref, NULL);
+
+    oci_inspect_options_t opts = {.volume_root = volume};
+    inspect_result_t r;
+    run_inspect(store, &ref, &opts, &r);
+
+    if (r.rc != 0) {
+        report_fail(name, "rc=%d", r.rc);
+    } else if (!contains(r.out, "raw cache:   1/2 layers shared with 1 other image(s)")) {
+        report_fail(name, "raw cache line should report 1/2 shared with 1");
+    } else {
+        report_pass(name);
+    }
+
+    free(r.out);
+    free(d1);
+    free(d2);
+    free(d7);
+    free(cfg);
+    free(mf);
+    oci_ref_free(&ref);
+    oci_store_close(store);
+}
+
 int main(void)
 {
     char *scratch = make_scratch_root();
@@ -713,6 +1144,12 @@ int main(void)
     case_digest_blob_missing(scratch);
     case_sub_manifest_missing(scratch);
     case_runtime_empty_env(scratch);
+    case_layer_reuse_shared_section_renders(scratch);
+    case_layer_reuse_zero_shared(scratch);
+    case_layer_reuse_single_image_in_store(scratch);
+    case_layer_reuse_config_missing_degrades(scratch);
+    case_layer_reuse_all_platforms_skips_section(scratch);
+    case_layer_reuse_with_volume_root_counts_unpacked(scratch);
 
     wipe_dir(scratch);
     free(scratch);
