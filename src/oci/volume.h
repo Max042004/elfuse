@@ -48,3 +48,32 @@ int oci_volume_subdir(const char *volume_root,
                       const char *name,
                       char **out_path,
                       const char **err);
+
+/* One entry yielded by oci_volume_list_unpacked: an absolute path to
+ * an unpacked image tree (no trailing slash). Owned by the enclosing
+ * list and freed via oci_volume_list_free.
+ */
+typedef struct {
+    char **items;
+    size_t count;
+} oci_volume_list_t;
+
+/* Enumerate every unpacked image tree under <volume_root>/images/.
+ * Filters: only entries shaped sha256-<lowercase-hex> are returned;
+ * the .staging/ subdirectory and any dotfiles are skipped silently.
+ * Returns 0 on success with *out populated; an empty store yields
+ * count == 0 and items == NULL. A missing or unreachable volume_root
+ * is treated as the empty case (count == 0) rather than an error so
+ * that fresh stores without any unpacked sysroots can be enumerated
+ * without disturbing the volume provisioning path. Returns -1 with
+ * errno set and *err populated on IO failure traversing an existing
+ * images/ directory.
+ */
+int oci_volume_list_unpacked(const char *volume_root,
+                             oci_volume_list_t *out,
+                             const char **err);
+
+/* Release every item path in list and zero the struct. Safe on a
+ * zero-initialised list and on NULL.
+ */
+void oci_volume_list_free(oci_volume_list_t *list);

@@ -43,6 +43,7 @@
 #include <stddef.h>
 
 #include "blob-store.h"
+#include "digest-set.h"
 #include "ref.h"
 
 typedef struct oci_store oci_store_t;
@@ -160,3 +161,42 @@ int oci_store_list_refs(oci_store_t *s,
  * a zero-initialised list and on NULL.
  */
 void oci_pin_list_free(oci_pin_list_t *list);
+
+/* Mark phase of the Plan 1 garbage collector: enumerate every blob
+ * digest still reachable from on-disk state and accumulate them in
+ * *out. Two sources are walked:
+ *
+ *   1. Pins in index.json. For each pin's manifest digest, the
+ *      manifest blob is read and parsed; the config descriptor and
+ *      every layer descriptor are added to the set. If the pinned
+ *      blob is an OCI image-index instead of an image manifest, every
+ *      sub-manifest descriptor digest is added, and for each
+ *      sub-manifest whose blob is on disk the walk recurses into its
+ *      config + layers. Sub-manifests not on disk (the multi-arch
+ *      case where only one platform was fetched) are still added to
+ *      the keep set so a sweep does not delete a sub-manifest blob
+ *      that did materialise locally.
+ *
+ *   2. Unpacked image trees under <volume_root>/images/sha256-<hex>/.
+ *      Each tree's .elfuse-origin.json is parsed; its manifest_digest
+ *      drives the same manifest/config/layer expansion as a pin.
+ *
+ * Failure policy is fail-fast on anything that would let prune later
+ * delete a reachable blob: a missing manifest blob, an unparseable
+ * manifest, a missing or malformed .elfuse-origin.json, or a missing
+ * image-config blob all return -1 with *err populated so the operator
+ * can repair the store before retrying. A missing
+ * <volume_root>/images/ tree is treated as the fresh-store case
+ * (count == 0 contribution from that source) and not an error.
+ *
+ * volume_root may be NULL, in which case the unpacked-tree walk is
+ * skipped entirely. The pin walk runs unconditionally.
+ *
+ * Returns 0 on success; on failure returns -1 with errno preserved
+ * and *err (when non-NULL) pointing at a static description. On
+ * failure *out is left in a freed-empty state.
+ */
+int oci_store_collect_roots(oci_store_t *s,
+                            oci_digest_set_t *out,
+                            const char *volume_root,
+                            const char **err);

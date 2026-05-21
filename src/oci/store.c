@@ -58,7 +58,11 @@
 #include <unistd.h>
 
 #include "../../externals/cjson/cJSON.h"
+#include "digest-set.h"
 #include "digest.h"
+#include "manifest.h"
+#include "origin-meta.h"
+#include "volume.h"
 
 /* Largest path the store materializes. Comfortably above PATH_MAX so snprintf
  * truncation surfaces as ENAMETOOLONG instead of a silent corruption.
@@ -1027,6 +1031,260 @@ void oci_pin_list_free(oci_pin_list_t *list)
     }
     list->items = NULL;
     list->count = 0;
+}
+
+/* Slurp the manifest-class blob at digest_str into a heap buffer. The
+ * caller frees *out_body. Mirrors the size and bounds checks of
+ * infer_manifest_media_type so a corrupt or hostile blob does not
+ * trigger a multi-GB malloc here. Returns 0 on success or -1 with
+ * errno preserved on failure.
+ */
+static int load_manifest_blob(const oci_store_t *s, const char *digest_str,
+                              char **out_body, size_t *out_len)
+{
+    char path[STORE_PATH_MAX];
+    if (blob_path_for_digest(s, digest_str, path, sizeof(path)) < 0)
+        return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (st.st_size <= 0 || st.st_size > (off_t) MAX_MANIFEST_BYTES) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    size_t len = (size_t) st.st_size;
+    char *body = malloc(len + 1);
+    if (!body) {
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t got = read(fd, body + off, len - off);
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            int saved = errno;
+            free(body);
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        if (got == 0)
+            break;
+        off += (size_t) got;
+    }
+    close(fd);
+    if (off != len) {
+        free(body);
+        errno = EIO;
+        return -1;
+    }
+    body[len] = '\0';
+    *out_body = body;
+    *out_len = len;
+    return 0;
+}
+
+/* True when blobs/<algo>/<hex> for digest_str exists on disk. Errors
+ * other than ENOENT (permission, ENAMETOOLONG) propagate as "missing"
+ * because the caller's failure path treats either as fatal for the
+ * keep-set walk; the distinction is academic.
+ */
+static bool manifest_blob_exists(const oci_store_t *s, const char *digest_str)
+{
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(digest_str, &algo, hex))
+        return false;
+    return oci_blob_store_has(s->blobs, algo, hex);
+}
+
+/* Recursive expander: ensure digest_str is in out and, if its blob is
+ * a manifest or image-index, also add every descriptor it references.
+ * Recursion terminates because oci_digest_set_add is a no-op for any
+ * digest already in the set, so a cycle (theoretical: an image-index
+ * pointing at itself) is bounded.
+ *
+ * Returns 0 on success, -1 on fatal failure (missing or unparseable
+ * blob) with errno set and *err populated.
+ */
+static int expand_manifest_digest(oci_store_t *s,
+                                  const char *digest_str,
+                                  oci_digest_set_t *out,
+                                  const char **err)
+{
+    if (oci_digest_set_contains(out, digest_str))
+        return 0;
+    if (oci_digest_set_add(out, digest_str) < 0) {
+        if (err)
+            *err = "collect_roots: digest_set_add failed";
+        return -1;
+    }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    if (load_manifest_blob(s, digest_str, &body, &body_len) < 0) {
+        if (err)
+            *err = "collect_roots: referenced manifest blob is missing or "
+                   "unreadable";
+        return -1;
+    }
+
+    oci_manifest_t manifest = {0};
+    const char *perr = NULL;
+    if (oci_manifest_parse(body, body_len, &manifest, &perr) == 0) {
+        int rc = 0;
+        if (oci_digest_set_add(out, manifest.config.digest_str) < 0) {
+            if (err)
+                *err = "collect_roots: digest_set_add for config failed";
+            rc = -1;
+            goto manifest_done;
+        }
+        for (size_t i = 0; i < manifest.nlayers; i++) {
+            if (oci_digest_set_add(out,
+                                   manifest.layers[i].digest_str) < 0) {
+                if (err)
+                    *err = "collect_roots: digest_set_add for layer failed";
+                rc = -1;
+                goto manifest_done;
+            }
+        }
+    manifest_done:
+        oci_manifest_free(&manifest);
+        free(body);
+        return rc;
+    }
+    memset(&manifest, 0, sizeof(manifest));
+
+    /* Not an image-manifest. Try image-index: a multi-arch index
+     * references one sub-manifest descriptor per platform.
+     */
+    oci_index_t index = {0};
+    const char *ierr = NULL;
+    if (oci_index_parse(body, body_len, &index, &ierr) < 0) {
+        free(body);
+        if (err)
+            *err = "collect_roots: blob is neither image-manifest nor "
+                   "image-index";
+        errno = EINVAL;
+        return -1;
+    }
+    free(body);
+
+    for (size_t i = 0; i < index.nentries; i++) {
+        const char *sub = index.entries[i].desc.digest_str;
+        /* Record the sub-manifest descriptor digest even when the
+         * blob is not on disk: a multi-arch index legitimately
+         * references blobs for other platforms that pull never
+         * fetched, and a sweep must not delete the platforms that
+         * did materialise. When the blob is present recurse so its
+         * config + layers join the keep set; when absent the index
+         * descriptor alone is enough because there is no blob to
+         * delete.
+         */
+        if (manifest_blob_exists(s, sub)) {
+            if (expand_manifest_digest(s, sub, out, err) < 0) {
+                oci_index_free(&index);
+                return -1;
+            }
+        } else if (oci_digest_set_add(out, sub) < 0) {
+            if (err)
+                *err = "collect_roots: digest_set_add for sub-manifest failed";
+            oci_index_free(&index);
+            return -1;
+        }
+    }
+    oci_index_free(&index);
+    return 0;
+}
+
+int oci_store_collect_roots(oci_store_t *s,
+                            oci_digest_set_t *out,
+                            const char *volume_root,
+                            const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!s || !out) {
+        if (err)
+            *err = "collect_roots: NULL argument";
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_set_init(out);
+
+    /* Source 1: pins in index.json. list_refs handles the empty case
+     * (no index.json yet) without surfacing an error, so a fresh
+     * store contributes zero entries from this source.
+     */
+    oci_pin_list_t pins = {0};
+    const char *list_err = NULL;
+    if (oci_store_list_refs(s, &pins, &list_err) < 0) {
+        if (err)
+            *err = list_err ? list_err
+                            : "collect_roots: oci_store_list_refs failed";
+        return -1;
+    }
+    for (size_t i = 0; i < pins.count; i++) {
+        if (expand_manifest_digest(s, pins.items[i].digest, out, err) < 0) {
+            oci_pin_list_free(&pins);
+            oci_digest_set_free(out);
+            return -1;
+        }
+    }
+    oci_pin_list_free(&pins);
+
+    /* Source 2: unpacked image trees under <volume_root>/images/.
+     * A NULL volume_root skips this source entirely (callers that
+     * only need the pin contribution). A missing images/ directory
+     * is treated as zero contribution by oci_volume_list_unpacked.
+     */
+    if (volume_root) {
+        oci_volume_list_t trees = {0};
+        const char *vlerr = NULL;
+        if (oci_volume_list_unpacked(volume_root, &trees, &vlerr) < 0) {
+            if (err)
+                *err = vlerr ? vlerr
+                             : "collect_roots: volume_list_unpacked failed";
+            oci_digest_set_free(out);
+            return -1;
+        }
+        for (size_t i = 0; i < trees.count; i++) {
+            oci_origin_t origin = {0};
+            const char *oerr = NULL;
+            if (oci_origin_read(trees.items[i], &origin, &oerr) < 0) {
+                if (err)
+                    *err = oerr
+                               ? oerr
+                               : "collect_roots: origin sidecar read failed";
+                oci_volume_list_free(&trees);
+                oci_digest_set_free(out);
+                return -1;
+            }
+            if (expand_manifest_digest(s, origin.manifest_digest, out, err) <
+                0) {
+                oci_origin_free(&origin);
+                oci_volume_list_free(&trees);
+                oci_digest_set_free(out);
+                return -1;
+            }
+            oci_origin_free(&origin);
+        }
+        oci_volume_list_free(&trees);
+    }
+    return 0;
 }
 
 /* Read a legacy pin file at path. The format is a single line of

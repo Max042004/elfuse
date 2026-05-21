@@ -68,6 +68,7 @@ SRCS := \
     oci/ref.c \
     oci/cli.c \
     oci/digest.c \
+    oci/digest-set.c \
     oci/blob-store.c \
     oci/media-type.c \
     oci/manifest.c \
@@ -81,6 +82,7 @@ SRCS := \
     oci/layer-apply.c \
     oci/origin-meta.c \
     oci/volume.c \
+    oci/volume-list.c \
     oci/clone-rootfs.c \
     oci/unpack.c \
     oci/runspec.c \
@@ -226,21 +228,21 @@ $(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/lib/oci-
 ## Build the OCI local store unit test (native macOS, no HVF). Pure C; links
 ## against the store wrapper plus its blob-store, digest, and cJSON deps.
 ## cJSON is required because store.c now reads / writes index.json.
-$(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 ## Build the OCI pull pipeline unit test (native macOS, no HVF). Shares the
 ## TLS-terminating mock server with test-oci-fetch via tests/lib/oci-mock.
 $(BUILD_DIR)/test-oci-pull.o: CFLAGS += $(OPENSSL_CFLAGS)
-$(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
 
 ## Build the OCI inspect renderer unit test (native macOS, no HVF). Pure
 ## offline: no fetcher, no mock server, no libcurl. Pre-populates the store
 ## via oci_blob_store_put_bytes + oci_store_put_ref.
-$(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/inspect.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-inspect: $(BUILD_DIR)/test-oci-inspect.o $(BUILD_DIR)/oci/inspect.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
@@ -273,7 +275,7 @@ $(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD
 ## the test ships an in-file elfuse_launch stub that aborts when called,
 ## and every case installs a launch hook via oci_run_set_launch_for_testing
 ## before invoking oci_run, so the real VM bring-up never runs from a test.
-$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
@@ -282,7 +284,7 @@ $(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(
 ## plus image-config flags. Used by tests/test-oci-compat.sh and
 ## available standalone for one-off "shape an image from local files"
 ## experiments.
-$(BUILD_DIR)/oci-fixture-builder: $(BUILD_DIR)/lib/oci-fixture-builder.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/oci-fixture-builder: $(BUILD_DIR)/lib/oci-fixture-builder.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
@@ -329,7 +331,7 @@ $(BUILD_DIR)/test-oci-clone: $(BUILD_DIR)/test-oci-clone.o $(BUILD_DIR)/oci/clon
 ## Build the OCI unpack orchestrator integration smoke (native macOS,
 ## no HVF). Pulls in the full Phase 2 OCI stack so the dependency
 ## edges between modules are exercised at link time.
-$(BUILD_DIR)/test-oci-unpack: $(BUILD_DIR)/test-oci-unpack.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-unpack: $(BUILD_DIR)/test-oci-unpack.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 

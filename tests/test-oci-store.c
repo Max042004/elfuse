@@ -41,8 +41,11 @@
 #include "../externals/cjson/cJSON.h"
 #include "oci/blob-store.h"
 #include "oci/digest.h"
+#include "oci/digest-set.h"
+#include "oci/origin-meta.h"
 #include "oci/ref.h"
 #include "oci/store.h"
+#include "oci/volume.h"
 
 #define GREEN "\033[0;32m"
 #define RED "\033[0;31m"
@@ -1625,6 +1628,608 @@ restore:
     free(saved_home);
 }
 
+/* ── C1.2 oci_store_collect_roots tests ───────────────────────────── */
+
+/* Heap-owned descriptor for one synthesized image. Layer digests are
+ * heap-allocated and the array itself is heap-allocated; layer payloads
+ * are slurped + hashed by stage_image so the caller picks the bytes
+ * via the layer_payloads argument.
+ */
+typedef struct {
+    char *manifest_digest;
+    char *config_digest;
+    char **layer_digests;
+    size_t n_layers;
+} stage_image_t;
+
+static void stage_image_free(stage_image_t *im)
+{
+    if (!im)
+        return;
+    free(im->manifest_digest);
+    free(im->config_digest);
+    if (im->layer_digests) {
+        for (size_t i = 0; i < im->n_layers; i++)
+            free(im->layer_digests[i]);
+        free(im->layer_digests);
+    }
+    memset(im, 0, sizeof(*im));
+}
+
+/* Synthesize a minimal image (n layer blobs + config blob + manifest
+ * referencing both) and store all blobs in the blob store. Returns
+ * true on success with *out populated; caller frees via
+ * stage_image_free. layer_payloads is a pointer array of n_layers
+ * NUL-terminated C strings; identical payloads across calls share a
+ * blob in the store, which is how the shared-layer test case
+ * exercises dedup.
+ */
+static bool stage_image(oci_blob_store_t *blobs,
+                        const char *config_payload,
+                        const char *const *layer_payloads, size_t n_layers,
+                        stage_image_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->n_layers = n_layers;
+    out->layer_digests = calloc(n_layers ? n_layers : 1,
+                                sizeof(*out->layer_digests));
+    if (!out->layer_digests)
+        return false;
+
+    int64_t *layer_sizes = calloc(n_layers ? n_layers : 1, sizeof(*layer_sizes));
+    if (!layer_sizes) {
+        stage_image_free(out);
+        return false;
+    }
+
+    for (size_t i = 0; i < n_layers; i++) {
+        char digest[OCI_DIGEST_HEX_MAX + 16];
+        if (!stage_manifest_blob(blobs, layer_payloads[i],
+                                 strlen(layer_payloads[i]), digest,
+                                 sizeof(digest))) {
+            free(layer_sizes);
+            stage_image_free(out);
+            return false;
+        }
+        out->layer_digests[i] = strdup(digest);
+        layer_sizes[i] = (int64_t) strlen(layer_payloads[i]);
+        if (!out->layer_digests[i]) {
+            free(layer_sizes);
+            stage_image_free(out);
+            return false;
+        }
+    }
+
+    char config_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_manifest_blob(blobs, config_payload, strlen(config_payload),
+                             config_digest, sizeof(config_digest))) {
+        free(layer_sizes);
+        stage_image_free(out);
+        return false;
+    }
+    out->config_digest = strdup(config_digest);
+    if (!out->config_digest) {
+        free(layer_sizes);
+        stage_image_free(out);
+        return false;
+    }
+
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddNumberToObject(m, "schemaVersion", 2);
+    cJSON_AddStringToObject(m, "mediaType",
+                            "application/vnd.oci.image.manifest.v1+json");
+    cJSON *cfg = cJSON_AddObjectToObject(m, "config");
+    cJSON_AddStringToObject(cfg, "mediaType",
+                            "application/vnd.oci.image.config.v1+json");
+    cJSON_AddStringToObject(cfg, "digest", config_digest);
+    cJSON_AddNumberToObject(cfg, "size", (double) strlen(config_payload));
+    cJSON *layers = cJSON_AddArrayToObject(m, "layers");
+    for (size_t i = 0; i < n_layers; i++) {
+        cJSON *l = cJSON_CreateObject();
+        cJSON_AddStringToObject(l, "mediaType",
+                                "application/vnd.oci.image.layer.v1.tar");
+        cJSON_AddStringToObject(l, "digest", out->layer_digests[i]);
+        cJSON_AddNumberToObject(l, "size", (double) layer_sizes[i]);
+        cJSON_AddItemToArray(layers, l);
+    }
+    char *json = cJSON_PrintUnformatted(m);
+    cJSON_Delete(m);
+    free(layer_sizes);
+    if (!json) {
+        stage_image_free(out);
+        return false;
+    }
+
+    char manifest_digest[OCI_DIGEST_HEX_MAX + 16];
+    bool ok = stage_manifest_blob(blobs, json, strlen(json), manifest_digest,
+                                  sizeof(manifest_digest));
+    free(json);
+    if (!ok) {
+        stage_image_free(out);
+        return false;
+    }
+    out->manifest_digest = strdup(manifest_digest);
+    if (!out->manifest_digest) {
+        stage_image_free(out);
+        return false;
+    }
+    return true;
+}
+
+/* Create <volume_root>/images/sha256-<hex>/ and seed it with an origin
+ * sidecar pointing at the given image. hex must be a 64-char lowercase
+ * hex string; the test caller picks an arbitrary value because the
+ * directory name does not need to match the manifest digest for
+ * oci_store_collect_roots (the walker reads the origin file, not the
+ * directory name).
+ */
+static bool seed_unpacked_tree(const char *volume_root, const char *hex_tag,
+                               const stage_image_t *im)
+{
+    char images[1024];
+    snprintf(images, sizeof(images), "%s/images", volume_root);
+    mkdir(volume_root, 0755);
+    mkdir(images, 0755);
+    char tree[1024];
+    snprintf(tree, sizeof(tree), "%s/sha256-%s", images, hex_tag);
+    if (mkdir(tree, 0755) < 0 && errno != EEXIST)
+        return false;
+    char *diff_ids[3] = {NULL, NULL, NULL};
+    /* Origin diff_ids array is not part of the collect_roots blob keep
+     * set, but it has to be valid JSON; reuse the manifest's layer
+     * digests as stand-ins for the diff_id field.
+     */
+    if (im->n_layers > 0)
+        diff_ids[0] = im->layer_digests[0];
+    if (im->n_layers > 1)
+        diff_ids[1] = im->layer_digests[1];
+    const char *err = NULL;
+    if (oci_origin_write(tree, im->manifest_digest, im->config_digest,
+                         diff_ids, &err) < 0)
+        return false;
+    return true;
+}
+
+static void test_collect_empty(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-empty", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_empty", "open failed");
+        return;
+    }
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    if (oci_store_collect_roots(s, &set, NULL, &err) < 0) {
+        report_fail("collect_empty", err ? err : "collect failed");
+        oci_digest_set_free(&set);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&set) != 0) {
+        report_fail("collect_empty", "expected empty set");
+        oci_digest_set_free(&set);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&set);
+    oci_store_close(s);
+    report_pass("collect_empty");
+}
+
+static void test_collect_single_pin(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-single-pin", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_single_pin", "open failed");
+        return;
+    }
+    const char *layers[] = {"single-pin-layer-A"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "single-pin-config", layers, 1, &im)) {
+        report_fail("collect_single_pin", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/alpine:3.20", &ref)) {
+        report_fail("collect_single_pin", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("collect_single_pin", perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    if (oci_store_collect_roots(s, &set, NULL, &err) < 0) {
+        report_fail("collect_single_pin", err ? err : "collect failed");
+        goto cleanup;
+    }
+    if (oci_digest_set_size(&set) != 3) {
+        report_fail("collect_single_pin", "expected 3 entries (manifest, "
+                                          "config, 1 layer)");
+        goto cleanup;
+    }
+    if (!oci_digest_set_contains(&set, im.manifest_digest) ||
+        !oci_digest_set_contains(&set, im.config_digest) ||
+        !oci_digest_set_contains(&set, im.layer_digests[0])) {
+        report_fail("collect_single_pin", "missing expected digest");
+        goto cleanup;
+    }
+    report_pass("collect_single_pin");
+
+cleanup:
+    oci_digest_set_free(&set);
+    stage_image_free(&im);
+    oci_store_close(s);
+}
+
+static void test_collect_shared_layer_dedups(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-shared", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_shared_layer_dedups", "open failed");
+        return;
+    }
+    /* Image A: layer "shared-base" + "alpha". Image B: layer
+     * "shared-base" + "beta". stage_manifest_blob hashes the payload,
+     * so identical payloads collapse to one on-disk blob; the
+     * collect_roots set must also collapse them to a single entry.
+     */
+    const char *layers_a[] = {"shared-base", "alpha-private"};
+    const char *layers_b[] = {"shared-base", "beta-private"};
+    stage_image_t a = {0}, b = {0};
+    if (!stage_image(oci_store_blobs(s), "config-A", layers_a, 2, &a) ||
+        !stage_image(oci_store_blobs(s), "config-B", layers_b, 2, &b)) {
+        report_fail("collect_shared_layer_dedups", "stage_image failed");
+        goto cleanup;
+    }
+    if (strcmp(a.layer_digests[0], b.layer_digests[0]) != 0) {
+        report_fail("collect_shared_layer_dedups",
+                    "shared layer digest mismatch (test setup bug)");
+        goto cleanup;
+    }
+    oci_ref_t r1 = {0}, r2 = {0};
+    if (!parse_ref("docker.io/library/a:1", &r1) ||
+        !parse_ref("docker.io/library/b:1", &r2)) {
+        report_fail("collect_shared_layer_dedups", "ref parse failed");
+        goto cleanup;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &r1, a.manifest_digest, &perr) < 0 ||
+        oci_store_put_ref(s, &r2, b.manifest_digest, &perr) < 0) {
+        report_fail("collect_shared_layer_dedups", perr ? perr : "put failed");
+        oci_ref_free(&r1);
+        oci_ref_free(&r2);
+        goto cleanup;
+    }
+    oci_ref_free(&r1);
+    oci_ref_free(&r2);
+
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    if (oci_store_collect_roots(s, &set, NULL, &err) < 0) {
+        report_fail("collect_shared_layer_dedups",
+                    err ? err : "collect failed");
+        oci_digest_set_free(&set);
+        goto cleanup;
+    }
+    /* Expected: m_a, c_a, m_b, c_b, shared_layer, alpha_layer, beta_layer
+     * minus the shared one being counted once: 7 - 0 dedup of shared = 7
+     * unique. Wait, both images list the shared layer; the set must
+     * contain it once. So uniques = 2*manifest + 2*config + 3 layer
+     * (shared + alpha + beta) = 7.
+     */
+    if (oci_digest_set_size(&set) != 7) {
+        report_fail("collect_shared_layer_dedups",
+                    "expected 7 unique digests across two images");
+        oci_digest_set_free(&set);
+        goto cleanup;
+    }
+    if (!oci_digest_set_contains(&set, a.layer_digests[0]) ||
+        !oci_digest_set_contains(&set, a.layer_digests[1]) ||
+        !oci_digest_set_contains(&set, b.layer_digests[1])) {
+        report_fail("collect_shared_layer_dedups",
+                    "missing expected layer digest");
+        oci_digest_set_free(&set);
+        goto cleanup;
+    }
+    oci_digest_set_free(&set);
+    report_pass("collect_shared_layer_dedups");
+
+cleanup:
+    stage_image_free(&a);
+    stage_image_free(&b);
+    oci_store_close(s);
+}
+
+static void test_collect_unpacked_tree(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-unpacked", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_unpacked_tree", "open failed");
+        return;
+    }
+    const char *layers[] = {"unpacked-layer-X"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "unpacked-config", layers, 1, &im)) {
+        report_fail("collect_unpacked_tree", "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    char volume[1024];
+    snprintf(volume, sizeof(volume), "%s/vol-unpacked", root);
+    /* The test passes a 64-char hex name unrelated to the manifest
+     * digest because collect_roots reads .elfuse-origin.json rather
+     * than parsing the directory name.
+     */
+    if (!seed_unpacked_tree(
+            volume,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            &im)) {
+        report_fail("collect_unpacked_tree", "seed_unpacked_tree failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    if (oci_store_collect_roots(s, &set, volume, &err) < 0) {
+        report_fail("collect_unpacked_tree", err ? err : "collect failed");
+        oci_digest_set_free(&set);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&set) != 3 ||
+        !oci_digest_set_contains(&set, im.manifest_digest) ||
+        !oci_digest_set_contains(&set, im.config_digest) ||
+        !oci_digest_set_contains(&set, im.layer_digests[0])) {
+        report_fail("collect_unpacked_tree",
+                    "expected manifest+config+layer harvested via origin");
+        oci_digest_set_free(&set);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&set);
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("collect_unpacked_tree");
+}
+
+static void test_collect_pin_plus_unpacked(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-mixed", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_pin_plus_unpacked", "open failed");
+        return;
+    }
+    const char *layers_p[] = {"mixed-pin-layer"};
+    const char *layers_u[] = {"mixed-unpacked-layer"};
+    stage_image_t p = {0}, u = {0};
+    if (!stage_image(oci_store_blobs(s), "config-pin", layers_p, 1, &p) ||
+        !stage_image(oci_store_blobs(s), "config-unp", layers_u, 1, &u)) {
+        report_fail("collect_pin_plus_unpacked", "stage_image failed");
+        goto cleanup;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/p:1", &ref)) {
+        report_fail("collect_pin_plus_unpacked", "ref parse failed");
+        goto cleanup;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, p.manifest_digest, &perr) < 0) {
+        report_fail("collect_pin_plus_unpacked", perr ? perr : "put failed");
+        oci_ref_free(&ref);
+        goto cleanup;
+    }
+    oci_ref_free(&ref);
+
+    char volume[1024];
+    snprintf(volume, sizeof(volume), "%s/vol-mixed", root);
+    if (!seed_unpacked_tree(
+            volume,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            &u)) {
+        report_fail("collect_pin_plus_unpacked", "seed failed");
+        goto cleanup;
+    }
+
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    if (oci_store_collect_roots(s, &set, volume, &err) < 0) {
+        report_fail("collect_pin_plus_unpacked",
+                    err ? err : "collect failed");
+        oci_digest_set_free(&set);
+        goto cleanup;
+    }
+    if (oci_digest_set_size(&set) != 6) {
+        report_fail("collect_pin_plus_unpacked",
+                    "expected 6 entries (3 per image)");
+        oci_digest_set_free(&set);
+        goto cleanup;
+    }
+    bool all_present =
+        oci_digest_set_contains(&set, p.manifest_digest) &&
+        oci_digest_set_contains(&set, p.config_digest) &&
+        oci_digest_set_contains(&set, p.layer_digests[0]) &&
+        oci_digest_set_contains(&set, u.manifest_digest) &&
+        oci_digest_set_contains(&set, u.config_digest) &&
+        oci_digest_set_contains(&set, u.layer_digests[0]);
+    oci_digest_set_free(&set);
+    if (!all_present) {
+        report_fail("collect_pin_plus_unpacked", "missing expected digest");
+        goto cleanup;
+    }
+    report_pass("collect_pin_plus_unpacked");
+
+cleanup:
+    stage_image_free(&p);
+    stage_image_free(&u);
+    oci_store_close(s);
+}
+
+static void test_collect_origin_corrupt_fails(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-bad-origin", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_origin_corrupt_fails", "open failed");
+        return;
+    }
+    char volume[1024];
+    snprintf(volume, sizeof(volume), "%s/vol-bad-origin", root);
+    char images[1024];
+    snprintf(images, sizeof(images), "%s/images", volume);
+    char tree[1024];
+    snprintf(tree, sizeof(tree), "%s/sha256-%s", images,
+             "2222222222222222222222222222222222222222222222222222222222222222");
+    mkdir(volume, 0755);
+    mkdir(images, 0755);
+    if (mkdir(tree, 0755) < 0 && errno != EEXIST) {
+        report_fail("collect_origin_corrupt_fails", "mkdir tree failed");
+        oci_store_close(s);
+        return;
+    }
+    /* Write garbage in place of valid JSON. */
+    char origin[1024];
+    snprintf(origin, sizeof(origin), "%s/.elfuse-origin.json", tree);
+    FILE *fp = fopen(origin, "w");
+    if (!fp) {
+        report_fail("collect_origin_corrupt_fails", "fopen origin failed");
+        oci_store_close(s);
+        return;
+    }
+    fputs("not-valid-json{", fp);
+    fclose(fp);
+
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    int rc = oci_store_collect_roots(s, &set, volume, &err);
+    if (rc == 0) {
+        report_fail("collect_origin_corrupt_fails",
+                    "expected -1 on malformed origin");
+        oci_digest_set_free(&set);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&set) != 0) {
+        report_fail("collect_origin_corrupt_fails",
+                    "expected set to be left empty on failure");
+        oci_digest_set_free(&set);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&set);
+    oci_store_close(s);
+    report_pass("collect_origin_corrupt_fails");
+}
+
+static void test_collect_missing_manifest_blob_fails(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-collect-missing-blob", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("collect_missing_manifest_blob_fails", "open failed");
+        return;
+    }
+    const char *layers[] = {"missing-blob-layer"};
+    stage_image_t im = {0};
+    if (!stage_image(oci_store_blobs(s), "missing-blob-config", layers, 1,
+                     &im)) {
+        report_fail("collect_missing_manifest_blob_fails",
+                    "stage_image failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/gone:1", &ref)) {
+        report_fail("collect_missing_manifest_blob_fails", "ref parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail("collect_missing_manifest_blob_fails",
+                    perr ? perr : "put failed");
+        oci_ref_free(&ref);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    /* Unlink the manifest blob from blobs/sha256/. The pin still
+     * references it via index.json; collect_roots must fail so a
+     * subsequent prune does not run on a store whose keep set is
+     * incomplete.
+     */
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    oci_digest_algo_t algo;
+    if (!oci_digest_parse(im.manifest_digest, &algo, hex)) {
+        report_fail("collect_missing_manifest_blob_fails",
+                    "digest parse failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+    if (unlink(path) < 0) {
+        report_fail("collect_missing_manifest_blob_fails",
+                    "unlink manifest blob failed");
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    oci_digest_set_t set = {0};
+    const char *err = NULL;
+    int rc = oci_store_collect_roots(s, &set, NULL, &err);
+    if (rc == 0) {
+        report_fail("collect_missing_manifest_blob_fails",
+                    "expected -1 when pinned manifest blob is missing");
+        oci_digest_set_free(&set);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&set) != 0) {
+        report_fail("collect_missing_manifest_blob_fails",
+                    "expected set freed on failure");
+        oci_digest_set_free(&set);
+        stage_image_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&set);
+    stage_image_free(&im);
+    oci_store_close(s);
+    report_pass("collect_missing_manifest_blob_fails");
+}
+
 int main(void)
 {
     printf("OCI store unit tests\n");
@@ -1652,6 +2257,13 @@ int main(void)
     test_legacy_migration_disabled_via_env(scratch);
     test_legacy_refs_index_coexist_no_remigrate(scratch);
     test_default_root_from_env();
+    test_collect_empty(scratch);
+    test_collect_single_pin(scratch);
+    test_collect_shared_layer_dedups(scratch);
+    test_collect_unpacked_tree(scratch);
+    test_collect_pin_plus_unpacked(scratch);
+    test_collect_origin_corrupt_fails(scratch);
+    test_collect_missing_manifest_blob_fails(scratch);
 
     wipe_dir(scratch);
     free(scratch);
