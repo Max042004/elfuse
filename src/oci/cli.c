@@ -892,20 +892,64 @@ static int cmd_prune(int argc, char **argv)
         return 1;
     }
 
+    /* Output preserves the Plan 1 line shape so existing operator scripts
+     * and the compat smoke continue to match on "reclaimable: N blobs" /
+     * "reclaimed: N blobs" / "kept: M blobs" / "dry-run". The new layer
+     * and stack lines (C3.3d) only render when their counter is non-zero
+     * so a single-family cache still produces the legacy two-line output.
+     */
+    const char *verb_done = args.commit ? "reclaimed" : "reclaimable";
+    const char *verb_pre = args.commit ? "reclaimed" : "reclaimable";
     if (args.commit) {
         printf("reclaimed: %zu blobs (%llu bytes)\n", opts.pruned_blobs,
                (unsigned long long) opts.pruned_bytes);
+        if (opts.pruned_layers > 0)
+            printf("layers:    %zu %s (%llu bytes)\n", opts.pruned_layers,
+                   verb_done, (unsigned long long) opts.pruned_layer_bytes);
+        if (opts.pruned_stacks > 0)
+            printf("stacks:    %zu %s (%llu bytes)\n", opts.pruned_stacks,
+                   verb_done, (unsigned long long) opts.pruned_stack_bytes);
         if (opts.skipped_blobs > 0)
             printf("skipped:   %zu blobs (%llu bytes)\n", opts.skipped_blobs,
                    (unsigned long long) opts.skipped_bytes);
+        if (opts.skipped_layers > 0)
+            printf("layers:    %zu skipped (%llu bytes)\n",
+                   opts.skipped_layers,
+                   (unsigned long long) opts.skipped_layer_bytes);
+        if (opts.skipped_stacks > 0)
+            printf("stacks:    %zu skipped (%llu bytes)\n",
+                   opts.skipped_stacks,
+                   (unsigned long long) opts.skipped_stack_bytes);
         printf("kept:      %zu blobs\n", opts.kept_blobs);
+        if (opts.kept_layers > 0)
+            printf("kept:      %zu layers\n", opts.kept_layers);
+        if (opts.kept_stacks > 0)
+            printf("kept:      %zu stacks\n", opts.kept_stacks);
     } else {
         printf("reclaimable: %zu blobs (%llu bytes)\n", opts.pruned_blobs,
                (unsigned long long) opts.pruned_bytes);
+        if (opts.pruned_layers > 0)
+            printf("layers:      %zu %s (%llu bytes)\n", opts.pruned_layers,
+                   verb_pre, (unsigned long long) opts.pruned_layer_bytes);
+        if (opts.pruned_stacks > 0)
+            printf("stacks:      %zu %s (%llu bytes)\n", opts.pruned_stacks,
+                   verb_pre, (unsigned long long) opts.pruned_stack_bytes);
         if (opts.skipped_blobs > 0)
             printf("skipped:     %zu blobs (%llu bytes)\n", opts.skipped_blobs,
                    (unsigned long long) opts.skipped_bytes);
+        if (opts.skipped_layers > 0)
+            printf("layers:      %zu skipped (%llu bytes)\n",
+                   opts.skipped_layers,
+                   (unsigned long long) opts.skipped_layer_bytes);
+        if (opts.skipped_stacks > 0)
+            printf("stacks:      %zu skipped (%llu bytes)\n",
+                   opts.skipped_stacks,
+                   (unsigned long long) opts.skipped_stack_bytes);
         printf("kept:        %zu blobs\n", opts.kept_blobs);
+        if (opts.kept_layers > 0)
+            printf("kept:        %zu layers\n", opts.kept_layers);
+        if (opts.kept_stacks > 0)
+            printf("kept:        %zu stacks\n", opts.kept_stacks);
         printf("(dry-run; pass --commit to delete)\n");
     }
 

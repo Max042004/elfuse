@@ -215,33 +215,90 @@ int oci_store_collect_roots(oci_store_t *s,
                             const char *volume_root,
                             const char **err);
 
+/* Plan 3 C3.3d mark walker for the layer + stack caches. Computes the
+ * reachable set of layer raw-cache and stack-cache entries from the
+ * same two sources oci_store_collect_roots reads: pins in index.json
+ * (resolved through one image-index level into a linux/arm64
+ * sub-manifest as needed) and unpacked sysroots under
+ * <volume_root>/images/. For every image the walker can resolve:
+ *
+ *   - Every layer's diff_id (from rootfs.diff_ids in the image-config
+ *     blob for pinned images, or directly from .elfuse-origin.json's
+ *     layer_diffids for unpacked sysroots) is added to *out_diff_ids.
+ *     These name the entries under <root>/layers/<algo>/<hex>/.
+ *
+ *   - Every prefix ChainID through the layer list is added to
+ *     *out_chain_ids. ChainID(L0) == DiffID(L0); ChainID(Li) ==
+ *     sha256("<prev> <diff_id>"). oci_unpack writes one stack
+ *     snapshot per prefix during the apply loop (src/oci/unpack.c
+ *     line 1063), so a prune sweep must keep every prefix that maps
+ *     to a reachable image, not only the terminating chain. These
+ *     name the entries under <root>/layers/stacks/<algo>/<hex>/.
+ *
+ * Both sets are populated by the same walker pass so they stay
+ * consistent across the two sources.
+ *
+ * Failure policy mirrors oci_store_collect_roots: a missing or
+ * unparseable image-config blob for a pinned image-manifest, a
+ * malformed origin sidecar, or a chainid_compute failure aborts the
+ * mark phase with -1 / errno set so prune cannot proceed to delete
+ * reachable cache entries. Soft cases (image-index pins whose
+ * linux/arm64 sub-manifest blob is not on disk, image-index pins
+ * with no linux/arm64 entry at all, a missing <volume_root>/images/
+ * directory) contribute nothing without surfacing as errors so a
+ * multi-arch operator stays unblocked.
+ *
+ * volume_root may be NULL, in which case only the pin source is
+ * walked. On entry *out_diff_ids and *out_chain_ids are
+ * initialised so the caller may pass uninitialised structs. On
+ * failure both sets are freed back to empty.
+ */
+int oci_store_collect_layer_roots(oci_store_t *s,
+                                  oci_digest_set_t *out_diff_ids,
+                                  oci_digest_set_t *out_chain_ids,
+                                  const char *volume_root,
+                                  const char **err);
+
 /* Options + stats for oci_store_prune. Output fields are filled
  * regardless of dry-run vs commit so callers can render a uniform
  * report from the same struct.
  *
- * older_than_sec and keep_bytes shape which dangling blobs survive
+ * older_than_sec and keep_bytes shape which dangling entries survive
  * the sweep. Both default to 0 with the documented meaning of "no
  * filter" so the C1.3 behaviour (every dangling blob is pruned) is
  * preserved when the caller does not opt in.
  *
- *   older_than_sec > 0 vetoes per-blob: a dangling blob whose mtime
- *   is younger than (now - older_than_sec) is reported in
- *   skipped_blobs / skipped_bytes and left on disk. This is the
- *   grace window for a half-completed pull whose blob has been
- *   committed but whose put_ref has not landed yet.
+ *   older_than_sec > 0 vetoes per-entry: a dangling entry whose mtime
+ *   is younger than (now - older_than_sec) is reported in the
+ *   skipped_* family and left on disk. This is the grace window for a
+ *   half-completed pull whose blob has been committed but whose
+ *   put_ref has not landed yet, or for a layer/stack cache entry an
+ *   unpack is still publishing.
  *
- *   keep_bytes > 0 enforces a global LRU budget over the candidates
- *   that survive the older-than veto: candidates are sorted by mtime
- *   ascending and walked newest-first, the newest blobs whose
- *   cumulative size fits under keep_bytes are reclassified as
- *   skipped, the rest stay pruned. A single candidate that does not
- *   fit the budget terminates the keep walk so older candidates are
- *   always evicted first even when an older blob would fit alone.
+ *   keep_bytes > 0 enforces a per-family LRU budget over the
+ *   candidates that survive the older-than veto: candidates are
+ *   sorted by mtime ascending and walked newest-first, the newest
+ *   entries whose cumulative size fits under keep_bytes are
+ *   reclassified as skipped, the rest stay pruned. A single
+ *   candidate that does not fit the budget terminates the keep walk
+ *   so older candidates are always evicted first even when an older
+ *   entry would fit alone. The budget is applied independently to
+ *   each cache family (blobs, layers, stacks) so a fat blob cannot
+ *   crowd out a layer-cache eviction.
  *
  * The two filters compose by running older-than first and keep-bytes
- * second: a transient just-pulled blob never enters the LRU budget
- * computation so the grace window holds. skipped_blobs counts the
- * union of both filter outcomes.
+ * second per family: a transient just-pulled entry never enters the
+ * LRU budget computation so the grace window holds.
+ *
+ * The Plan 3 C3.3d extension introduces per-layer and per-stack
+ * counters that behave just like the blob counters: kept entries
+ * survive the mark phase, pruned entries are unreachable and (when
+ * commit is true) recursively removed, skipped entries were
+ * unreachable but the filters spared them. layer entries live under
+ * <root>/layers/<algo>/<hex>/ and stack entries under
+ * <root>/layers/stacks/<algo>/<hex>/; both are directory trees so
+ * the *_bytes counters are the recursive st_size sum of every
+ * regular file beneath the entry directory.
  */
 typedef struct {
     /* Inputs */
@@ -250,54 +307,81 @@ typedef struct {
     uint64_t older_than_sec; /* 0 = no mtime filter */
     uint64_t keep_bytes;     /* 0 = no size budget (no filter) */
 
-    /* Outputs */
+    /* Outputs - blobs */
     size_t kept_blobs;
     size_t pruned_blobs;
     uint64_t pruned_bytes;
     size_t skipped_blobs;   /* dangling but spared by older_than_sec or keep_bytes */
     uint64_t skipped_bytes; /* sum of st_size for skipped_blobs */
+
+    /* Outputs - per-layer raw cache entries (C3.3d) */
+    size_t kept_layers;
+    size_t pruned_layers;
+    uint64_t pruned_layer_bytes;
+    size_t skipped_layers;
+    uint64_t skipped_layer_bytes;
+
+    /* Outputs - ChainID-keyed stack cache entries (C3.3d) */
+    size_t kept_stacks;
+    size_t pruned_stacks;
+    uint64_t pruned_stack_bytes;
+    size_t skipped_stacks;
+    uint64_t skipped_stack_bytes;
 } oci_store_prune_options_t;
 
-/* Garbage-collect dangling blobs from <root>/blobs/<algo>/. The mark
- * phase calls oci_store_collect_roots(s, &set, opts->volume_root, ...)
- * so the keep semantics match exactly: pinned manifests plus the
- * config + layer blobs they reference, image-index sub-manifests,
- * and every blob reachable from an unpacked sysroot's
- * .elfuse-origin.json. The sweep phase walks blobs/sha256/ and
- * blobs/sha512/, comparing each <algo>:<hex> against the keep set;
- * any blob whose digest is not reachable is counted as
- * pruned_blobs and (when opts->commit is true) unlinked.
+/* Garbage-collect dangling entries from three cache families under
+ * the store root. The mark phase pairs oci_store_collect_roots (blob
+ * keep set) with oci_store_collect_layer_roots (diff_id and ChainID
+ * keep sets) so all three sweeps share a single consistent snapshot
+ * of pins + unpacked sysroots:
+ *
+ *   - <root>/blobs/<algo>/<hex>           regular files (Plan 1)
+ *   - <root>/layers/<algo>/<hex>/         raw layer dirs (C3.3d)
+ *   - <root>/layers/stacks/<algo>/<hex>/  stack snapshot dirs (C3.3d)
+ *
+ * The sweep phase walks each family in turn, comparing every entry's
+ * <algo>:<hex> against its family's keep set; entries not reachable
+ * are counted into the family's pruned_* counters and (when
+ * opts->commit is true) removed (unlink for blobs, recursive rm for
+ * layer / stack directory trees). pruned_layer_bytes and
+ * pruned_stack_bytes hold the recursive sum of regular-file st_size
+ * beneath each removed directory.
  *
  * The whole operation runs under flock(<root>/index.json.lock,
  * LOCK_EX), which is the same write lock oci_store_put_ref holds.
  * That bounds the race where a concurrent pull writes a new pin
- * after collect_roots already snapshotted index.json: the pull
- * cannot acquire the lock until prune releases it, so a pinned
- * manifest is either visible to mark or its put_ref has not started
- * yet (and the corresponding blob commit either has not happened or
- * is treated as a transient resource the caller will re-fetch).
+ * after the mark phase already snapshotted index.json. Layer / stack
+ * cache writers (oci_unpack / oci_rebuild_cache) do NOT take this
+ * lock so they may publish new cache entries concurrent with prune;
+ * those entries are reachable from their image's pin or unpacked
+ * sysroot, both of which the mark phase already captured, so their
+ * diff_id / ChainID is in the keep set even if the directory did
+ * not yet exist when sweep enumerated. The remaining window is the
+ * mid-pull case (a layer extracted before put_ref lands) which
+ * matches the C1.3 blob-mid-pull semantic: the operator retries.
  *
- * On entry opts->kept_blobs / pruned_blobs / pruned_bytes /
- * skipped_blobs / skipped_bytes are reset to zero so the caller does
- * not have to memset between invocations. Subdirectories under
- * blobs/<algo>/ and files whose names are not valid lowercase hex for
- * that algorithm are skipped without surfacing as errors (the
- * directory is part of the OCI image-layout spec only for regular
- * blob files; anything else is treated as foreign state we must not
- * touch).
+ * On entry every counter in opts is reset to zero so the caller does
+ * not have to memset between invocations. Entries whose name is not
+ * a valid lowercase hex digest for the enclosing algorithm subdir,
+ * non-directory entries inside layers/, and dotfiles are all skipped
+ * without surfacing as errors so any foreign state under the store
+ * root stays untouched.
  *
- * When opts->older_than_sec or opts->keep_bytes is set, the sweep
- * gathers dangling-blob candidates first and then applies the
- * filters (older-than veto, then keep-bytes LRU budget) before any
- * unlink. Candidates spared by either filter contribute to
- * skipped_blobs / skipped_bytes rather than pruned_blobs /
- * pruned_bytes so the caller can render a three-way kept/pruned/
- * skipped split.
+ * When opts->older_than_sec or opts->keep_bytes is set, each family
+ * gathers dangling candidates first and then applies the filters
+ * (older-than veto, then keep-bytes LRU budget) before any removal.
+ * The keep-bytes budget is independent per family: a 100 MiB budget
+ * means "keep up to 100 MiB of newest dangling blobs AND up to
+ * 100 MiB of newest dangling layer trees AND up to 100 MiB of
+ * newest dangling stack trees", so a fat blob cannot crowd a layer
+ * eviction off the budget. Candidates spared by either filter
+ * contribute to skipped_* rather than pruned_* so the caller can
+ * render a three-way kept/pruned/skipped split per family.
  *
  * Returns 0 on success and -1 on failure with errno preserved and
  * *err (when non-NULL) populated. Mark-phase failure is fatal and
- * aborts before any unlink so a corrupt or torn manifest cannot
- * cause prune to delete reachable blobs.
+ * aborts before any removal so a corrupt or torn manifest / config
+ * blob cannot cause prune to delete reachable entries.
  */
 int oci_store_prune(oci_store_t *s,
                     oci_store_prune_options_t *opts,

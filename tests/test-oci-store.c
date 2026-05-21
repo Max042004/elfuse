@@ -1703,12 +1703,39 @@ static bool stage_image(oci_blob_store_t *blobs,
         }
     }
 
+    /* Stage an image-config JSON whose architecture/os/rootfs.diff_ids are
+     * all valid so the Plan 3 C3.3d layer mark walker can parse the blob
+     * without surfacing the test fixture as a fatal-mark scenario. The
+     * config_payload string is folded into the config JSON as an opaque
+     * "author" annotation so each test still gets a distinct config digest
+     * by varying the payload. rootfs.diff_ids stays empty because this
+     * helper is used by the Plan 1 / C1.3 / C1.4 tests that exercise blob
+     * mark only and do not care which diff_ids end up in the keep set.
+     */
     char config_digest[OCI_DIGEST_HEX_MAX + 16];
-    if (!stage_manifest_blob(blobs, config_payload, strlen(config_payload),
-                             config_digest, sizeof(config_digest))) {
-        free(layer_sizes);
-        stage_image_free(out);
-        return false;
+    {
+        cJSON *cfg_root = cJSON_CreateObject();
+        cJSON_AddStringToObject(cfg_root, "architecture", "arm64");
+        cJSON_AddStringToObject(cfg_root, "os", "linux");
+        cJSON_AddStringToObject(cfg_root, "author", config_payload);
+        cJSON *rootfs = cJSON_AddObjectToObject(cfg_root, "rootfs");
+        cJSON_AddStringToObject(rootfs, "type", "layers");
+        cJSON_AddArrayToObject(rootfs, "diff_ids");
+        char *cfg_body = cJSON_PrintUnformatted(cfg_root);
+        cJSON_Delete(cfg_root);
+        if (!cfg_body) {
+            free(layer_sizes);
+            stage_image_free(out);
+            return false;
+        }
+        bool cfg_ok = stage_manifest_blob(blobs, cfg_body, strlen(cfg_body),
+                                          config_digest, sizeof(config_digest));
+        free(cfg_body);
+        if (!cfg_ok) {
+            free(layer_sizes);
+            stage_image_free(out);
+            return false;
+        }
     }
     out->config_digest = strdup(config_digest);
     if (!out->config_digest) {
@@ -3334,6 +3361,1208 @@ static void test_prune_invalid_args_rejected(const char *scratch)
     report_pass("prune_invalid_args_rejected");
 }
 
+/* ── C3.3d oci_store_collect_layer_roots + prune sweep tests ─────────── */
+
+/* Heap-owned descriptor for an image whose image-config blob is a real
+ * parseable OCI image-config (architecture / os / rootfs.diff_ids), so the
+ * C3.3d mark walker can drill into rootfs.diff_ids. stage_image_v2 differs
+ * from stage_image in that the config payload is real JSON instead of an
+ * opaque test string; the rest of the manifest shape is identical.
+ */
+typedef struct {
+    char *manifest_digest;
+    char *config_digest;
+    char **layer_digests; /* manifest layer descriptor digests */
+    size_t n_layers;
+    /* The diff_ids the caller injected into the image-config; not freed by
+     * the helper (the strings are owned by the test driver). */
+} stage_image_v2_t;
+
+static void stage_image_v2_free(stage_image_v2_t *im)
+{
+    if (!im)
+        return;
+    free(im->manifest_digest);
+    free(im->config_digest);
+    if (im->layer_digests) {
+        for (size_t i = 0; i < im->n_layers; i++)
+            free(im->layer_digests[i]);
+        free(im->layer_digests);
+    }
+    memset(im, 0, sizeof(*im));
+}
+
+/* Build a parseable image-config JSON whose rootfs.diff_ids equals the
+ * supplied array, store it as a blob, and return its canonical
+ * "<algo>:<hex>" digest in out_digest. Used as the configurable image-config
+ * source for the C3.3d mark walker tests.
+ */
+static bool stage_image_config_blob(oci_blob_store_t *blobs,
+                                    const char *const *diff_ids,
+                                    size_t n_diff_ids, char *out_digest,
+                                    size_t cap)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "architecture", "arm64");
+    cJSON_AddStringToObject(root, "os", "linux");
+    cJSON *rootfs = cJSON_AddObjectToObject(root, "rootfs");
+    cJSON_AddStringToObject(rootfs, "type", "layers");
+    cJSON *arr = cJSON_AddArrayToObject(rootfs, "diff_ids");
+    for (size_t i = 0; i < n_diff_ids; i++)
+        cJSON_AddItemToArray(arr, cJSON_CreateString(diff_ids[i]));
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body)
+        return false;
+    bool ok = stage_manifest_blob(blobs, body, strlen(body), out_digest, cap);
+    free(body);
+    return ok;
+}
+
+static bool stage_image_v2(oci_blob_store_t *blobs,
+                           const char *const *layer_payloads,
+                           const char *const *diff_ids, size_t n_layers,
+                           stage_image_v2_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->n_layers = n_layers;
+    out->layer_digests = calloc(n_layers ? n_layers : 1,
+                                sizeof(*out->layer_digests));
+    if (!out->layer_digests)
+        return false;
+    int64_t *layer_sizes = calloc(n_layers ? n_layers : 1, sizeof(*layer_sizes));
+    if (!layer_sizes) {
+        stage_image_v2_free(out);
+        return false;
+    }
+    for (size_t i = 0; i < n_layers; i++) {
+        char digest[OCI_DIGEST_HEX_MAX + 16];
+        if (!stage_manifest_blob(blobs, layer_payloads[i],
+                                 strlen(layer_payloads[i]), digest,
+                                 sizeof(digest))) {
+            free(layer_sizes);
+            stage_image_v2_free(out);
+            return false;
+        }
+        out->layer_digests[i] = strdup(digest);
+        layer_sizes[i] = (int64_t) strlen(layer_payloads[i]);
+        if (!out->layer_digests[i]) {
+            free(layer_sizes);
+            stage_image_v2_free(out);
+            return false;
+        }
+    }
+    char config_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_image_config_blob(blobs, diff_ids, n_layers, config_digest,
+                                 sizeof(config_digest))) {
+        free(layer_sizes);
+        stage_image_v2_free(out);
+        return false;
+    }
+    out->config_digest = strdup(config_digest);
+    if (!out->config_digest) {
+        free(layer_sizes);
+        stage_image_v2_free(out);
+        return false;
+    }
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddNumberToObject(m, "schemaVersion", 2);
+    cJSON_AddStringToObject(m, "mediaType",
+                            "application/vnd.oci.image.manifest.v1+json");
+    cJSON *cfg = cJSON_AddObjectToObject(m, "config");
+    cJSON_AddStringToObject(cfg, "mediaType",
+                            "application/vnd.oci.image.config.v1+json");
+    cJSON_AddStringToObject(cfg, "digest", config_digest);
+    /* The image-config blob's exact byte count drives the descriptor's
+     * size field. stage_image_config_blob already wrote those bytes into
+     * the store, but we do not know its length here without re-serializing;
+     * the walker does not validate descriptor size against blob size, so
+     * passing 0 is acceptable for this fixture. */
+    cJSON_AddNumberToObject(cfg, "size", 0);
+    cJSON *layers = cJSON_AddArrayToObject(m, "layers");
+    for (size_t i = 0; i < n_layers; i++) {
+        cJSON *l = cJSON_CreateObject();
+        cJSON_AddStringToObject(l, "mediaType",
+                                "application/vnd.oci.image.layer.v1.tar");
+        cJSON_AddStringToObject(l, "digest", out->layer_digests[i]);
+        cJSON_AddNumberToObject(l, "size", (double) layer_sizes[i]);
+        cJSON_AddItemToArray(layers, l);
+    }
+    char *json = cJSON_PrintUnformatted(m);
+    cJSON_Delete(m);
+    free(layer_sizes);
+    if (!json) {
+        stage_image_v2_free(out);
+        return false;
+    }
+    char manifest_digest[OCI_DIGEST_HEX_MAX + 16];
+    bool ok = stage_manifest_blob(blobs, json, strlen(json), manifest_digest,
+                                  sizeof(manifest_digest));
+    free(json);
+    if (!ok) {
+        stage_image_v2_free(out);
+        return false;
+    }
+    out->manifest_digest = strdup(manifest_digest);
+    if (!out->manifest_digest) {
+        stage_image_v2_free(out);
+        return false;
+    }
+    return true;
+}
+
+/* Compose <root>/layers/sha256/<hex>/ for the diff_id whose canonical form
+ * is supplied (assumed "sha256:<64hex>"); the directory is created with
+ * 0755 if absent. Returns true on success.
+ */
+static bool seed_layer_dir(const char *store_root, const char *diff_id)
+{
+    if (strncmp(diff_id, "sha256:", 7) != 0)
+        return false;
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/layers/sha256/%s", store_root,
+             diff_id + 7);
+    if (mkdir(path, 0755) < 0 && errno != EEXIST)
+        return false;
+    return true;
+}
+
+static bool seed_stack_dir(const char *store_root, const char *chain_id)
+{
+    if (strncmp(chain_id, "sha256:", 7) != 0)
+        return false;
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/layers/stacks/sha256/%s", store_root,
+             chain_id + 7);
+    if (mkdir(path, 0755) < 0 && errno != EEXIST)
+        return false;
+    return true;
+}
+
+/* Drop a regular file of `size` bytes inside `dir`. Used by the size-
+ * accounting test to drive pruned_layer_bytes deterministically.
+ */
+static bool seed_file_in_dir(const char *dir, const char *name, size_t size)
+{
+    char path[1408];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return false;
+    char buf[256];
+    memset(buf, 'x', sizeof(buf));
+    size_t left = size;
+    while (left > 0) {
+        size_t want = left > sizeof(buf) ? sizeof(buf) : left;
+        ssize_t got = write(fd, buf, want);
+        if (got <= 0) {
+            close(fd);
+            return false;
+        }
+        left -= (size_t) got;
+    }
+    close(fd);
+    return true;
+}
+
+static bool path_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Force the on-disk mtime of an arbitrary path (file or directory) to a
+ * specific epoch. utimes works on directories on Darwin so this drives the
+ * older-than / keep-bytes filter sort keys deterministically for the new
+ * tree-cache cases.
+ */
+static bool set_path_mtime(const char *path, time_t want_epoch)
+{
+    struct timeval times[2] = {
+        {.tv_sec = want_epoch, .tv_usec = 0},
+        {.tv_sec = want_epoch, .tv_usec = 0},
+    };
+    return utimes(path, times) == 0;
+}
+
+static void test_collect_layer_roots_empty_store(const char *scratch)
+{
+    const char *name = "collect_layer_roots_empty_store";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-clr-empty", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    oci_digest_set_t diffs = {0};
+    oci_digest_set_t chains = {0};
+    const char *err = NULL;
+    if (oci_store_collect_layer_roots(s, &diffs, &chains, NULL, &err) < 0) {
+        report_fail(name, err ? err : "collect failed");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&diffs) != 0 ||
+        oci_digest_set_size(&chains) != 0) {
+        report_fail(name, "expected both sets empty");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&diffs);
+    oci_digest_set_free(&chains);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_collect_layer_roots_single_pin_layer(const char *scratch)
+{
+    const char *name = "collect_layer_roots_single_pin_layer";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-clr-single", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    /* A made-up but well-formed diff_id. The walker treats it as opaque
+     * once it has parsed the image-config blob, so any valid 64-hex
+     * suffix works.
+     */
+    const char *diff_ids[1] = {
+        "sha256:"
+        "1111111111111111111111111111111111111111111111111111111111111111"};
+    const char *layer_payloads[1] = {"clr-single-layer-payload"};
+    stage_image_v2_t im = {0};
+    if (!stage_image_v2(oci_store_blobs(s), layer_payloads, diff_ids, 1, &im)) {
+        report_fail(name, "stage_image_v2 failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/clr-single:1", &ref)) {
+        report_fail(name, "ref parse failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail(name, perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    oci_digest_set_t diffs = {0};
+    oci_digest_set_t chains = {0};
+    const char *err = NULL;
+    if (oci_store_collect_layer_roots(s, &diffs, &chains, NULL, &err) < 0) {
+        report_fail(name, err ? err : "collect failed");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    /* L0 case: ChainID(L0) == DiffID(L0). Both sets must contain exactly
+     * the one diff_id. */
+    if (oci_digest_set_size(&diffs) != 1 ||
+        !oci_digest_set_contains(&diffs, diff_ids[0])) {
+        report_fail(name, "diff set missing diff_id");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&chains) != 1 ||
+        !oci_digest_set_contains(&chains, diff_ids[0])) {
+        report_fail(name, "chain set missing L0 chain_id");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&diffs);
+    oci_digest_set_free(&chains);
+    stage_image_v2_free(&im);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_collect_layer_roots_three_layer_prefix_chains(
+    const char *scratch)
+{
+    const char *name = "collect_layer_roots_three_layer_prefix_chains";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-clr-three", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *diff_ids[3] = {
+        "sha256:"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sha256:"
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    };
+    const char *layer_payloads[3] = {"clr-l0", "clr-l1", "clr-l2"};
+    stage_image_v2_t im = {0};
+    if (!stage_image_v2(oci_store_blobs(s), layer_payloads, diff_ids, 3, &im)) {
+        report_fail(name, "stage_image_v2 failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/clr-three:1", &ref)) {
+        report_fail(name, "ref parse failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail(name, perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+
+    oci_digest_set_t diffs = {0};
+    oci_digest_set_t chains = {0};
+    const char *err = NULL;
+    if (oci_store_collect_layer_roots(s, &diffs, &chains, NULL, &err) < 0) {
+        report_fail(name, err ? err : "collect failed");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&diffs) != 3) {
+        report_fail(name, "diff set size != 3");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    /* Recompute the prefix chains independently and assert each prefix is
+     * in chain_set. This guards against a walker that only recorded the
+     * terminal chain (which would break unpack-write semantics).
+     */
+    char expected[3][OCI_DIGEST_HEX_MAX + 16];
+    char prev[OCI_DIGEST_HEX_MAX + 16] = "";
+    for (size_t i = 0; i < 3; i++) {
+        const char *prev_arg = (i == 0) ? NULL : prev;
+        if (oci_chainid_compute(prev_arg, diff_ids[i], expected[i],
+                                sizeof(expected[i])) < 0) {
+            report_fail(name, "chainid_compute helper failed");
+            oci_digest_set_free(&diffs);
+            oci_digest_set_free(&chains);
+            stage_image_v2_free(&im);
+            oci_store_close(s);
+            return;
+        }
+        memcpy(prev, expected[i], strlen(expected[i]) + 1);
+    }
+    if (oci_digest_set_size(&chains) != 3) {
+        report_fail(name, "chain set size != 3");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    for (size_t i = 0; i < 3; i++) {
+        if (!oci_digest_set_contains(&chains, expected[i])) {
+            report_fail(name, "chain set missing a prefix chain_id");
+            oci_digest_set_free(&diffs);
+            oci_digest_set_free(&chains);
+            stage_image_v2_free(&im);
+            oci_store_close(s);
+            return;
+        }
+    }
+    oci_digest_set_free(&diffs);
+    oci_digest_set_free(&chains);
+    stage_image_v2_free(&im);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+/* Build an unpacked tree fixture wired to a specific diff_id list, then
+ * verify both sets reflect those diff_ids. Distinct from
+ * collect_layer_roots_single_pin_layer because the walker reads the origin
+ * sidecar directly instead of drilling through an image-config blob.
+ */
+static void test_collect_layer_roots_unpacked_tree(const char *scratch)
+{
+    const char *name = "collect_layer_roots_unpacked_tree";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-clr-unpacked", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    char vol[1024];
+    snprintf(vol, sizeof(vol), "%s/case-clr-unpacked-vol", scratch);
+    char images[1280];
+    snprintf(images, sizeof(images), "%s/images", vol);
+    mkdir(vol, 0755);
+    mkdir(images, 0755);
+    char tree[1408];
+    snprintf(tree, sizeof(tree),
+             "%s/sha256-"
+             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+             images);
+    if (mkdir(tree, 0755) < 0 && errno != EEXIST) {
+        report_fail(name, "tree mkdir failed");
+        oci_store_close(s);
+        return;
+    }
+    char *diff_ids[3] = {
+        "sha256:"
+        "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        "sha256:"
+        "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321",
+        NULL,
+    };
+    const char *oerr = NULL;
+    if (oci_origin_write(tree, diff_ids[0], diff_ids[1], diff_ids, &oerr) <
+        0) {
+        report_fail(name, oerr ? oerr : "origin_write failed");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_digest_set_t diffs = {0};
+    oci_digest_set_t chains = {0};
+    const char *err = NULL;
+    if (oci_store_collect_layer_roots(s, &diffs, &chains, vol, &err) < 0) {
+        report_fail(name, err ? err : "collect failed");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&diffs) != 2 ||
+        !oci_digest_set_contains(&diffs, diff_ids[0]) ||
+        !oci_digest_set_contains(&diffs, diff_ids[1])) {
+        report_fail(name, "diff set missing origin diff_ids");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        oci_store_close(s);
+        return;
+    }
+    /* Two prefix chains: ChainID(L0) == DiffID(L0); ChainID(L1) =
+     * sha256(L0 chain + " " + DiffID(L1)). */
+    char chain1[OCI_DIGEST_HEX_MAX + 16];
+    if (oci_chainid_compute(diff_ids[0], diff_ids[1], chain1,
+                            sizeof(chain1)) < 0) {
+        report_fail(name, "chainid_compute helper failed");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        oci_store_close(s);
+        return;
+    }
+    if (oci_digest_set_size(&chains) != 2 ||
+        !oci_digest_set_contains(&chains, diff_ids[0]) ||
+        !oci_digest_set_contains(&chains, chain1)) {
+        report_fail(name, "chain set missing prefix chains");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&diffs);
+    oci_digest_set_free(&chains);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+/* A pin whose manifest blob is present but whose image-config blob is
+ * absent must surface as a fatal mark failure so prune does not later
+ * delete reachable cache entries on the false belief that nothing is
+ * referenced.
+ */
+static void test_collect_layer_roots_missing_config_blob_fails(
+    const char *scratch)
+{
+    const char *name = "collect_layer_roots_missing_config_blob_fails";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-clr-missing-cfg", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *diff_ids[1] = {
+        "sha256:"
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"};
+    const char *layer_payloads[1] = {"clr-missing-cfg-layer"};
+    stage_image_v2_t im = {0};
+    if (!stage_image_v2(oci_store_blobs(s), layer_payloads, diff_ids, 1, &im)) {
+        report_fail(name, "stage_image_v2 failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/clr-missing-cfg:1", &ref)) {
+        report_fail(name, "ref parse failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail(name, perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+    /* Unlink the image-config blob to simulate corrupted store state. */
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(im.config_digest, &algo, hex)) {
+        report_fail(name, "digest parse failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char cfg_path[1280];
+    snprintf(cfg_path, sizeof(cfg_path), "%s/blobs/sha256/%s", root, hex);
+    if (unlink(cfg_path) < 0) {
+        report_fail(name, "unlink config blob failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_t diffs = {0};
+    oci_digest_set_t chains = {0};
+    const char *err = NULL;
+    int rc = oci_store_collect_layer_roots(s, &diffs, &chains, NULL, &err);
+    if (rc != -1) {
+        report_fail(name, "expected -1 on missing config blob");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    /* Sets must be freed back to empty on failure. */
+    if (oci_digest_set_size(&diffs) != 0 ||
+        oci_digest_set_size(&chains) != 0) {
+        report_fail(name, "sets not freed on failure");
+        oci_digest_set_free(&diffs);
+        oci_digest_set_free(&chains);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_set_free(&diffs);
+    oci_digest_set_free(&chains);
+    stage_image_v2_free(&im);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_sweeps_dangling_layer_entry(const char *scratch)
+{
+    const char *name = "prune_sweeps_dangling_layer_entry";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-dangling-layer", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *dangling =
+        "sha256:"
+        "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+    if (!seed_layer_dir(root, dangling)) {
+        report_fail(name, "seed_layer_dir failed");
+        oci_store_close(s);
+        return;
+    }
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/layers/sha256/%s", root, dangling + 7);
+    if (!seed_file_in_dir(path, "payload", 17)) {
+        report_fail(name, "seed_file_in_dir failed");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_layers != 1 || opts.pruned_layer_bytes != 17 ||
+        opts.kept_layers != 0) {
+        report_fail(name, "layer stats mismatch");
+        oci_store_close(s);
+        return;
+    }
+    if (path_exists(path)) {
+        report_fail(name, "dangling layer dir survived commit");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_keeps_layer_referenced_by_pin(const char *scratch)
+{
+    const char *name = "prune_keeps_layer_referenced_by_pin";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-keep-layer-pin", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *diff_id =
+        "sha256:"
+        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+    const char *diff_ids[1] = {diff_id};
+    const char *layer_payloads[1] = {"keep-layer-pin-payload"};
+    stage_image_v2_t im = {0};
+    if (!stage_image_v2(oci_store_blobs(s), layer_payloads, diff_ids, 1, &im)) {
+        report_fail(name, "stage_image_v2 failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/klp:1", &ref)) {
+        report_fail(name, "ref parse failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail(name, perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+    if (!seed_layer_dir(root, diff_id)) {
+        report_fail(name, "seed_layer_dir failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_layers != 1 || opts.pruned_layers != 0) {
+        report_fail(name, "expected kept=1 pruned=0 for the reachable layer");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/layers/sha256/%s", root, diff_id + 7);
+    if (!path_exists(path)) {
+        report_fail(name, "reachable layer dir was deleted");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_v2_free(&im);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_keeps_layer_referenced_by_unpacked_tree(
+    const char *scratch)
+{
+    const char *name = "prune_keeps_layer_referenced_by_unpacked_tree";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-keep-layer-unp", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    /* Stage a real image so the blob mark walker can resolve the manifest
+     * digest the origin sidecar references; the layer mark walker reads
+     * diff_ids directly from origin.layer_diffids so they need not match
+     * the image-config rootfs.diff_ids. */
+    const char *diff_ids_unused[1] = {
+        "sha256:"
+        "0000000000000000000000000000000000000000000000000000000000000000"};
+    const char *layer_payloads[1] = {"unpacked-keep-layer"};
+    stage_image_v2_t im = {0};
+    if (!stage_image_v2(oci_store_blobs(s), layer_payloads, diff_ids_unused, 1,
+                        &im)) {
+        report_fail(name, "stage_image_v2 failed");
+        oci_store_close(s);
+        return;
+    }
+
+    char vol[1024];
+    snprintf(vol, sizeof(vol), "%s/case-prune-keep-layer-unp-vol", scratch);
+    char images[1280];
+    snprintf(images, sizeof(images), "%s/images", vol);
+    mkdir(vol, 0755);
+    mkdir(images, 0755);
+    char tree[1408];
+    snprintf(tree, sizeof(tree),
+             "%s/sha256-"
+             "9999999999999999999999999999999999999999999999999999999999999999",
+             images);
+    if (mkdir(tree, 0755) < 0 && errno != EEXIST) {
+        report_fail(name, "tree mkdir failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char *diff_ids[2] = {
+        "sha256:"
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        NULL};
+    const char *oerr = NULL;
+    if (oci_origin_write(tree, im.manifest_digest, im.config_digest, diff_ids,
+                         &oerr) < 0) {
+        report_fail(name, oerr ? oerr : "origin_write failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (!seed_layer_dir(root, diff_ids[0])) {
+        report_fail(name, "seed_layer_dir failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .volume_root = vol,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_layers != 1 || opts.pruned_layers != 0) {
+        report_fail(name, "stats mismatch for unpacked-tree contribution");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/layers/sha256/%s", root, diff_ids[0] + 7);
+    if (!path_exists(path)) {
+        report_fail(name, "reachable layer dir was deleted");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    stage_image_v2_free(&im);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_sweeps_dangling_stack_entry(const char *scratch)
+{
+    const char *name = "prune_sweeps_dangling_stack_entry";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-dangling-stack", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *dangling =
+        "sha256:"
+        "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+    if (!seed_stack_dir(root, dangling)) {
+        report_fail(name, "seed_stack_dir failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_stacks != 1 || opts.kept_stacks != 0) {
+        report_fail(name, "stack stats mismatch");
+        oci_store_close(s);
+        return;
+    }
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/layers/stacks/sha256/%s", root,
+             dangling + 7);
+    if (path_exists(path)) {
+        report_fail(name, "dangling stack dir survived commit");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_keeps_stack_for_each_prefix_chain(const char *scratch)
+{
+    const char *name = "prune_keeps_stack_for_each_prefix_chain";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-stack-prefixes", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *diff_ids[3] = {
+        "sha256:"
+        "3030303030303030303030303030303030303030303030303030303030303030",
+        "sha256:"
+        "3131313131313131313131313131313131313131313131313131313131313131",
+        "sha256:"
+        "3232323232323232323232323232323232323232323232323232323232323232",
+    };
+    const char *layer_payloads[3] = {"stk-l0", "stk-l1", "stk-l2"};
+    stage_image_v2_t im = {0};
+    if (!stage_image_v2(oci_store_blobs(s), layer_payloads, diff_ids, 3, &im)) {
+        report_fail(name, "stage_image_v2 failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t ref = {0};
+    if (!parse_ref("docker.io/library/stk:1", &ref)) {
+        report_fail(name, "ref parse failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    const char *perr = NULL;
+    if (oci_store_put_ref(s, &ref, im.manifest_digest, &perr) < 0) {
+        report_fail(name, perr ? perr : "put_ref failed");
+        oci_ref_free(&ref);
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&ref);
+    /* Materialize all three prefix chains on disk. The walker must keep
+     * every one because oci_unpack writes each prefix during the apply
+     * loop. */
+    char chains[3][OCI_DIGEST_HEX_MAX + 16];
+    char prev[OCI_DIGEST_HEX_MAX + 16] = "";
+    for (size_t i = 0; i < 3; i++) {
+        const char *prev_arg = (i == 0) ? NULL : prev;
+        if (oci_chainid_compute(prev_arg, diff_ids[i], chains[i],
+                                sizeof(chains[i])) < 0) {
+            report_fail(name, "chainid compute failed");
+            stage_image_v2_free(&im);
+            oci_store_close(s);
+            return;
+        }
+        memcpy(prev, chains[i], strlen(chains[i]) + 1);
+        if (!seed_stack_dir(root, chains[i])) {
+            report_fail(name, "seed_stack_dir failed");
+            stage_image_v2_free(&im);
+            oci_store_close(s);
+            return;
+        }
+    }
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    if (opts.kept_stacks != 3 || opts.pruned_stacks != 0) {
+        report_fail(name, "stats mismatch (want kept=3 pruned=0)");
+        stage_image_v2_free(&im);
+        oci_store_close(s);
+        return;
+    }
+    for (size_t i = 0; i < 3; i++) {
+        char path[1280];
+        snprintf(path, sizeof(path), "%s/layers/stacks/sha256/%s", root,
+                 chains[i] + 7);
+        if (!path_exists(path)) {
+            report_fail(name, "prefix chain dir deleted");
+            stage_image_v2_free(&im);
+            oci_store_close(s);
+            return;
+        }
+    }
+    stage_image_v2_free(&im);
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_dry_run_keeps_layer_and_stack_on_disk(
+    const char *scratch)
+{
+    const char *name = "prune_dry_run_keeps_layer_and_stack_on_disk";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-dry-c33d", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *layer_id =
+        "sha256:"
+        "4040404040404040404040404040404040404040404040404040404040404040";
+    const char *stack_id =
+        "sha256:"
+        "5050505050505050505050505050505050505050505050505050505050505050";
+    if (!seed_layer_dir(root, layer_id) || !seed_stack_dir(root, stack_id)) {
+        report_fail(name, "seed_* failed");
+        oci_store_close(s);
+        return;
+    }
+    char lp[1280];
+    char sp[1280];
+    snprintf(lp, sizeof(lp), "%s/layers/sha256/%s", root, layer_id + 7);
+    snprintf(sp, sizeof(sp), "%s/layers/stacks/sha256/%s", root, stack_id + 7);
+
+    oci_store_prune_options_t opts = {0}; /* dry-run */
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_layers != 1 || opts.pruned_stacks != 1) {
+        report_fail(name, "expected pruned_layers=1 pruned_stacks=1");
+        oci_store_close(s);
+        return;
+    }
+    if (!path_exists(lp) || !path_exists(sp)) {
+        report_fail(name, "dry-run touched disk");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_layer_size_counted_in_pruned_bytes(const char *scratch)
+{
+    const char *name = "prune_layer_size_counted_in_pruned_bytes";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-layer-bytes", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *layer_id =
+        "sha256:"
+        "6060606060606060606060606060606060606060606060606060606060606060";
+    if (!seed_layer_dir(root, layer_id)) {
+        report_fail(name, "seed_layer_dir failed");
+        oci_store_close(s);
+        return;
+    }
+    char dir[1280];
+    snprintf(dir, sizeof(dir), "%s/layers/sha256/%s", root, layer_id + 7);
+    if (!seed_file_in_dir(dir, "a", 100) ||
+        !seed_file_in_dir(dir, "b", 250)) {
+        report_fail(name, "seed_file_in_dir failed");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {.commit = true};
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_layers != 1 || opts.pruned_layer_bytes != 350) {
+        report_fail(name, "pruned_layer_bytes != 350");
+        oci_store_close(s);
+        return;
+    }
+    if (path_exists(dir)) {
+        report_fail(name, "layer dir not removed");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_older_than_skips_fresh_layer_entry(const char *scratch)
+{
+    const char *name = "prune_older_than_skips_fresh_layer_entry";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-otl", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    const char *fresh_id =
+        "sha256:"
+        "7070707070707070707070707070707070707070707070707070707070707070";
+    const char *stale_id =
+        "sha256:"
+        "8181818181818181818181818181818181818181818181818181818181818181";
+    if (!seed_layer_dir(root, fresh_id) || !seed_layer_dir(root, stale_id)) {
+        report_fail(name, "seed_layer_dir failed");
+        oci_store_close(s);
+        return;
+    }
+    char fresh_path[1280];
+    char stale_path[1280];
+    snprintf(fresh_path, sizeof(fresh_path), "%s/layers/sha256/%s", root,
+             fresh_id + 7);
+    snprintf(stale_path, sizeof(stale_path), "%s/layers/sha256/%s", root,
+             stale_id + 7);
+    time_t now = time(NULL);
+    if (!set_path_mtime(fresh_path, now - 3600) ||
+        !set_path_mtime(stale_path, now - 8 * 86400)) {
+        report_fail(name, "set_path_mtime failed");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .older_than_sec = 7 * 86400,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_layers != 1 || opts.skipped_layers != 1) {
+        report_fail(name, "expected pruned=1 skipped=1 for layers");
+        oci_store_close(s);
+        return;
+    }
+    if (path_exists(stale_path) || !path_exists(fresh_path)) {
+        report_fail(name, "wrong layer was unlinked");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_prune_keep_bytes_evicts_oldest_layer_first(
+    const char *scratch)
+{
+    const char *name = "prune_keep_bytes_evicts_oldest_layer_first";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-kbl", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "open failed");
+        return;
+    }
+    /* Three dangling layer dirs sized 100 / 200 / 300, mtimes 4000s / 3000s
+     * / 2000s ago. With keep_bytes=500 the newest two (200+300=500) survive
+     * and the oldest (100 bytes) is evicted regardless of fit. */
+    const char *ids[3] = {
+        "sha256:"
+        "abababababababababababababababababababababababababababababababab",
+        "sha256:"
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "sha256:"
+        "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+    };
+    size_t sizes[3] = {100, 200, 300};
+    time_t ages[3] = {4000, 3000, 2000};
+    time_t now = time(NULL);
+    for (size_t i = 0; i < 3; i++) {
+        if (!seed_layer_dir(root, ids[i])) {
+            report_fail(name, "seed_layer_dir failed");
+            oci_store_close(s);
+            return;
+        }
+        char dp[1280];
+        snprintf(dp, sizeof(dp), "%s/layers/sha256/%s", root, ids[i] + 7);
+        if (!seed_file_in_dir(dp, "payload", sizes[i])) {
+            report_fail(name, "seed_file_in_dir failed");
+            oci_store_close(s);
+            return;
+        }
+        if (!set_path_mtime(dp, now - ages[i])) {
+            report_fail(name, "set_path_mtime failed");
+            oci_store_close(s);
+            return;
+        }
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .keep_bytes = 500,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail(name, err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_layers != 1 || opts.skipped_layers != 2) {
+        report_fail(name, "expected pruned=1 skipped=2");
+        oci_store_close(s);
+        return;
+    }
+    /* ids[0] is the oldest; it must be the one that lost. ids[1] / ids[2]
+     * must still be on disk. */
+    char p0[1280];
+    char p1[1280];
+    char p2[1280];
+    snprintf(p0, sizeof(p0), "%s/layers/sha256/%s", root, ids[0] + 7);
+    snprintf(p1, sizeof(p1), "%s/layers/sha256/%s", root, ids[1] + 7);
+    snprintf(p2, sizeof(p2), "%s/layers/sha256/%s", root, ids[2] + 7);
+    if (path_exists(p0) || !path_exists(p1) || !path_exists(p2)) {
+        report_fail(name, "wrong layer was evicted");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
 /* --- Plan 3 C3.2: layer cache directory layout + helpers ----------------- */
 
 static void test_open_creates_layer_dirs(const char *scratch)
@@ -4248,6 +5477,20 @@ int main(void)
     test_prune_keep_bytes_zero_is_unlimited(scratch);
     test_prune_combined_older_then_budget(scratch);
     test_prune_dry_run_with_filters_no_disk_touch(scratch);
+    test_collect_layer_roots_empty_store(scratch);
+    test_collect_layer_roots_single_pin_layer(scratch);
+    test_collect_layer_roots_three_layer_prefix_chains(scratch);
+    test_collect_layer_roots_unpacked_tree(scratch);
+    test_collect_layer_roots_missing_config_blob_fails(scratch);
+    test_prune_sweeps_dangling_layer_entry(scratch);
+    test_prune_keeps_layer_referenced_by_pin(scratch);
+    test_prune_keeps_layer_referenced_by_unpacked_tree(scratch);
+    test_prune_sweeps_dangling_stack_entry(scratch);
+    test_prune_keeps_stack_for_each_prefix_chain(scratch);
+    test_prune_dry_run_keeps_layer_and_stack_on_disk(scratch);
+    test_prune_layer_size_counted_in_pruned_bytes(scratch);
+    test_prune_older_than_skips_fresh_layer_entry(scratch);
+    test_prune_keep_bytes_evicts_oldest_layer_first(scratch);
     test_open_creates_layer_dirs(scratch);
     test_layer_resolve_format(scratch);
     test_layer_has_present_absent(scratch);

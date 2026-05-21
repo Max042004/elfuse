@@ -1700,6 +1700,332 @@ static int migrate_legacy_refs(struct oci_store *s)
     return 0;
 }
 
+/* --- Plan 3 C3.3d: layer + stack cache mark walker -------------------- */
+
+/* Free a NULL-terminated heap-owned char ** array. */
+static void diff_id_strv_free(char **v)
+{
+    if (!v)
+        return;
+    for (size_t i = 0; v[i]; i++)
+        free(v[i]);
+    free((void *) v);
+}
+
+/* Walk a directory tree summing the st_size of every regular file. Symlinks
+ * and other non-regular entries contribute zero (lstat does not follow). A
+ * missing entry (ENOENT) yields 0 so a concurrent rm cannot make the caller
+ * undercount what is still on disk. Other directory IO errors are treated as
+ * zero too because the prune sweep already counted the entry as a candidate
+ * and a partial size sum here would only shrink the reported reclaim figure;
+ * the recursive rm in apply_verdicts will surface the real failure.
+ *
+ * Duplicate of dedup-metrics.c::sum_tree_size; lift to a shared util when a
+ * third copy appears (rebuild-cache.c already carries its own rm_recursive
+ * for the same reason).
+ */
+static uint64_t dir_tree_size_sum(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0)
+        return 0;
+    if (S_ISREG(st.st_mode))
+        return (uint64_t) st.st_size;
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+    DIR *d = opendir(path);
+    if (!d)
+        return 0;
+    uint64_t total = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char child[STORE_PATH_MAX];
+        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (n < 0 || (size_t) n >= sizeof(child))
+            continue;
+        total += dir_tree_size_sum(child);
+    }
+    closedir(d);
+    return total;
+}
+
+/* Walk one image's manifest digest down to the linux/arm64 image-config and
+ * extract its rootfs.diff_ids as a heap-allocated NULL-terminated char **.
+ *
+ * Resolution path:
+ *   - load + try image-manifest parse -> read config descriptor, load + parse
+ *     image-config, return rootfs.diff_ids
+ *   - else try image-index parse -> pick linux/arm64 sub-manifest, recurse
+ *     if its blob is on disk, otherwise return a soft NO_LINUX_ARM64 result
+ *   - else fatal: malformed blob
+ *
+ * Return discipline (see diff_id_resolve_t below): SOFT_NONE indicates "no
+ * linux/arm64 entry in this image-index" or "the picked sub-manifest blob is
+ * not on disk" and contributes zero to the keep set without surfacing as an
+ * error; HARD_FAIL indicates a corrupt or missing manifest / config blob and
+ * propagates as a fatal mark failure so prune cannot later delete reachable
+ * cache entries.
+ *
+ * Duplicate of dedup-metrics.c::resolve_config_digest + load_diff_ids (those
+ * helpers fold all failures into "skip the image"; the mark walker needs the
+ * fatal vs soft distinction).
+ */
+typedef enum {
+    DIFF_ID_RESOLVE_OK = 0,
+    DIFF_ID_RESOLVE_SOFT_NONE = 1,
+    DIFF_ID_RESOLVE_HARD_FAIL = 2,
+} diff_id_resolve_t;
+
+static diff_id_resolve_t resolve_image_diff_ids(oci_store_t *s,
+                                                const char *manifest_digest,
+                                                char ***out_diff_ids,
+                                                const char **err)
+{
+    *out_diff_ids = NULL;
+    char *body = NULL;
+    size_t body_len = 0;
+    if (load_manifest_blob(s, manifest_digest, &body, &body_len) < 0) {
+        if (err)
+            *err = "collect_layer_roots: manifest blob missing or unreadable";
+        return DIFF_ID_RESOLVE_HARD_FAIL;
+    }
+
+    /* Image-manifest path: drill into its image-config. */
+    oci_manifest_t mf = {0};
+    if (oci_manifest_parse(body, body_len, &mf, NULL) == 0) {
+        char config_digest[OCI_DIGEST_HEX_MAX + 16];
+        int dn = snprintf(config_digest, sizeof(config_digest), "%s",
+                          mf.config.digest_str);
+        oci_manifest_free(&mf);
+        free(body);
+        if (dn < 0 || (size_t) dn >= sizeof(config_digest)) {
+            if (err)
+                *err = "collect_layer_roots: config digest overflow";
+            errno = ENAMETOOLONG;
+            return DIFF_ID_RESOLVE_HARD_FAIL;
+        }
+        char *cfg_body = NULL;
+        size_t cfg_len = 0;
+        if (load_manifest_blob(s, config_digest, &cfg_body, &cfg_len) < 0) {
+            if (err)
+                *err = "collect_layer_roots: image-config blob missing or "
+                       "unreadable";
+            return DIFF_ID_RESOLVE_HARD_FAIL;
+        }
+        oci_image_config_t cfg = {0};
+        if (oci_image_config_parse(cfg_body, cfg_len, &cfg, NULL) < 0) {
+            free(cfg_body);
+            if (err)
+                *err = "collect_layer_roots: image-config blob unparseable";
+            errno = EINVAL;
+            return DIFF_ID_RESOLVE_HARD_FAIL;
+        }
+        free(cfg_body);
+        /* Count and copy the diff_ids. Empty list yields a one-element NULL
+         * terminator so callers iterate uniformly. */
+        size_t n = 0;
+        while (cfg.rootfs_diff_ids[n])
+            n++;
+        char **copy = (char **) calloc(n + 1, sizeof(*copy));
+        if (!copy) {
+            oci_image_config_free(&cfg);
+            if (err)
+                *err = "collect_layer_roots: diff_id strv alloc failed";
+            errno = ENOMEM;
+            return DIFF_ID_RESOLVE_HARD_FAIL;
+        }
+        for (size_t i = 0; i < n; i++) {
+            copy[i] = strdup(cfg.rootfs_diff_ids[i]);
+            if (!copy[i]) {
+                diff_id_strv_free(copy);
+                oci_image_config_free(&cfg);
+                if (err)
+                    *err = "collect_layer_roots: diff_id strdup failed";
+                errno = ENOMEM;
+                return DIFF_ID_RESOLVE_HARD_FAIL;
+            }
+        }
+        oci_image_config_free(&cfg);
+        *out_diff_ids = copy;
+        return DIFF_ID_RESOLVE_OK;
+    }
+    memset(&mf, 0, sizeof(mf));
+
+    /* Image-index path: pick linux/arm64 and recurse. */
+    oci_index_t idx = {0};
+    if (oci_index_parse(body, body_len, &idx, NULL) < 0) {
+        free(body);
+        if (err)
+            *err = "collect_layer_roots: blob is neither image-manifest nor "
+                   "image-index";
+        errno = EINVAL;
+        return DIFF_ID_RESOLVE_HARD_FAIL;
+    }
+    free(body);
+    const oci_index_entry_t *picked = oci_index_pick_linux_arm64(&idx);
+    if (!picked) {
+        oci_index_free(&idx);
+        return DIFF_ID_RESOLVE_SOFT_NONE;
+    }
+    char *sub_digest = strdup(picked->desc.digest_str);
+    oci_index_free(&idx);
+    if (!sub_digest) {
+        if (err)
+            *err = "collect_layer_roots: sub-manifest digest strdup failed";
+        errno = ENOMEM;
+        return DIFF_ID_RESOLVE_HARD_FAIL;
+    }
+    if (!manifest_blob_exists(s, sub_digest)) {
+        /* Multi-arch pin where pull never fetched linux/arm64. Contribute
+         * nothing; the sub-manifest's layers are not on disk so there is
+         * nothing to keep. Matches expand_manifest_digest's soft policy for
+         * the same shape under blob mark.
+         */
+        free(sub_digest);
+        return DIFF_ID_RESOLVE_SOFT_NONE;
+    }
+    diff_id_resolve_t rc = resolve_image_diff_ids(s, sub_digest, out_diff_ids,
+                                                  err);
+    free(sub_digest);
+    return rc;
+}
+
+/* Add every diff_id in the NULL-terminated list to *diff_set and every
+ * ChainID prefix (ChainID(L0..Lk) for k = 0..n-1) to *chain_set. The walker
+ * threads the running chain through a single buffer; oci_chainid_compute
+ * already handles the L0 passthrough case via a NULL prev argument.
+ *
+ * Returns 0 on success or -1 with errno set on allocation failure inside the
+ * digest set or chainid composition. err is populated on failure.
+ */
+static int add_diff_ids_and_chains(char *const *diff_ids,
+                                   oci_digest_set_t *diff_set,
+                                   oci_digest_set_t *chain_set,
+                                   const char **err)
+{
+    char prev[OCI_DIGEST_HEX_MAX + 16] = "";
+    for (size_t i = 0; diff_ids[i]; i++) {
+        if (oci_digest_set_add(diff_set, diff_ids[i]) < 0) {
+            if (err)
+                *err = "collect_layer_roots: diff_id set add failed";
+            return -1;
+        }
+        char chain[OCI_DIGEST_HEX_MAX + 16];
+        const char *prev_arg = (i == 0) ? NULL : prev;
+        if (oci_chainid_compute(prev_arg, diff_ids[i], chain,
+                                sizeof(chain)) < 0) {
+            if (err)
+                *err = "collect_layer_roots: chainid compute failed";
+            return -1;
+        }
+        memcpy(prev, chain, strlen(chain) + 1);
+        if (oci_digest_set_add(chain_set, chain) < 0) {
+            if (err)
+                *err = "collect_layer_roots: chain set add failed";
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int oci_store_collect_layer_roots(oci_store_t *s,
+                                  oci_digest_set_t *out_diff_ids,
+                                  oci_digest_set_t *out_chain_ids,
+                                  const char *volume_root,
+                                  const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!s || !out_diff_ids || !out_chain_ids) {
+        *err = "collect_layer_roots: NULL argument";
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_set_init(out_diff_ids);
+    oci_digest_set_init(out_chain_ids);
+
+    /* Source 1: pins in index.json. */
+    oci_pin_list_t pins = {0};
+    const char *list_err = NULL;
+    if (oci_store_list_refs(s, &pins, &list_err) < 0) {
+        *err = list_err ? list_err
+                        : "collect_layer_roots: oci_store_list_refs failed";
+        oci_digest_set_free(out_diff_ids);
+        oci_digest_set_free(out_chain_ids);
+        return -1;
+    }
+    for (size_t i = 0; i < pins.count; i++) {
+        char **diff_ids = NULL;
+        diff_id_resolve_t rr = resolve_image_diff_ids(s, pins.items[i].digest,
+                                                      &diff_ids, err);
+        if (rr == DIFF_ID_RESOLVE_HARD_FAIL) {
+            oci_pin_list_free(&pins);
+            oci_digest_set_free(out_diff_ids);
+            oci_digest_set_free(out_chain_ids);
+            return -1;
+        }
+        if (rr == DIFF_ID_RESOLVE_SOFT_NONE)
+            continue;
+        int ac = add_diff_ids_and_chains(diff_ids, out_diff_ids, out_chain_ids,
+                                         err);
+        diff_id_strv_free(diff_ids);
+        if (ac < 0) {
+            oci_pin_list_free(&pins);
+            oci_digest_set_free(out_diff_ids);
+            oci_digest_set_free(out_chain_ids);
+            return -1;
+        }
+    }
+    oci_pin_list_free(&pins);
+
+    /* Source 2: unpacked image trees under <volume_root>/images/. The
+     * origin sidecar already carries the resolved diff_id list so no blob
+     * read is required here.
+     */
+    if (volume_root) {
+        oci_volume_list_t trees = {0};
+        const char *vlerr = NULL;
+        if (oci_volume_list_unpacked(volume_root, &trees, &vlerr) < 0) {
+            *err = vlerr
+                       ? vlerr
+                       : "collect_layer_roots: volume_list_unpacked failed";
+            oci_digest_set_free(out_diff_ids);
+            oci_digest_set_free(out_chain_ids);
+            return -1;
+        }
+        for (size_t i = 0; i < trees.count; i++) {
+            oci_origin_t origin = {0};
+            const char *oerr = NULL;
+            if (oci_origin_read(trees.items[i], &origin, &oerr) < 0) {
+                *err = oerr ? oerr
+                            : "collect_layer_roots: origin sidecar read failed";
+                oci_volume_list_free(&trees);
+                oci_digest_set_free(out_diff_ids);
+                oci_digest_set_free(out_chain_ids);
+                return -1;
+            }
+            if (origin.layer_diffids) {
+                if (add_diff_ids_and_chains(origin.layer_diffids,
+                                            out_diff_ids, out_chain_ids,
+                                            err) < 0) {
+                    oci_origin_free(&origin);
+                    oci_volume_list_free(&trees);
+                    oci_digest_set_free(out_diff_ids);
+                    oci_digest_set_free(out_chain_ids);
+                    return -1;
+                }
+            }
+            oci_origin_free(&origin);
+        }
+        oci_volume_list_free(&trees);
+    }
+    return 0;
+}
+
 /* Algorithm set this build expects to find under blobs/. Other algorithm
  * subdirectories (a future operator hand-created sha384/, for instance)
  * are left untouched: sweep only inspects directories it recognises.
@@ -1791,10 +2117,20 @@ static int prune_candidate_ptr_cmp_mtime_asc(const void *a, const void *b)
     return strcmp(pa->path, pb->path);
 }
 
+/* The three cache families share a single sweep pipeline. Family selects
+ * how apply_verdicts removes a PRUNE-verdict entry (unlink vs recursive rm)
+ * and informs diagnostics; the classify and filter passes operate uniformly
+ * on prune_candidate_list_t.
+ */
+typedef enum {
+    PRUNE_FAMILY_BLOB = 0,  /* <root>/blobs/<algo>/<hex> regular files */
+    PRUNE_FAMILY_TREE = 1,  /* <root>/layers/.../<algo>/<hex>/ directories */
+} prune_family_t;
+
 /* Classify one blobs/<algo>/ directory. For every regular file whose
  * name is a valid lowercase hex digest of the right length, build the
  * canonical "<algo>:<hex>" digest, look it up in the keep set, and
- * either bump kept_blobs (reachable) or append a candidate (dangling).
+ * either bump *out_kept (reachable) or append a candidate (dangling).
  * lstat ENOENT mid-walk is treated as a concurrent prune and skipped
  * silently. Subdirectories, dotfiles, and otherwise-shaped entries
  * pass through untouched so the OCI image-layout spec's regular-blob
@@ -1806,7 +2142,7 @@ static int prune_candidate_ptr_cmp_mtime_asc(const void *a, const void *b)
 static int classify_algo_dir(oci_store_t *s,
                              oci_digest_algo_t algo,
                              const oci_digest_set_t *keep,
-                             oci_store_prune_options_t *stats,
+                             size_t *out_kept,
                              prune_candidate_list_t *list,
                              const char **err)
 {
@@ -1891,7 +2227,7 @@ static int classify_algo_dir(oci_store_t *s,
         }
 
         if (oci_digest_set_contains(keep, digest)) {
-            stats->kept_blobs++;
+            (*out_kept)++;
             continue;
         }
 
@@ -1904,6 +2240,135 @@ static int classify_algo_dir(oci_store_t *s,
             break;
         }
         if (prune_candidate_list_append(list, path_copy, (uint64_t) st.st_size,
+                                        st.st_mtime) < 0) {
+            free(path_copy);
+            if (err)
+                *err = "prune: candidate list grow failed";
+            rc = -1;
+            break;
+        }
+    }
+    closedir(dp);
+    return rc;
+}
+
+/* Classify one tree-shaped cache directory (layers/<algo>/ or
+ * layers/stacks/<algo>/). The base_subpath argument is the relative path
+ * beneath the store root, e.g. "layers/sha256" or "layers/stacks/sha256";
+ * it lets one helper drive both the raw layer cache and the ChainID-keyed
+ * stack cache without duplicating the dir-walk plumbing.
+ *
+ * For every immediate child whose name is a valid lowercase hex digest of
+ * the right length AND whose lstat reports a directory, compose the
+ * canonical "<algo>:<hex>" digest and look it up in the keep set. Misses
+ * (dangling cache entries) get appended to the candidate list together with
+ * the recursive size of the entry tree and the directory's own st_mtime
+ * (set by rename(2) at commit time, so newer entries sort newer). Hits
+ * bump *out_kept.
+ *
+ * Non-directory entries, dotfiles, sibling .schema / .staging markers, and
+ * malformed names are all skipped silently so the caller never deletes
+ * foreign state. Missing base directory (fresh store before any unpack)
+ * yields 0 with no entries. Other IO failures are fatal.
+ */
+static int classify_tree_cache_dir(oci_store_t *s,
+                                   const char *base_subpath,
+                                   oci_digest_algo_t algo,
+                                   const oci_digest_set_t *keep,
+                                   size_t *out_kept,
+                                   prune_candidate_list_t *list,
+                                   const char **err)
+{
+    const char *algo_name = oci_digest_algo_name(algo);
+    if (!algo_name) {
+        if (err)
+            *err = "prune: unknown digest algorithm";
+        errno = EINVAL;
+        return -1;
+    }
+
+    char dir_path[STORE_PATH_MAX];
+    int n = snprintf(dir_path, sizeof(dir_path), "%s/%s", s->root,
+                     base_subpath);
+    if (n < 0 || (size_t) n >= sizeof(dir_path)) {
+        if (err)
+            *err = "prune: tree-cache path exceeds STORE_PATH_MAX";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    DIR *dp = opendir(dir_path);
+    if (!dp) {
+        if (errno == ENOENT)
+            return 0;
+        if (err)
+            *err = "prune: opendir on tree-cache dir failed";
+        return -1;
+    }
+
+    int rc = 0;
+    struct dirent *de;
+    size_t hex_len = oci_digest_hex_len(algo);
+    while ((de = readdir(dp)) != NULL) {
+        const char *name = de->d_name;
+        if (name[0] == '.' &&
+            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            continue;
+        if (name[0] == '.')
+            continue;
+        if (strlen(name) != hex_len)
+            continue;
+        if (!oci_digest_hex_valid(algo, name))
+            continue;
+
+        char entry_path[STORE_PATH_MAX];
+        int en = snprintf(entry_path, sizeof(entry_path), "%s/%s", dir_path,
+                          name);
+        if (en < 0 || (size_t) en >= sizeof(entry_path)) {
+            if (err)
+                *err = "prune: tree-cache entry path exceeds STORE_PATH_MAX";
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+
+        struct stat st;
+        if (lstat(entry_path, &st) < 0) {
+            if (errno == ENOENT)
+                continue;
+            if (err)
+                *err = "prune: lstat on tree-cache entry failed";
+            rc = -1;
+            break;
+        }
+        if (!S_ISDIR(st.st_mode))
+            continue;
+
+        char digest[OCI_DIGEST_HEX_MAX + 16];
+        int dn = snprintf(digest, sizeof(digest), "%s:%s", algo_name, name);
+        if (dn < 0 || (size_t) dn >= sizeof(digest)) {
+            if (err)
+                *err = "prune: digest string buffer too small";
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+
+        if (oci_digest_set_contains(keep, digest)) {
+            (*out_kept)++;
+            continue;
+        }
+
+        uint64_t tree_bytes = dir_tree_size_sum(entry_path);
+        char *path_copy = strdup(entry_path);
+        if (!path_copy) {
+            if (err)
+                *err = "prune: strdup tree-cache path failed";
+            errno = ENOMEM;
+            rc = -1;
+            break;
+        }
+        if (prune_candidate_list_append(list, path_copy, tree_bytes,
                                         st.st_mtime) < 0) {
             free(path_copy);
             if (err)
@@ -1998,32 +2463,65 @@ static int apply_filters(oci_store_prune_options_t *opts,
     return 0;
 }
 
+/* Forward declaration for the recursive rm helper used by the TREE family
+ * removal path below; the implementation lives with the layer cache helpers
+ * later in this file.
+ */
+static int layer_stage_rm(const char *path);
+
 /* Materialise filter verdicts onto disk and stats. Every candidate
  * contributes to exactly one output bucket: SKIP -> skipped_*, PRUNE
- * -> pruned_* (and unlink when commit). The unlink failure policy
+ * -> pruned_* (and removal when commit). The removal failure policy
  * mirrors C1.3: ENOENT is treated as a concurrent prune and counted
- * silently; any other unlink errno is fatal so the caller's stats
- * never report bytes we did not actually reclaim.
+ * silently; any other errno is fatal so the caller's stats never
+ * report bytes we did not actually reclaim. family selects the
+ * removal primitive: BLOB uses unlink(2) on a regular file; TREE uses
+ * layer_stage_rm on a directory subtree so a populated cache entry is
+ * taken down in one call. The four output pointers let the caller
+ * route the counters into the per-family stats fields (kept lives in
+ * classify; this function only writes pruned + skipped).
  */
 static int apply_verdicts(prune_candidate_list_t *list, bool commit,
-                          oci_store_prune_options_t *stats, const char **err)
+                          prune_family_t family,
+                          size_t *out_pruned_count,
+                          uint64_t *out_pruned_bytes,
+                          size_t *out_skipped_count,
+                          uint64_t *out_skipped_bytes,
+                          const char **err)
 {
     for (size_t i = 0; i < list->count; i++) {
         if (list->items[i].verdict == PRUNE_VERDICT_SKIP) {
-            stats->skipped_blobs++;
-            stats->skipped_bytes += list->items[i].size;
+            (*out_skipped_count)++;
+            *out_skipped_bytes += list->items[i].size;
             continue;
         }
-        stats->pruned_blobs++;
-        stats->pruned_bytes += list->items[i].size;
+        (*out_pruned_count)++;
+        *out_pruned_bytes += list->items[i].size;
         if (!commit)
             continue;
-        if (unlink(list->items[i].path) < 0) {
-            if (errno == ENOENT)
-                continue;
-            if (err)
-                *err = "prune: unlink on dangling blob failed";
-            return -1;
+        if (family == PRUNE_FAMILY_BLOB) {
+            if (unlink(list->items[i].path) < 0) {
+                if (errno == ENOENT)
+                    continue;
+                if (err)
+                    *err = "prune: unlink on dangling blob failed";
+                return -1;
+            }
+        } else {
+            /* TREE: recursive rm tolerates ENOENT internally via lstat
+             * but still returns -1 on any other failure mid-walk. The
+             * stats already count the entry as pruned so a partial
+             * teardown that succeeds for some children leaves the stats
+             * consistent with what was actually freed.
+             */
+            if (layer_stage_rm(list->items[i].path) < 0) {
+                if (errno == ENOENT)
+                    continue;
+                if (err)
+                    *err = "prune: recursive rm on dangling cache entry "
+                           "failed";
+                return -1;
+            }
         }
     }
     return 0;
@@ -2049,50 +2547,155 @@ int oci_store_prune(oci_store_t *s,
     opts->pruned_bytes = 0;
     opts->skipped_blobs = 0;
     opts->skipped_bytes = 0;
+    opts->kept_layers = 0;
+    opts->pruned_layers = 0;
+    opts->pruned_layer_bytes = 0;
+    opts->skipped_layers = 0;
+    opts->skipped_layer_bytes = 0;
+    opts->kept_stacks = 0;
+    opts->pruned_stacks = 0;
+    opts->pruned_stack_bytes = 0;
+    opts->skipped_stacks = 0;
+    opts->skipped_stack_bytes = 0;
 
     /* Serialize against oci_store_put_ref so a pull cannot publish a
-     * new pin between collect_roots and sweep. Mark and sweep both run
-     * under the lock.
+     * new pin between the mark snapshot and the sweep. Mark and sweep
+     * for all three cache families share this single lock window so
+     * the blob keep set, the diff_id keep set, and the chain_id keep
+     * set are derived from one consistent view of pins + unpacked
+     * sysroots.
      */
     int lock_fd = acquire_index_lock(s->root, err);
     if (lock_fd < 0)
         return -1;
 
-    oci_digest_set_t keep = {0};
-    if (oci_store_collect_roots(s, &keep, opts->volume_root, err) < 0) {
-        int saved = errno;
-        close(lock_fd);
-        errno = saved;
-        return -1;
+    /* Mark phase: build three keep sets in one window. oci_digest_set_free
+     * is safe on zero-initialised structs so a partial mark still cleans
+     * up correctly via the single done: label below.
+     */
+    oci_digest_set_t keep_blobs = {0};
+    oci_digest_set_t keep_diff_ids = {0};
+    oci_digest_set_t keep_chain_ids = {0};
+    int rc = 0;
+    if (oci_store_collect_roots(s, &keep_blobs, opts->volume_root, err) < 0) {
+        rc = -1;
+        goto done;
+    }
+    if (oci_store_collect_layer_roots(s, &keep_diff_ids, &keep_chain_ids,
+                                      opts->volume_root, err) < 0) {
+        rc = -1;
+        goto done;
     }
 
-    prune_candidate_list_t candidates = {0};
-    int rc = 0;
+    /* Sweep phase: each family classifies, filters, and applies independently
+     * against its own keep set and candidate list. The filter passes use the
+     * same opts->older_than_sec / opts->keep_bytes inputs but each family
+     * runs its own keep-bytes budget so a fat blob cannot crowd a layer
+     * eviction (or vice versa) off a shared global budget.
+     */
+    time_t now = time(NULL);
+
+    /* Family 1: blobs */
+    prune_candidate_list_t blob_candidates = {0};
     for (size_t i = 0; i < sizeof(PRUNE_ALGOS) / sizeof(PRUNE_ALGOS[0]); i++) {
-        if (classify_algo_dir(s, PRUNE_ALGOS[i], &keep, opts, &candidates,
-                              err) < 0) {
+        if (classify_algo_dir(s, PRUNE_ALGOS[i], &keep_blobs,
+                              &opts->kept_blobs, &blob_candidates, err) < 0) {
+            prune_candidate_list_free(&blob_candidates);
             rc = -1;
             goto done;
         }
     }
+    if (apply_filters(opts, &blob_candidates, now, err) < 0) {
+        prune_candidate_list_free(&blob_candidates);
+        rc = -1;
+        goto done;
+    }
+    if (apply_verdicts(&blob_candidates, opts->commit, PRUNE_FAMILY_BLOB,
+                       &opts->pruned_blobs, &opts->pruned_bytes,
+                       &opts->skipped_blobs, &opts->skipped_bytes, err) < 0) {
+        prune_candidate_list_free(&blob_candidates);
+        rc = -1;
+        goto done;
+    }
+    prune_candidate_list_free(&blob_candidates);
 
-    /* Filters short-circuit when no candidates exist or when neither
-     * input flag is set; in either case verdicts stay PRUNE and the
-     * apply pass behaves exactly like the C1.3 sweep.
-     */
-    if (apply_filters(opts, &candidates, time(NULL), err) < 0) {
+    /* Family 2: layers/<algo>/<hex>/ raw cache directories */
+    prune_candidate_list_t layer_candidates = {0};
+    for (size_t i = 0; i < sizeof(PRUNE_ALGOS) / sizeof(PRUNE_ALGOS[0]); i++) {
+        const char *algo_name = oci_digest_algo_name(PRUNE_ALGOS[i]);
+        char base[STORE_PATH_MAX];
+        int bn = snprintf(base, sizeof(base), "layers/%s", algo_name);
+        if (bn < 0 || (size_t) bn >= sizeof(base)) {
+            *err = "prune: layers/<algo> subpath overflow";
+            errno = ENAMETOOLONG;
+            prune_candidate_list_free(&layer_candidates);
+            rc = -1;
+            goto done;
+        }
+        if (classify_tree_cache_dir(s, base, PRUNE_ALGOS[i], &keep_diff_ids,
+                                    &opts->kept_layers, &layer_candidates,
+                                    err) < 0) {
+            prune_candidate_list_free(&layer_candidates);
+            rc = -1;
+            goto done;
+        }
+    }
+    if (apply_filters(opts, &layer_candidates, now, err) < 0) {
+        prune_candidate_list_free(&layer_candidates);
         rc = -1;
         goto done;
     }
-    if (apply_verdicts(&candidates, opts->commit, opts, err) < 0) {
+    if (apply_verdicts(&layer_candidates, opts->commit, PRUNE_FAMILY_TREE,
+                       &opts->pruned_layers, &opts->pruned_layer_bytes,
+                       &opts->skipped_layers, &opts->skipped_layer_bytes,
+                       err) < 0) {
+        prune_candidate_list_free(&layer_candidates);
         rc = -1;
         goto done;
     }
+    prune_candidate_list_free(&layer_candidates);
+
+    /* Family 3: layers/stacks/<algo>/<hex>/ ChainID-keyed snapshots */
+    prune_candidate_list_t stack_candidates = {0};
+    for (size_t i = 0; i < sizeof(PRUNE_ALGOS) / sizeof(PRUNE_ALGOS[0]); i++) {
+        const char *algo_name = oci_digest_algo_name(PRUNE_ALGOS[i]);
+        char base[STORE_PATH_MAX];
+        int bn = snprintf(base, sizeof(base), "layers/stacks/%s", algo_name);
+        if (bn < 0 || (size_t) bn >= sizeof(base)) {
+            *err = "prune: layers/stacks/<algo> subpath overflow";
+            errno = ENAMETOOLONG;
+            prune_candidate_list_free(&stack_candidates);
+            rc = -1;
+            goto done;
+        }
+        if (classify_tree_cache_dir(s, base, PRUNE_ALGOS[i], &keep_chain_ids,
+                                    &opts->kept_stacks, &stack_candidates,
+                                    err) < 0) {
+            prune_candidate_list_free(&stack_candidates);
+            rc = -1;
+            goto done;
+        }
+    }
+    if (apply_filters(opts, &stack_candidates, now, err) < 0) {
+        prune_candidate_list_free(&stack_candidates);
+        rc = -1;
+        goto done;
+    }
+    if (apply_verdicts(&stack_candidates, opts->commit, PRUNE_FAMILY_TREE,
+                       &opts->pruned_stacks, &opts->pruned_stack_bytes,
+                       &opts->skipped_stacks, &opts->skipped_stack_bytes,
+                       err) < 0) {
+        prune_candidate_list_free(&stack_candidates);
+        rc = -1;
+        goto done;
+    }
+    prune_candidate_list_free(&stack_candidates);
 
 done:;
     int saved = errno;
-    prune_candidate_list_free(&candidates);
-    oci_digest_set_free(&keep);
+    oci_digest_set_free(&keep_chain_ids);
+    oci_digest_set_free(&keep_diff_ids);
+    oci_digest_set_free(&keep_blobs);
     close(lock_fd);
     errno = saved;
     return rc;

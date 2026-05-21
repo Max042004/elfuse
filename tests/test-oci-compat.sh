@@ -363,6 +363,51 @@ case "${rebuild_out}" in
         ;;
 esac
 
+# ── C3.3d layer + stack prune sweep smoke ───────────────────────────
+
+# After the prune-smoke section above the store holds 3 reachable blobs
+# (manifest + config + layer for the dry/commit fixture pin). Drop one
+# dangling layer dir and one dangling stack dir into the store and verify
+# the CLI render now mentions layers and stacks alongside blobs, that the
+# directories are unlinked on --commit, and that the existing blob lines
+# still match the pre-C3.3d output shape.
+mkdir -p "${SCRATCH}/c33d"
+echo "dangling-layer" > "${SCRATCH}/c33d/layer"
+echo "dangling-stack" > "${SCRATCH}/c33d/stack"
+if command -v shasum >/dev/null 2>&1; then
+    layer_hex=$(shasum -a 256 "${SCRATCH}/c33d/layer" | awk '{print $1}')
+    stack_hex=$(shasum -a 256 "${SCRATCH}/c33d/stack" | awk '{print $1}')
+else
+    layer_hex=$(sha256sum "${SCRATCH}/c33d/layer" | awk '{print $1}')
+    stack_hex=$(sha256sum "${SCRATCH}/c33d/stack" | awk '{print $1}')
+fi
+mkdir -p "${STORE}/layers/sha256/${layer_hex}"
+mkdir -p "${STORE}/layers/stacks/sha256/${stack_hex}"
+echo "filler" > "${STORE}/layers/sha256/${layer_hex}/payload"
+
+c33d_out=$("${ELFUSE}" oci prune --store "${STORE}" --commit 2>&1)
+rc=$?
+case "${c33d_out}" in
+    *"layers:"*"reclaimed"*"stacks:"*"reclaimed"*)
+        if [ "${rc}" = 0 ]; then
+            ok "c33d-smoke: --commit renders layers + stacks lines"
+        else
+            bad "c33d-smoke: --commit rc" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "c33d-smoke: --commit output" "${c33d_out}"
+        ;;
+esac
+
+if [ ! -e "${STORE}/layers/sha256/${layer_hex}" ] \
+   && [ ! -e "${STORE}/layers/stacks/sha256/${stack_hex}" ]; then
+    ok "c33d-smoke: dangling layer and stack dirs were unlinked"
+else
+    bad "c33d-smoke: disk state" \
+        "layer=${layer_hex} stack=${stack_hex} still present"
+fi
+
 # ── Heavy mode (full E2E launches) ───────────────────────────────────
 
 if [ -n "${OCI_COMPAT_TEST:-}" ]; then
