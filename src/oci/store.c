@@ -33,13 +33,19 @@
  *     that bumped the imageLayoutVersion is not stomped.
  *
  * Pre-C2.2 stores wrote pin files under refs/<registry>/<repository>/<tag>
- * instead of index.json. C2.2 stops writing that tree; C2.3 will migrate
- * older stores on open. This module does not remove a pre-existing refs/
- * directory so a downgrade still finds the legacy data.
+ * instead of index.json. C2.3 migrates older stores on open by recursively
+ * scanning refs/ and rebuilding index.json under the same flock that
+ * oci_store_put_ref takes, so a concurrent first-open and first-put cannot
+ * double-write. refs/ is left in place for one release so a downgrade still
+ * finds the legacy data. Migration is suppressed when ELFUSE_OCI_NO_MIGRATE
+ * is set in the environment; in that mode an older store appears empty to
+ * oci_store_get_ref / oci_store_list_refs until the env var is cleared on a
+ * subsequent open.
  */
 
 #include "store.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -89,6 +95,23 @@ struct oci_store {
  * conventional and matches what umoci / skopeo write.
  */
 static const char OCI_LAYOUT_BODY[] = "{\"imageLayoutVersion\":\"1.0.0\"}\n";
+
+/* Environment variable that disables C2.3 auto-migration of pre-index.json
+ * stores. When set to any non-empty value, oci_store_open leaves refs/ and
+ * the absent index.json alone so a downgrade test or recovery workflow can
+ * inspect the legacy layout without the daemon helpfully rewriting it.
+ */
+static const char NO_MIGRATE_ENV[] = "ELFUSE_OCI_NO_MIGRATE";
+
+/* Walks <root>/refs/ recursively, rebuilds <root>/index.json with one
+ * descriptor per discovered pin file, and writes it via tmp + rename. The
+ * caller must already hold an LOCK_EX on <root>/index.json.lock. Returns 0
+ * on success (including the no-pins-found case), -1 with errno preserved on
+ * an unrecoverable IO error. Individual pins whose manifest blob is missing
+ * from blobs/ are skipped with a stderr warning so a single dangling pin
+ * does not block migration for the rest of the store.
+ */
+static int migrate_legacy_refs(struct oci_store *s);
 
 /* Idempotently write <root>/oci-layout. Returns 0 on success or when the
  * marker already exists, -1 on any unexpected IO failure. The write uses a
@@ -197,6 +220,22 @@ oci_store_t *oci_store_open(const char *root)
         return NULL;
     }
     s->blobs = blobs;
+
+    /* C2.3 auto-migration: detect a pre-index.json store (refs/ tree without
+     * an index.json) and rebuild index.json under the same flock that
+     * oci_store_put_ref takes. Suppressed by ELFUSE_OCI_NO_MIGRATE so a
+     * downgrade test or recovery workflow can inspect the legacy layout
+     * without it being silently rewritten.
+     */
+    const char *no_migrate = getenv(NO_MIGRATE_ENV);
+    if (!no_migrate || !*no_migrate) {
+        if (migrate_legacy_refs(s) < 0) {
+            int saved = errno;
+            oci_store_close(s);
+            errno = saved;
+            return NULL;
+        }
+    }
     return s;
 }
 
@@ -988,4 +1027,347 @@ void oci_pin_list_free(oci_pin_list_t *list)
     }
     list->items = NULL;
     list->count = 0;
+}
+
+/* Read a legacy pin file at path. The format is a single line of
+ * "<algo>:<hex>" optionally followed by \n or \r\n. Trims trailing whitespace
+ * and validates digest shape. Returns a heap-allocated digest string on
+ * success, NULL on IO or schema failure with errno preserved.
+ */
+static char *read_legacy_pin_file(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return NULL;
+    char buf[OCI_DIGEST_HEX_MAX + 32];
+    ssize_t got = read(fd, buf, sizeof(buf) - 1);
+    int saved_errno = errno;
+    close(fd);
+    if (got < 0) {
+        errno = saved_errno;
+        return NULL;
+    }
+    if (got == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    buf[got] = '\0';
+    /* Trim trailing newline / carriage return so a Windows-edited pin file
+     * does not feed a stray byte into the digest validator.
+     */
+    while (got > 0 && (buf[got - 1] == '\n' || buf[got - 1] == '\r' ||
+                       buf[got - 1] == ' ' || buf[got - 1] == '\t')) {
+        buf[--got] = '\0';
+    }
+    if (got == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(buf, &algo, hex)) {
+        errno = EINVAL;
+        return NULL;
+    }
+    char *copy = strdup(buf);
+    if (!copy) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return copy;
+}
+
+/* Synthesize a pin descriptor for one legacy refs/ leaf and insert it into
+ * manifests[]. (name, digest_str) describe the pin; the manifest blob must
+ * exist on disk so mediaType + size can be derived. Returns 0 on success,
+ * +1 if the pin should be skipped (missing blob or other recoverable hole),
+ * -1 with errno preserved on an unrecoverable failure.
+ */
+static int migrate_append_descriptor(const oci_store_t *s, cJSON *manifests,
+                                     const char *name, const char *digest_str)
+{
+    int64_t size = 0;
+    if (blob_size(s, digest_str, &size) < 0) {
+        if (errno == ENOENT) {
+            fprintf(stderr,
+                    "elfuse oci: migration skipping pin %s: manifest blob "
+                    "%s missing from blobs/\n", name, digest_str);
+            return 1;
+        }
+        return -1;
+    }
+    char *media_type = infer_manifest_media_type(s, digest_str);
+    if (!media_type)
+        return -1;
+    cJSON *desc = build_descriptor(name, media_type, digest_str, size);
+    free(media_type);
+    if (!desc) {
+        errno = ENOMEM;
+        return -1;
+    }
+    /* Pre-existing index entry with the same name should not happen during
+     * a fresh migration, but defend against a partially-migrated store
+     * inheriting from an earlier crash: a later refs/ leaf with the same
+     * canonical name simply replaces the earlier one. */
+    int existing = find_manifest_index(manifests, name);
+    if (existing >= 0) {
+        if (!cJSON_ReplaceItemInArray(manifests, existing, desc)) {
+            cJSON_Delete(desc);
+            errno = EIO;
+            return -1;
+        }
+    } else if (!cJSON_AddItemToArray(manifests, desc)) {
+        cJSON_Delete(desc);
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}
+
+/* Recursive walk of refs/. depth counts directory levels below refs/:
+ *   depth 0 = registry, depth 1.. = repository components, leaf file = tag.
+ * head and head_len accumulate the relative path so the leaf callback can
+ * split it into registry/repo/tag. *migrated and *skipped track totals for
+ * the final log line. Returns 0 on success, -1 on unrecoverable failure.
+ */
+static int scan_refs_dir(const oci_store_t *s, cJSON *manifests,
+                         const char *dir_abs,
+                         const char *rel_head, size_t rel_head_len,
+                         size_t depth, size_t *migrated, size_t *skipped)
+{
+    DIR *dp = opendir(dir_abs);
+    if (!dp)
+        return -1;
+
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        const char *name = de->d_name;
+        if (name[0] == '.' &&
+            (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+            continue;
+        /* Hidden files (e.g. .DS_Store) are ignored: legacy pins always used
+         * an unprefixed registry / tag name so a dotfile cannot represent a
+         * pin and we skip it without surfacing as a migration warning. */
+        if (name[0] == '.')
+            continue;
+
+        size_t name_len = strlen(name);
+        char child_abs[STORE_PATH_MAX];
+        int n = snprintf(child_abs, sizeof(child_abs), "%s/%s", dir_abs, name);
+        if (n < 0 || (size_t) n >= sizeof(child_abs)) {
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+        char child_rel[STORE_PATH_MAX];
+        int rn = rel_head_len == 0
+                     ? snprintf(child_rel, sizeof(child_rel), "%s", name)
+                     : snprintf(child_rel, sizeof(child_rel), "%s/%s",
+                                rel_head, name);
+        if (rn < 0 || (size_t) rn >= sizeof(child_rel)) {
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+
+        struct stat st;
+        if (lstat(child_abs, &st) < 0) {
+            rc = -1;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (scan_refs_dir(s, manifests, child_abs, child_rel,
+                              (size_t) rn, depth + 1, migrated, skipped) < 0) {
+                rc = -1;
+                break;
+            }
+            continue;
+        }
+        if (!S_ISREG(st.st_mode))
+            continue;
+
+        /* Leaf file. Need at least one repository component plus the tag, so
+         * total depth must be >= 2 (registry / repo / tag). A leaf that lands
+         * directly under refs/<registry>/ has no repository component and is
+         * not a well-formed legacy pin; skip it with a warning so the store
+         * is not silently lossy.
+         */
+        if (depth < 2) {
+            fprintf(stderr,
+                    "elfuse oci: migration skipping refs/%s: not deep enough "
+                    "for <registry>/<repo>/<tag>\n", child_rel);
+            (*skipped)++;
+            continue;
+        }
+        (void) name_len;
+
+        /* Split child_rel = "<registry>/<repo-component>(/<repo-component>)*"
+         * "/<tag>". First '/' separates registry; last '/' separates tag.
+         */
+        const char *first_slash = strchr(child_rel, '/');
+        const char *last_slash = strrchr(child_rel, '/');
+        if (!first_slash || !last_slash || first_slash == last_slash) {
+            fprintf(stderr,
+                    "elfuse oci: migration skipping refs/%s: malformed path\n",
+                    child_rel);
+            (*skipped)++;
+            continue;
+        }
+        size_t reg_len = (size_t) (first_slash - child_rel);
+        size_t repo_len = (size_t) (last_slash - first_slash - 1);
+        const char *repo_start = first_slash + 1;
+        const char *tag_start = last_slash + 1;
+        size_t tag_len = strlen(tag_start);
+        if (reg_len == 0 || repo_len == 0 || tag_len == 0) {
+            fprintf(stderr,
+                    "elfuse oci: migration skipping refs/%s: empty path "
+                    "component\n", child_rel);
+            (*skipped)++;
+            continue;
+        }
+
+        char *digest_str = read_legacy_pin_file(child_abs);
+        if (!digest_str) {
+            fprintf(stderr,
+                    "elfuse oci: migration skipping refs/%s: pin file "
+                    "unreadable or malformed\n", child_rel);
+            (*skipped)++;
+            continue;
+        }
+
+        /* Build canonical "<registry>/<repository>:<tag>" inline (cannot
+         * borrow oci_ref_canonical_name without round-tripping through the
+         * parser, which would reject repository components that the legacy
+         * code path happened to accept). */
+        size_t total = reg_len + 1 + repo_len + 1 + tag_len + 1;
+        char *canon = malloc(total);
+        if (!canon) {
+            free(digest_str);
+            errno = ENOMEM;
+            rc = -1;
+            break;
+        }
+        char *wp = canon;
+        memcpy(wp, child_rel, reg_len);
+        wp += reg_len;
+        *wp++ = '/';
+        memcpy(wp, repo_start, repo_len);
+        wp += repo_len;
+        *wp++ = ':';
+        memcpy(wp, tag_start, tag_len);
+        wp += tag_len;
+        *wp = '\0';
+
+        int ar = migrate_append_descriptor(s, manifests, canon, digest_str);
+        free(canon);
+        free(digest_str);
+        if (ar < 0) {
+            rc = -1;
+            break;
+        }
+        if (ar > 0) {
+            (*skipped)++;
+            continue;
+        }
+        (*migrated)++;
+    }
+    closedir(dp);
+    return rc;
+}
+
+static int migrate_legacy_refs(struct oci_store *s)
+{
+    char refs_path[STORE_PATH_MAX];
+    int n = snprintf(refs_path, sizeof(refs_path), "%s/refs", s->root);
+    if (n < 0 || (size_t) n >= sizeof(refs_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    struct stat st;
+    if (lstat(refs_path, &st) < 0) {
+        if (errno == ENOENT)
+            return 0;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode))
+        return 0;
+
+    char index_path[STORE_PATH_MAX];
+    n = snprintf(index_path, sizeof(index_path), "%s/index.json", s->root);
+    if (n < 0 || (size_t) n >= sizeof(index_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (lstat(index_path, &st) == 0)
+        return 0;
+    if (errno != ENOENT)
+        return -1;
+
+    /* Race window: between the unlocked check and acquire_index_lock a
+     * concurrent put_ref / open may have written index.json. Re-check under
+     * the lock and bail out if so, otherwise two migrations would race and
+     * the later write would partially overwrite a put_ref's descriptor.
+     */
+    const char *lock_err = NULL;
+    int lock_fd = acquire_index_lock(s->root, &lock_err);
+    if (lock_fd < 0)
+        return -1;
+
+    if (lstat(index_path, &st) == 0) {
+        close(lock_fd);
+        return 0;
+    }
+    if (errno != ENOENT) {
+        int saved = errno;
+        close(lock_fd);
+        errno = saved;
+        return -1;
+    }
+
+    cJSON *root_json = new_empty_index();
+    if (!root_json) {
+        close(lock_fd);
+        errno = ENOMEM;
+        return -1;
+    }
+    cJSON *manifests = cJSON_GetObjectItemCaseSensitive(root_json, "manifests");
+
+    size_t migrated = 0, skipped = 0;
+    int rc = scan_refs_dir(s, manifests, refs_path, "", 0, 0,
+                           &migrated, &skipped);
+    if (rc < 0) {
+        int saved = errno;
+        cJSON_Delete(root_json);
+        close(lock_fd);
+        errno = saved;
+        return -1;
+    }
+
+    /* Write even when migrated == 0 so a future open does not re-probe a
+     * refs/ tree that turned out to be empty or all-skipped. An empty
+     * index.json is the documented C2.2 happy-path shape (manifests: []).
+     */
+    const char *write_err = NULL;
+    if (write_index_json(s->root, root_json, &write_err) < 0) {
+        int saved = errno;
+        cJSON_Delete(root_json);
+        close(lock_fd);
+        errno = saved;
+        return -1;
+    }
+    cJSON_Delete(root_json);
+    close(lock_fd);
+
+    if (skipped > 0) {
+        fprintf(stderr,
+                "elfuse oci: migrated %zu pin(s) from refs/ to index.json "
+                "(refs/ kept for downgrade fallback; %zu pin(s) skipped)\n",
+                migrated, skipped);
+    } else {
+        fprintf(stderr,
+                "elfuse oci: migrated %zu pin(s) from refs/ to index.json "
+                "(refs/ kept for downgrade fallback)\n", migrated);
+    }
+    return 0;
 }

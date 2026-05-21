@@ -24,8 +24,14 @@
  * the file in one open + read.
  *
  * Pre-C2.2 stores used a refs/<registry>/<repository>/<tag> flat-file layout
- * instead of index.json. C2.3 will auto-migrate older stores on open; C2.2
- * itself stops writing the legacy refs/ tree and only consults index.json.
+ * instead of index.json. oci_store_open auto-migrates such stores: refs/ is
+ * scanned recursively, every well-formed pin file becomes a manifests[]
+ * descriptor in a freshly written index.json, and refs/ is kept on disk for
+ * one release so a downgrade still finds the legacy data. Pins whose
+ * manifest blob is missing from blobs/ are skipped with a warning rather
+ * than aborting the open. Migration is suppressed when the environment
+ * variable ELFUSE_OCI_NO_MIGRATE is set to any non-empty value, which lets
+ * a downgrade test or recovery workflow inspect the legacy layout.
  *
  * Phase 1 keeps <root> as a plain directory. The sparse case-sensitive APFS
  * volume bootstrap (oci-roadmap Q1) is a Phase 2 concern; the volume mount
@@ -62,7 +68,18 @@ typedef struct {
  * a pre-existing oci-layout file is never rewritten so a third party that
  * bumped the imageLayoutVersion is preserved. The index.json file is not
  * materialized until the first oci_store_put_ref so an empty store stays
- * literally empty on disk. Returns NULL on failure with errno preserved.
+ * literally empty on disk.
+ *
+ * If the root contains a pre-C2.2 refs/ tree but no index.json, this call
+ * also rebuilds index.json from refs/ contents under flock(index.json.lock,
+ * LOCK_EX) so a concurrent put_ref cannot race the migration. refs/ is
+ * preserved on disk for a downgrade fallback. Set ELFUSE_OCI_NO_MIGRATE to
+ * any non-empty value to skip the migration on this open. Migration failure
+ * is propagated through this call (NULL return with errno preserved); per-pin
+ * issues (missing blob, malformed pin file) are logged to stderr and skipped
+ * without failing the open.
+ *
+ * Returns NULL on failure with errno preserved.
  */
 oci_store_t *oci_store_open(const char *root);
 

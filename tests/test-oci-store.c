@@ -21,6 +21,8 @@
  *   - enumeration API returns every pin
  *   - concurrent writers are serialized by flock and both pins survive
  *   - layout marker is fresh / backfilled / preserved
+ *   - legacy refs/ trees auto-migrate to index.json on open, env var
+ *     suppression works, and a coexisting index.json is left alone
  */
 
 #include <errno.h>
@@ -1092,6 +1094,473 @@ static void test_layout_marker_preserved(const char *scratch)
     report_pass("layout_marker_preserve");
 }
 
+/* mkdir -p clone for the legacy-fixture helpers below. The test only feeds
+ * paths it controls so the simple loop suffices; failures surface to the
+ * caller via the int return. */
+static int mkdir_p_test(const char *path)
+{
+    char buf[1024];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(buf))
+        return -1;
+    memcpy(buf, path, len + 1);
+    for (size_t i = 1; i < len; i++) {
+        if (buf[i] != '/')
+            continue;
+        buf[i] = '\0';
+        if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+            return -1;
+        buf[i] = '/';
+    }
+    if (mkdir(buf, 0755) < 0 && errno != EEXIST)
+        return -1;
+    return 0;
+}
+
+/* Synthesize a pre-C2.2 pin: stage a manifest-shaped blob under
+ * blobs/sha256/, then write refs/<reg>/<repo>/<tag> containing "<algo>:<hex>"
+ * the way the legacy oci_store_put_ref did. On success copies the resulting
+ * digest into out_digest so the caller can assert post-migration that the
+ * pin survived round-trip.
+ */
+static bool seed_legacy_pin(const char *root, const char *registry,
+                            const char *repository, const char *tag,
+                            const char *body, size_t body_len,
+                            char *out_digest, size_t cap)
+{
+    oci_blob_store_t *blobs = oci_blob_store_open(root);
+    if (!blobs)
+        return false;
+    if (!stage_manifest_blob(blobs, body, body_len, out_digest, cap)) {
+        oci_blob_store_close(blobs);
+        return false;
+    }
+    oci_blob_store_close(blobs);
+
+    char dir[1024];
+    int n = snprintf(dir, sizeof(dir), "%s/refs/%s/%s", root, registry,
+                     repository);
+    if (n < 0 || (size_t) n >= sizeof(dir))
+        return false;
+    if (mkdir_p_test(dir) < 0)
+        return false;
+
+    char path[1280];
+    n = snprintf(path, sizeof(path), "%s/%s", dir, tag);
+    if (n < 0 || (size_t) n >= sizeof(path))
+        return false;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return false;
+    size_t dlen = strlen(out_digest);
+    const char nl = '\n';
+    if (write(fd, out_digest, dlen) != (ssize_t) dlen ||
+        write(fd, &nl, 1) != 1) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+    return true;
+}
+
+/* Build a tiny but unique-per-call manifest body so each legacy pin in a
+ * fixture has its own sha256.
+ */
+static int unique_manifest_body(char *buf, size_t cap, const char *salt)
+{
+    return snprintf(buf, cap,
+                    "{\"schemaVersion\":2,"
+                    "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+                    "\"config\":{"
+                    "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+                    "\"digest\":\"sha256:"
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\","
+                    "\"size\":3},"
+                    "\"layers\":[],\"legacy\":\"%s\"}", salt);
+}
+
+static void test_legacy_refs_migration(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-legacy-migrate", scratch);
+    if (mkdir_p_test(root) < 0) {
+        report_fail("legacy_refs_migration", "could not create root");
+        return;
+    }
+
+    /* Seed two pins: a simple one under docker.io/library/, and a deep one
+     * under ghcr.io/owner/group/sub/ so the multi-component repository path
+     * is exercised by the migration walker.
+     */
+    char body1[512], body2[512];
+    int n1 = unique_manifest_body(body1, sizeof(body1), "alpine-3.20");
+    int n2 = unique_manifest_body(body2, sizeof(body2), "deep-v1.0");
+    char d1[OCI_DIGEST_HEX_MAX + 16];
+    char d2[OCI_DIGEST_HEX_MAX + 16];
+    if (!seed_legacy_pin(root, "docker.io", "library/alpine", "3.20",
+                         body1, (size_t) n1, d1, sizeof(d1)) ||
+        !seed_legacy_pin(root, "ghcr.io", "owner/group/sub/img", "v1.0",
+                         body2, (size_t) n2, d2, sizeof(d2))) {
+        report_fail("legacy_refs_migration", "fixture seed failed");
+        return;
+    }
+
+    /* Sanity: index.json must not exist yet, otherwise the test isn't
+     * actually exercising the migration path. */
+    char idx_path[1024];
+    snprintf(idx_path, sizeof(idx_path), "%s/index.json", root);
+    struct stat st;
+    if (stat(idx_path, &st) == 0) {
+        report_fail("legacy_refs_migration",
+                    "index.json existed before open; fixture is wrong");
+        return;
+    }
+
+    /* Make sure migration is not suppressed for this test run. */
+    char *saved = NULL;
+    const char *cur = getenv("ELFUSE_OCI_NO_MIGRATE");
+    if (cur)
+        saved = strdup(cur);
+    unsetenv("ELFUSE_OCI_NO_MIGRATE");
+
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("legacy_refs_migration", "open failed");
+        goto restore;
+    }
+
+    /* index.json must now exist with both pins, refs/ must still be present
+     * so a downgrade can read it. */
+    if (stat(idx_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail("legacy_refs_migration",
+                    "index.json not materialized after migration");
+        oci_store_close(s);
+        goto restore;
+    }
+    char refs_root[1024];
+    snprintf(refs_root, sizeof(refs_root), "%s/refs", root);
+    if (stat(refs_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail("legacy_refs_migration", "refs/ removed by migration");
+        oci_store_close(s);
+        goto restore;
+    }
+
+    /* Verify both pins are queryable through the post-migration API. */
+    oci_ref_t r1 = {0}, r2 = {0};
+    if (!parse_ref("alpine:3.20", &r1) ||
+        !parse_ref("ghcr.io/owner/group/sub/img:v1.0", &r2)) {
+        report_fail("legacy_refs_migration", "ref parse failed");
+        oci_ref_free(&r1);
+        oci_ref_free(&r2);
+        oci_store_close(s);
+        goto restore;
+    }
+    char *got1 = NULL, *got2 = NULL;
+    if (oci_store_get_ref(s, &r1, &got1, NULL) < 0 ||
+        oci_store_get_ref(s, &r2, &got2, NULL) < 0) {
+        report_fail("legacy_refs_migration", "post-migration get_ref failed");
+        free(got1);
+        free(got2);
+        oci_ref_free(&r1);
+        oci_ref_free(&r2);
+        oci_store_close(s);
+        goto restore;
+    }
+    if (!got1 || strcmp(got1, d1) != 0 || !got2 || strcmp(got2, d2) != 0) {
+        report_fail("legacy_refs_migration",
+                    "post-migration digest mismatch");
+        free(got1);
+        free(got2);
+        oci_ref_free(&r1);
+        oci_ref_free(&r2);
+        oci_store_close(s);
+        goto restore;
+    }
+    free(got1);
+    free(got2);
+    oci_ref_free(&r1);
+    oci_ref_free(&r2);
+
+    /* The on-disk index.json should describe both pins with the canonical
+     * ref-name annotation: simple pins inherit the docker.io/library/ default
+     * registry / namespace prefix, deep pins carry their full path verbatim.
+     */
+    cJSON *idx = load_index_json(root);
+    if (!idx) {
+        report_fail("legacy_refs_migration", "index.json unparseable");
+        oci_store_close(s);
+        goto restore;
+    }
+    const cJSON *manifests =
+        cJSON_GetObjectItemCaseSensitive(idx, "manifests");
+    if (!cJSON_IsArray(manifests) || cJSON_GetArraySize(manifests) != 2) {
+        report_fail("legacy_refs_migration",
+                    "post-migration manifests array size != 2");
+        cJSON_Delete(idx);
+        oci_store_close(s);
+        goto restore;
+    }
+    bool saw_alpine = false, saw_deep = false;
+    int n = cJSON_GetArraySize(manifests);
+    for (int i = 0; i < n; i++) {
+        const cJSON *entry = cJSON_GetArrayItem(manifests, i);
+        const cJSON *annots =
+            cJSON_GetObjectItemCaseSensitive(entry, "annotations");
+        const cJSON *name =
+            cJSON_IsObject(annots)
+                ? cJSON_GetObjectItemCaseSensitive(
+                      annots, "org.opencontainers.image.ref.name")
+                : NULL;
+        if (!cJSON_IsString(name))
+            continue;
+        if (strcmp(name->valuestring,
+                   "docker.io/library/alpine:3.20") == 0)
+            saw_alpine = true;
+        else if (strcmp(name->valuestring,
+                        "ghcr.io/owner/group/sub/img:v1.0") == 0)
+            saw_deep = true;
+    }
+    cJSON_Delete(idx);
+    if (!saw_alpine || !saw_deep) {
+        report_fail("legacy_refs_migration",
+                    "expected pin annotations missing after migration");
+        oci_store_close(s);
+        goto restore;
+    }
+
+    /* Second open must not re-run migration: with index.json present the
+     * trigger is gated off, so the file's inode and bytes stay the same.
+     */
+    struct stat before;
+    if (stat(idx_path, &before) != 0) {
+        report_fail("legacy_refs_migration", "index.json missing pre-reopen");
+        oci_store_close(s);
+        goto restore;
+    }
+    oci_store_close(s);
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail("legacy_refs_migration", "reopen failed");
+        goto restore;
+    }
+    struct stat after;
+    if (stat(idx_path, &after) != 0 || before.st_ino != after.st_ino) {
+        report_fail("legacy_refs_migration",
+                    "index.json inode changed on reopen (migration re-ran)");
+        oci_store_close(s);
+        goto restore;
+    }
+    oci_store_close(s);
+    report_pass("legacy_refs_migration");
+
+restore:
+    if (saved) {
+        setenv("ELFUSE_OCI_NO_MIGRATE", saved, 1);
+        free(saved);
+    }
+}
+
+static void test_legacy_migration_disabled_via_env(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-legacy-no-migrate", scratch);
+    if (mkdir_p_test(root) < 0) {
+        report_fail("legacy_migration_disabled_via_env",
+                    "could not create root");
+        return;
+    }
+    char body[512];
+    int nb = unique_manifest_body(body, sizeof(body), "no-migrate-tag");
+    char d[OCI_DIGEST_HEX_MAX + 16];
+    if (!seed_legacy_pin(root, "docker.io", "library/alpine", "3.20",
+                         body, (size_t) nb, d, sizeof(d))) {
+        report_fail("legacy_migration_disabled_via_env", "fixture seed failed");
+        return;
+    }
+
+    char *saved = NULL;
+    const char *cur = getenv("ELFUSE_OCI_NO_MIGRATE");
+    if (cur)
+        saved = strdup(cur);
+    setenv("ELFUSE_OCI_NO_MIGRATE", "1", 1);
+
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("legacy_migration_disabled_via_env", "open failed");
+        goto restore;
+    }
+
+    /* index.json must NOT exist: the env var blocked the migration. */
+    char idx_path[1024];
+    snprintf(idx_path, sizeof(idx_path), "%s/index.json", root);
+    struct stat st;
+    if (stat(idx_path, &st) == 0) {
+        report_fail("legacy_migration_disabled_via_env",
+                    "index.json materialized despite ELFUSE_OCI_NO_MIGRATE");
+        oci_store_close(s);
+        goto restore;
+    }
+
+    /* get_ref must return ENOENT: the user explicitly opted out of seeing
+     * the legacy pin until they clear the env var on a later open. */
+    oci_ref_t r = {0};
+    if (!parse_ref("alpine:3.20", &r)) {
+        report_fail("legacy_migration_disabled_via_env", "ref parse failed");
+        oci_store_close(s);
+        goto restore;
+    }
+    char *got = NULL;
+    errno = 0;
+    int rc = oci_store_get_ref(s, &r, &got, NULL);
+    if (rc == 0 || errno != ENOENT || got != NULL) {
+        report_fail("legacy_migration_disabled_via_env",
+                    "get_ref unexpectedly returned a digest");
+        free(got);
+        oci_ref_free(&r);
+        oci_store_close(s);
+        goto restore;
+    }
+    oci_ref_free(&r);
+    oci_store_close(s);
+
+    /* And after clearing the env var on a subsequent open, migration must
+     * actually run so the legacy pin becomes visible. */
+    unsetenv("ELFUSE_OCI_NO_MIGRATE");
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail("legacy_migration_disabled_via_env",
+                    "reopen-with-migration failed");
+        goto restore;
+    }
+    if (stat(idx_path, &st) != 0) {
+        report_fail("legacy_migration_disabled_via_env",
+                    "index.json missing after env-var-cleared reopen");
+        oci_store_close(s);
+        goto restore;
+    }
+    oci_store_close(s);
+    report_pass("legacy_migration_disabled_via_env");
+
+restore:
+    if (saved) {
+        setenv("ELFUSE_OCI_NO_MIGRATE", saved, 1);
+        free(saved);
+    } else {
+        unsetenv("ELFUSE_OCI_NO_MIGRATE");
+    }
+}
+
+static void test_legacy_refs_index_coexist_no_remigrate(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-legacy-coexist", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("legacy_refs_index_coexist_no_remigrate", "open failed");
+        return;
+    }
+    /* Author a real index.json via the modern API: stage a blob and put_ref
+     * an unrelated tag so the on-disk file describes "alpine:writer". */
+    char body_modern[512];
+    int nm = unique_manifest_body(body_modern, sizeof(body_modern), "modern");
+    char d_modern[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_manifest_blob(oci_store_blobs(s), body_modern, (size_t) nm,
+                             d_modern, sizeof(d_modern))) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "modern stage failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_t modern_ref = {0};
+    if (!parse_ref("alpine:writer", &modern_ref) ||
+        oci_store_put_ref(s, &modern_ref, d_modern, NULL) < 0) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "modern put_ref failed");
+        oci_ref_free(&modern_ref);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&modern_ref);
+    oci_store_close(s);
+
+    /* Now seed a legacy refs/ pin for a DIFFERENT canonical name so the
+     * coexistence is unambiguous. If migration were to (incorrectly) run,
+     * it would add this pin to index.json and the manifests count would go
+     * from 1 to 2; the test asserts the count stays at 1.
+     */
+    char body_legacy[512];
+    int nl = unique_manifest_body(body_legacy, sizeof(body_legacy), "legacy");
+    char d_legacy[OCI_DIGEST_HEX_MAX + 16];
+    if (!seed_legacy_pin(root, "docker.io", "library/alpine", "legacy-tag",
+                         body_legacy, (size_t) nl, d_legacy,
+                         sizeof(d_legacy))) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "legacy fixture seed failed");
+        return;
+    }
+
+    /* Snapshot index.json's inode + bytes so a silent re-migration shows up
+     * as either an inode change or a content drift. */
+    char idx_path[1024];
+    snprintf(idx_path, sizeof(idx_path), "%s/index.json", root);
+    struct stat before;
+    char before_buf[8192];
+    size_t before_len = 0;
+    if (stat(idx_path, &before) != 0 ||
+        !read_whole(idx_path, before_buf, sizeof(before_buf), &before_len)) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "pre-reopen snapshot failed");
+        return;
+    }
+
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "reopen failed");
+        return;
+    }
+    struct stat after;
+    char after_buf[8192];
+    size_t after_len = 0;
+    if (stat(idx_path, &after) != 0 ||
+        !read_whole(idx_path, after_buf, sizeof(after_buf), &after_len)) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "post-reopen snapshot failed");
+        oci_store_close(s);
+        return;
+    }
+    if (before.st_ino != after.st_ino || before_len != after_len ||
+        memcmp(before_buf, after_buf, before_len) != 0) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "index.json changed on reopen with refs/ present");
+        oci_store_close(s);
+        return;
+    }
+    /* And the legacy pin must remain invisible to get_ref: the modern
+     * index.json is authoritative; refs/ is downgrade-only data. */
+    oci_ref_t legacy_ref = {0};
+    if (!parse_ref("alpine:legacy-tag", &legacy_ref)) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "ref parse failed");
+        oci_store_close(s);
+        return;
+    }
+    char *got = NULL;
+    errno = 0;
+    int rc = oci_store_get_ref(s, &legacy_ref, &got, NULL);
+    if (rc == 0 || errno != ENOENT) {
+        report_fail("legacy_refs_index_coexist_no_remigrate",
+                    "legacy pin became visible after coexistence open");
+        free(got);
+        oci_ref_free(&legacy_ref);
+        oci_store_close(s);
+        return;
+    }
+    oci_ref_free(&legacy_ref);
+    oci_store_close(s);
+    report_pass("legacy_refs_index_coexist_no_remigrate");
+}
+
 static void test_default_root_from_env(void)
 {
     /* Save and clear environment so the default-root computation is fully
@@ -1179,6 +1648,9 @@ int main(void)
     test_layout_marker_fresh(scratch);
     test_layout_marker_added_on_existing(scratch);
     test_layout_marker_preserved(scratch);
+    test_legacy_refs_migration(scratch);
+    test_legacy_migration_disabled_via_env(scratch);
+    test_legacy_refs_index_coexist_no_remigrate(scratch);
     test_default_root_from_env();
 
     wipe_dir(scratch);
