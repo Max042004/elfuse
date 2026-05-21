@@ -49,6 +49,14 @@ typedef struct {
  * stats and meta may be NULL; passing both lets the caller drive a
  * dry-run for fixture validation.
  *
+ * Whiteout entries (.wh.<name>) and opaque markers (.wh..wh..opq) are
+ * processed against root_dir: .wh.<name> rm-rfs the named upper-layer
+ * entry, and .wh..wh..opq clears the marker's directory of lower-layer
+ * contents. This is the canonical overlay-merge behaviour used by the
+ * top-level oci_unpack assembly path. For populating a Plan 3 C3.3 raw
+ * per-layer cache where whiteout markers must remain on disk as files,
+ * use oci_layer_apply_raw_tar instead.
+ *
  * Returns 0 on success, -1 on error with *err set and errno carrying
  * one of:
  *   ENOTSUP        - tar entry type rejected (block/char/fifo/socket)
@@ -64,6 +72,35 @@ int oci_layer_apply(oci_tar_reader_t *r,
                     oci_layer_apply_stats_t *stats,
                     oci_meta_table_t *meta,
                     const char **err);
+
+/* Plan 3 C3.3: raw per-layer extract for the cross-image dedup cache.
+ *
+ * Identical to oci_layer_apply except .wh.<name> and .wh..wh..opq tar
+ * entries are NOT interpreted as delete / clear directives: they fall
+ * through to the regular-file dispatch and land on disk as 0-byte
+ * regular files at their tar path. The on-disk shape of root_dir then
+ * preserves the layer's whiteout intent for the later assembly pass
+ * (the assembler walks the raw directory, applies whiteouts against
+ * the running work_dir, then copies non-whiteout entries on top).
+ *
+ * Consequences vs overlay mode:
+ *   - stats->whiteouts and stats->opaques stay at zero; the markers
+ *     are counted in stats->files because they exist on disk as
+ *     regular zero-length files
+ *   - the per-layer oci_meta_table_t records the markers like any
+ *     other regular file (uid/gid/mode tuples from the tar header)
+ *   - root_dir is treated as a fresh extraction target: there is no
+ *     pre-existing upper-layer state to delete or clear, so the
+ *     whiteout branches would have been no-ops even if executed
+ *
+ * Returns 0 on success, -1 on error with the same errno surface as
+ * oci_layer_apply (the dispatch and path validation logic is shared).
+ */
+int oci_layer_apply_raw_tar(oci_tar_reader_t *r,
+                            const char *root_dir,
+                            oci_layer_apply_stats_t *stats,
+                            oci_meta_table_t *meta,
+                            const char **err);
 
 /* Compose root_dir + '/' + guest_path into out. Rejects:
  *   - leading '/' in guest_path (absolute is not allowed for tar entries)

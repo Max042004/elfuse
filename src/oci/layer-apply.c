@@ -484,11 +484,24 @@ static int apply_opaque_whiteout(const oci_tar_entry_t *e,
     return 0;
 }
 
-int oci_layer_apply(oci_tar_reader_t *r,
-                    const char *root_dir,
-                    oci_layer_apply_stats_t *stats,
-                    oci_meta_table_t *meta,
-                    const char **err)
+/* Whiteout-handling discipline shared by oci_layer_apply (overlay) and
+ * oci_layer_apply_raw_tar (Plan 3 C3.3 raw per-layer cache populate).
+ * Overlay mode interprets .wh.<name> and .wh..wh..opq tar entries as
+ * delete / clear directives against root_dir; raw mode leaves them as
+ * regular 0-byte files at their tar path so the assembler can replay
+ * the whiteout intent against the running work_dir later.
+ */
+typedef enum {
+    APPLY_MODE_OVERLAY,
+    APPLY_MODE_RAW_TAR,
+} apply_mode_t;
+
+static int layer_apply_impl(oci_tar_reader_t *r,
+                            const char *root_dir,
+                            apply_mode_t mode,
+                            oci_layer_apply_stats_t *stats,
+                            oci_meta_table_t *meta,
+                            const char **err)
 {
     static const char *dummy_err;
     if (!err)
@@ -514,20 +527,28 @@ int oci_layer_apply(oci_tar_reader_t *r,
         while (gp[0] == '/')
             gp++;
 
-        if (e.is_opaque_whiteout) {
-            oci_tar_entry_t e2 = e;
-            e2.path = (char *) gp;
-            if (apply_opaque_whiteout(&e2, root_dir, meta, stats, err) < 0)
-                return -1;
-            continue;
+        if (mode == APPLY_MODE_OVERLAY) {
+            if (e.is_opaque_whiteout) {
+                oci_tar_entry_t e2 = e;
+                e2.path = (char *) gp;
+                if (apply_opaque_whiteout(&e2, root_dir, meta, stats, err) < 0)
+                    return -1;
+                continue;
+            }
+            if (e.is_whiteout) {
+                oci_tar_entry_t e2 = e;
+                e2.path = (char *) gp;
+                if (apply_whiteout(&e2, root_dir, meta, stats, err) < 0)
+                    return -1;
+                continue;
+            }
         }
-        if (e.is_whiteout) {
-            oci_tar_entry_t e2 = e;
-            e2.path = (char *) gp;
-            if (apply_whiteout(&e2, root_dir, meta, stats, err) < 0)
-                return -1;
-            continue;
-        }
+        /* Raw-tar mode falls through: .wh.<name> and .wh..wh..opq are
+         * typeflag '0' regular tar entries with zero payload, and the
+         * regular-file dispatch below writes them on disk as 0-byte
+         * files at their tar path. The assembler consumes the markers
+         * later.
+         */
 
         if (e.type == OCI_TAR_UNSUPPORTED)
             return set_err(err, "layer apply: unsupported entry type", ENOTSUP);
@@ -564,4 +585,22 @@ int oci_layer_apply(oci_tar_reader_t *r,
         if (meta && e.type != OCI_TAR_HARDLINK)
             (void) oci_meta_record(meta, gp, e.uid, e.gid, e.mode);
     }
+}
+
+int oci_layer_apply(oci_tar_reader_t *r,
+                    const char *root_dir,
+                    oci_layer_apply_stats_t *stats,
+                    oci_meta_table_t *meta,
+                    const char **err)
+{
+    return layer_apply_impl(r, root_dir, APPLY_MODE_OVERLAY, stats, meta, err);
+}
+
+int oci_layer_apply_raw_tar(oci_tar_reader_t *r,
+                            const char *root_dir,
+                            oci_layer_apply_stats_t *stats,
+                            oci_meta_table_t *meta,
+                            const char **err)
+{
+    return layer_apply_impl(r, root_dir, APPLY_MODE_RAW_TAR, stats, meta, err);
 }

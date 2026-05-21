@@ -435,6 +435,220 @@ out:
     free(root);
 }
 
+/* Plan 3 C3.3: raw-tar mode preserves .wh.<name> markers on disk
+ * instead of executing the upper-layer deletion. The marker lands as a
+ * 0-byte regular file at its tar path; stats->whiteouts stays at zero
+ * because the entry is counted as a regular file (which is what it is
+ * on disk).
+ */
+static void test_raw_tar_preserves_whiteout_marker(void)
+{
+    char *root = make_root();
+    if (!root) {
+        report_fail("raw-tar whiteout", "mkdtemp");
+        return;
+    }
+    bb_t b;
+    bb_init(&b);
+    /* The fixture matches the overlay whiteout test so the contrast is
+     * direct: raw-tar mode keeps both files, overlay mode would delete
+     * the second after writing the first.
+     */
+    append_entry(&b, "removed", 5, 0644, '0', NULL, "data\n");
+    append_entry(&b, ".wh.removed", 0, 0644, '0', NULL, NULL);
+    bb_zero(&b, BLOCK * 2);
+
+    src_t s = {.buf = b.buf, .len = b.len};
+    oci_tar_reader_t *r = oci_tar_reader_new(src_read, &s);
+    oci_layer_apply_stats_t st = {0};
+    oci_meta_table_t *meta = oci_meta_table_new();
+    const char *err = NULL;
+    int rc = oci_layer_apply_raw_tar(r, root, &st, meta, &err);
+    if (rc != 0) {
+        report_fail("raw-tar whiteout", "rc=%d err=%s", rc,
+                    err ? err : "(nil)");
+        goto out;
+    }
+    char path[512];
+    /* The whiteout marker must exist as a regular zero-length file. */
+    snprintf(path, sizeof(path), "%s/.wh.removed", root);
+    struct stat sb;
+    if (lstat(path, &sb) < 0) {
+        report_fail("raw-tar whiteout", ".wh.removed missing errno=%d", errno);
+        goto out;
+    }
+    if (!S_ISREG(sb.st_mode) || sb.st_size != 0) {
+        report_fail("raw-tar whiteout", ".wh.removed not 0-byte regular");
+        goto out;
+    }
+    /* The target file the marker would have deleted in overlay mode
+     * stays untouched because the marker did not execute.
+     */
+    snprintf(path, sizeof(path), "%s/removed", root);
+    if (!file_has_contents(path, "data\n")) {
+        report_fail("raw-tar whiteout", "removed missing or wrong contents");
+        goto out;
+    }
+    if (st.whiteouts != 0 || st.files != 2) {
+        report_fail("raw-tar whiteout",
+                    "stats f=%zu w=%zu (want f=2 w=0)", st.files,
+                    st.whiteouts);
+        goto out;
+    }
+    /* The marker must also appear in the per-layer meta sidecar so the
+     * assembler can carry uid/gid/mode through to work_dir. */
+    if (oci_meta_lookup(meta, ".wh.removed", NULL, NULL, NULL) < 0) {
+        report_fail("raw-tar whiteout", "meta entry for .wh.removed missing");
+        goto out;
+    }
+    report_pass("raw-tar mode preserves whiteout marker as 0-byte file");
+out:
+    oci_tar_reader_free(r);
+    oci_meta_table_free(meta);
+    bb_free(&b);
+    rm_rf(root);
+    free(root);
+}
+
+/* Plan 3 C3.3: raw-tar mode preserves .wh..wh..opq markers on disk
+ * instead of clearing the marker's directory. Sibling entries in the
+ * same directory survive because the opaque branch is bypassed.
+ */
+static void test_raw_tar_preserves_opaque_marker(void)
+{
+    char *root = make_root();
+    if (!root) {
+        report_fail("raw-tar opaque", "mkdtemp");
+        return;
+    }
+    bb_t b;
+    bb_init(&b);
+    append_entry(&b, "dir", 0, 0755, '5', NULL, NULL);
+    append_entry(&b, "dir/old", 4, 0644, '0', NULL, "old\n");
+    append_entry(&b, "dir/.wh..wh..opq", 0, 0644, '0', NULL, NULL);
+    append_entry(&b, "dir/kept", 5, 0644, '0', NULL, "new!\n");
+    bb_zero(&b, BLOCK * 2);
+
+    src_t s = {.buf = b.buf, .len = b.len};
+    oci_tar_reader_t *r = oci_tar_reader_new(src_read, &s);
+    oci_layer_apply_stats_t st = {0};
+    oci_meta_table_t *meta = oci_meta_table_new();
+    const char *err = NULL;
+    int rc = oci_layer_apply_raw_tar(r, root, &st, meta, &err);
+    if (rc != 0) {
+        report_fail("raw-tar opaque", "rc=%d err=%s", rc, err ? err : "(nil)");
+        goto out;
+    }
+    char path[512];
+    /* dir/.wh..wh..opq must exist as a regular zero-length file. */
+    snprintf(path, sizeof(path), "%s/dir/.wh..wh..opq", root);
+    struct stat sb;
+    if (lstat(path, &sb) < 0 || !S_ISREG(sb.st_mode) || sb.st_size != 0) {
+        report_fail("raw-tar opaque", "opaque marker missing or wrong shape");
+        goto out;
+    }
+    /* dir/old must NOT have been cleared by the opaque branch. */
+    snprintf(path, sizeof(path), "%s/dir/old", root);
+    if (!file_has_contents(path, "old\n")) {
+        report_fail("raw-tar opaque", "dir/old cleared by opaque branch");
+        goto out;
+    }
+    snprintf(path, sizeof(path), "%s/dir/kept", root);
+    if (!file_has_contents(path, "new!\n")) {
+        report_fail("raw-tar opaque", "dir/kept missing");
+        goto out;
+    }
+    if (st.opaques != 0 || st.dirs != 1 || st.files != 3) {
+        report_fail("raw-tar opaque",
+                    "stats d=%zu f=%zu o=%zu (want d=1 f=3 o=0)", st.dirs,
+                    st.files, st.opaques);
+        goto out;
+    }
+    report_pass("raw-tar mode preserves opaque marker and siblings");
+out:
+    oci_tar_reader_free(r);
+    oci_meta_table_free(meta);
+    bb_free(&b);
+    rm_rf(root);
+    free(root);
+}
+
+/* Plan 3 C3.3: a tar without any whiteout markers goes through raw-tar
+ * mode identically to overlay mode. This is the cache-populate happy
+ * path: most layers carry only content, and raw-tar's dispatch must
+ * not regress them.
+ */
+static void test_raw_tar_regular_entries_match_overlay(void)
+{
+    char *root = make_root();
+    if (!root) {
+        report_fail("raw-tar regulars", "mkdtemp");
+        return;
+    }
+    bb_t b;
+    bb_init(&b);
+    append_entry(&b, "etc", 0, 0755, '5', NULL, NULL);
+    append_entry(&b, "etc/hostname", 14, 0644, '0', NULL, "hello, world!\n");
+    append_entry(&b, "lib", 0, 0755, '5', NULL, NULL);
+    append_entry(&b, "lib/foo", 0, 0777, '2', "./bar", NULL);
+    append_entry(&b, "etc/hostname2", 0, 0644, '1', "etc/hostname", NULL);
+    bb_zero(&b, BLOCK * 2);
+
+    src_t s = {.buf = b.buf, .len = b.len};
+    oci_tar_reader_t *r = oci_tar_reader_new(src_read, &s);
+    oci_layer_apply_stats_t st = {0};
+    oci_meta_table_t *meta = oci_meta_table_new();
+    const char *err = NULL;
+    int rc = oci_layer_apply_raw_tar(r, root, &st, meta, &err);
+    if (rc != 0) {
+        report_fail("raw-tar regulars", "rc=%d err=%s", rc,
+                    err ? err : "(nil)");
+        goto out;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/etc/hostname", root);
+    if (!file_has_contents(path, "hello, world!\n")) {
+        report_fail("raw-tar regulars", "etc/hostname wrong");
+        goto out;
+    }
+    snprintf(path, sizeof(path), "%s/lib/foo", root);
+    char tgt[64];
+    ssize_t n = readlink(path, tgt, sizeof(tgt) - 1);
+    if (n < 0) {
+        report_fail("raw-tar regulars", "lib/foo readlink errno=%d", errno);
+        goto out;
+    }
+    tgt[n] = '\0';
+    if (strcmp(tgt, "./bar") != 0) {
+        report_fail("raw-tar regulars", "lib/foo target=%s", tgt);
+        goto out;
+    }
+    struct stat a, h;
+    snprintf(path, sizeof(path), "%s/etc/hostname", root);
+    if (lstat(path, &a) < 0)
+        goto out;
+    snprintf(path, sizeof(path), "%s/etc/hostname2", root);
+    if (lstat(path, &h) < 0)
+        goto out;
+    if (a.st_ino != h.st_ino) {
+        report_fail("raw-tar regulars", "hardlink inode mismatch");
+        goto out;
+    }
+    if (st.files != 1 || st.dirs != 2 || st.symlinks != 1 ||
+        st.hardlinks != 1) {
+        report_fail("raw-tar regulars", "stats f=%zu d=%zu s=%zu h=%zu",
+                    st.files, st.dirs, st.symlinks, st.hardlinks);
+        goto out;
+    }
+    report_pass("raw-tar mode passes regular entries through unchanged");
+out:
+    oci_tar_reader_free(r);
+    oci_meta_table_free(meta);
+    bb_free(&b);
+    rm_rf(root);
+    free(root);
+}
+
 static void test_unsupported_type_rejected(void)
 {
     char *root = make_root();
@@ -512,6 +726,9 @@ int main(void)
     test_hardlink_missing_target();
     test_whiteout_removes_upper_entry();
     test_opaque_whiteout_clears_directory();
+    test_raw_tar_preserves_whiteout_marker();
+    test_raw_tar_preserves_opaque_marker();
+    test_raw_tar_regular_entries_match_overlay();
     test_unsupported_type_rejected();
     test_path_join_traversal();
     test_path_join_absolute();
