@@ -82,3 +82,14 @@ int oci_meta_write(const oci_meta_table_t *t,
 int oci_meta_read(const char *root_dir,
                   oci_meta_table_t **out,
                   const char **err);
+
+/* Copy every entry from src into dst via oci_meta_record. Existing dst
+ * entries with the same guest path are overwritten (record's idempotent
+ * upsert semantics). Used by the Plan 3 C3.2 unpack layer cache hit path
+ * so a clonefile-restored layer's persisted sidecar repopulates the in-
+ * memory meta table that subsequent layer applies extend. Returns 0 on
+ * success or -1 with errno set (EINVAL on NULL inputs, ENOMEM on record
+ * allocation failure). Partial merges may leave dst with a subset of src
+ * already applied; the caller treats this as a fatal error.
+ */
+int oci_meta_merge(oci_meta_table_t *dst, const oci_meta_table_t *src);

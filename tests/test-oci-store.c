@@ -3334,6 +3334,206 @@ static void test_prune_invalid_args_rejected(const char *scratch)
     report_pass("prune_invalid_args_rejected");
 }
 
+/* --- Plan 3 C3.2: layer cache directory layout + helpers ----------------- */
+
+static void test_open_creates_layer_dirs(const char *scratch)
+{
+    const char *name = "open_creates_layer_dirs";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-init", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    struct stat st;
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/layers", root);
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "layers/ missing");
+        oci_store_close(s);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/layers/sha256", root);
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "layers/sha256/ missing");
+        oci_store_close(s);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/layers/.staging", root);
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "layers/.staging/ missing");
+        oci_store_close(s);
+        return;
+    }
+    /* Reopen idempotently: mkdir EEXIST must not surface as an error. */
+    oci_store_close(s);
+    s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "reopen failed (EEXIST not handled)");
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_layer_resolve_format(const char *scratch)
+{
+    const char *name = "layer_resolve_format";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-resolve", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    char out[1024];
+    if (oci_store_layer_resolve(
+            s,
+            "sha256:"
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            out, sizeof(out)) < 0) {
+        report_fail(name, "resolve returned -1");
+        oci_store_close(s);
+        return;
+    }
+    char want[1280];
+    snprintf(want, sizeof(want),
+             "%s/layers/sha256/"
+             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/",
+             root);
+    if (strcmp(out, want) != 0) {
+        report_fail(name, "resolved path mismatch");
+        oci_store_close(s);
+        return;
+    }
+    /* Malformed diff_id must be rejected with EINVAL. */
+    errno = 0;
+    if (oci_store_layer_resolve(s, "not-a-digest", out, sizeof(out)) != -1 ||
+        errno != EINVAL) {
+        report_fail(name, "malformed diff_id not rejected");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_layer_has_present_absent(const char *scratch)
+{
+    const char *name = "layer_has_present_absent";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-has", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    const char *diff_id =
+        "sha256:"
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    int rc = oci_store_layer_has(s, diff_id);
+    if (rc != 0) {
+        report_fail(name, "absent layer reported as present");
+        oci_store_close(s);
+        return;
+    }
+    /* Materialize the cache directory and re-probe. */
+    char dir[1280];
+    snprintf(dir, sizeof(dir), "%s/layers/sha256/%s", root, diff_id + 7);
+    if (mkdir(dir, 0755) < 0) {
+        report_fail(name, "mkdir cache_dir failed");
+        oci_store_close(s);
+        return;
+    }
+    rc = oci_store_layer_has(s, diff_id);
+    if (rc != 1) {
+        report_fail(name, "present layer reported as absent");
+        oci_store_close(s);
+        return;
+    }
+    /* Malformed diff_id is rejected without touching disk. */
+    errno = 0;
+    if (oci_store_layer_has(s, "sha256:not-hex") != -1 || errno != EINVAL) {
+        report_fail(name, "malformed diff_id not rejected");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_layer_commit_rename_race_benign(const char *scratch)
+{
+    const char *name = "layer_commit_rename_race_benign";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-layer-commit", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    const char *diff_id =
+        "sha256:"
+        "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /* Pre-seed the destination so the rename below races with a "winner". */
+    char dest[1280];
+    snprintf(dest, sizeof(dest), "%s/layers/sha256/%s", root, diff_id + 7);
+    if (mkdir(dest, 0755) < 0) {
+        report_fail(name, "mkdir dest failed");
+        oci_store_close(s);
+        return;
+    }
+
+    /* Stage a directory with a marker file so the loser-cleanup path has
+     * something to recursively remove.
+     */
+    char stage[1280];
+    if (oci_store_layer_stage_path(s, diff_id, stage, sizeof(stage)) < 0) {
+        report_fail(name, "stage_path failed");
+        oci_store_close(s);
+        return;
+    }
+    if (mkdir(stage, 0755) < 0) {
+        report_fail(name, "stage mkdir failed");
+        oci_store_close(s);
+        return;
+    }
+    char marker[1408];
+    snprintf(marker, sizeof(marker), "%s/marker", stage);
+    int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "stage marker open failed");
+        oci_store_close(s);
+        return;
+    }
+    close(fd);
+
+    const char *err = NULL;
+    int rc = oci_store_layer_commit(s, stage, diff_id, &err);
+    if (rc != 0) {
+        report_fail(name, err ? err : "commit returned -1 on race");
+        oci_store_close(s);
+        return;
+    }
+    /* Staging dir must be gone after the loser-cleanup branch. */
+    struct stat st;
+    if (stat(stage, &st) == 0) {
+        report_fail(name, "stage dir not cleaned up after race loss");
+        oci_store_close(s);
+        return;
+    }
+    /* Pre-existing dest must remain untouched. */
+    if (stat(dest, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "winner cache dir removed by commit");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
 int main(void)
 {
     printf("OCI store unit tests\n");
@@ -3382,6 +3582,10 @@ int main(void)
     test_prune_keep_bytes_zero_is_unlimited(scratch);
     test_prune_combined_older_then_budget(scratch);
     test_prune_dry_run_with_filters_no_disk_touch(scratch);
+    test_open_creates_layer_dirs(scratch);
+    test_layer_resolve_format(scratch);
+    test_layer_has_present_absent(scratch);
+    test_layer_commit_rename_race_benign(scratch);
 
     wipe_dir(scratch);
     free(scratch);

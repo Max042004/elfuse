@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -131,6 +132,33 @@ static unsigned long layout_seq(void)
     return __sync_add_and_fetch(&n, 1);
 }
 
+/* Ensure <root>/layers/sha256/ and <root>/layers/.staging/ exist on open. The
+ * Plan 3 C3.2 per-layer snapshot cache depends on both directories: the first
+ * holds committed cache entries and the second is the in-flight staging area
+ * for clonefile(2) snapshots. The blob store already created <root> itself
+ * (oci_blob_store_open mkdirs the root tree), so this helper only adds the
+ * layers/ subtree. mkdir EEXIST is benign so reopens are idempotent.
+ */
+static int ensure_layer_dirs(const char *root)
+{
+    static const char *const subdirs[] = {
+        "layers",
+        "layers/sha256",
+        "layers/.staging",
+    };
+    for (size_t i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
+        char path[STORE_PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", root, subdirs[i]);
+        if (n < 0 || (size_t) n >= sizeof(path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (mkdir(path, 0755) < 0 && errno != EEXIST)
+            return -1;
+    }
+    return 0;
+}
+
 static int ensure_oci_layout_marker(const char *root)
 {
     char path[STORE_PATH_MAX];
@@ -205,6 +233,12 @@ oci_store_t *oci_store_open(const char *root)
         return NULL;
 
     if (ensure_oci_layout_marker(root) < 0) {
+        int saved = errno;
+        oci_blob_store_close(blobs);
+        errno = saved;
+        return NULL;
+    }
+    if (ensure_layer_dirs(root) < 0) {
         int saved = errno;
         oci_blob_store_close(blobs);
         errno = saved;
@@ -2027,4 +2061,220 @@ done:;
     close(lock_fd);
     errno = saved;
     return rc;
+}
+
+/* --- Plan 3 C3.2: layer cache helpers ---------------------------------- */
+
+/* Parse a "<algo>:<hex>" diff_id into its components and the lowercase
+ * algorithm name used as the cache subdir. Validation matches the digest
+ * library; oci_digest_parse already rejects unknown algos and bad hex.
+ */
+static int parse_diff_id_for_cache(const char *diff_id,
+                                   oci_digest_algo_t *out_algo,
+                                   char *out_hex,
+                                   const char **out_algo_name)
+{
+    if (!diff_id || !*diff_id) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(diff_id, &algo, hex)) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *name = oci_digest_algo_name(algo);
+    if (!name) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_algo = algo;
+    memcpy(out_hex, hex, strlen(hex) + 1);
+    *out_algo_name = name;
+    return 0;
+}
+
+int oci_store_layer_has(oci_store_t *s, const char *diff_id)
+{
+    if (!s) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0)
+        return -1;
+
+    char path[STORE_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/layers/%s/%s", s->root, algo_name,
+                     hex);
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    struct stat st;
+    if (stat(path, &st) < 0) {
+        if (errno == ENOENT)
+            return 0;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 1;
+}
+
+int oci_store_layer_resolve(oci_store_t *s,
+                            const char *diff_id,
+                            char *out, size_t cap)
+{
+    if (!s || !out || cap == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/layers/%s/%s/", s->root, algo_name, hex);
+    if (n < 0 || (size_t) n >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+/* Produce 12 lowercase hex chars from 6 random bytes. Mirrors the local
+ * rand_hex helpers in src/oci/unpack.c and src/oci/clone-rootfs.c; kept
+ * static here so store.c stays self-contained.
+ */
+static int layer_stage_rand_suffix(char out[13])
+{
+    uint8_t raw[6];
+    if (getentropy(raw, sizeof(raw)) < 0)
+        return -1;
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        out[i * 2] = hex[raw[i] >> 4];
+        out[i * 2 + 1] = hex[raw[i] & 0xf];
+    }
+    out[12] = '\0';
+    return 0;
+}
+
+int oci_store_layer_stage_path(oci_store_t *s,
+                               const char *diff_id,
+                               char *out, size_t cap)
+{
+    if (!s || !out || cap == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0)
+        return -1;
+    char rand_suffix[13];
+    if (layer_stage_rand_suffix(rand_suffix) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/layers/.staging/%s-%s-%s", s->root, algo_name,
+                     hex, rand_suffix);
+    if (n < 0 || (size_t) n >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+/* Recursively rm a path (file, symlink, or directory). Mirrors the discipline
+ * in src/oci/clone-rootfs.c so the layer stage abort path does not shell out.
+ * Returns 0 on success or when path was already absent; -1 with errno set on
+ * any unexpected IO error. Designed for staging cleanup, not as a general-
+ * purpose rm.
+ */
+static int layer_stage_rm(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0) {
+        if (errno == ENOENT)
+            return 0;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode))
+        return unlink(path);
+    DIR *d = opendir(path);
+    if (!d)
+        return -1;
+    struct dirent *de;
+    int rc = 0;
+    while ((de = readdir(d))) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        char child[STORE_PATH_MAX];
+        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (n < 0 || (size_t) n >= sizeof(child)) {
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+        if (layer_stage_rm(child) < 0) {
+            rc = -1;
+            break;
+        }
+    }
+    closedir(d);
+    if (rc == 0 && rmdir(path) < 0)
+        rc = -1;
+    return rc;
+}
+
+int oci_store_layer_commit(oci_store_t *s,
+                           const char *stage_path,
+                           const char *diff_id,
+                           const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!s || !stage_path || !*stage_path) {
+        *err = "layer_commit: NULL argument";
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0) {
+        *err = "layer_commit: invalid diff_id";
+        return -1;
+    }
+    char dest[STORE_PATH_MAX];
+    int n = snprintf(dest, sizeof(dest), "%s/layers/%s/%s", s->root, algo_name,
+                     hex);
+    if (n < 0 || (size_t) n >= sizeof(dest)) {
+        *err = "layer_commit: dest path exceeds STORE_PATH_MAX";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (rename(stage_path, dest) == 0)
+        return 0;
+    int saved = errno;
+    if (saved == EEXIST || saved == ENOTEMPTY) {
+        /* Concurrent writer landed the same entry first; drop the loser's
+         * staging tree and treat this as a benign success. The cache content
+         * is content-addressed so the winning entry is byte-equivalent.
+         */
+        (void) layer_stage_rm(stage_path);
+        errno = 0;
+        return 0;
+    }
+    *err = "layer_commit: rename to layers/<algo>/<hex>/ failed";
+    errno = saved;
+    return -1;
 }

@@ -396,3 +396,17 @@ int oci_meta_read(const char *root_dir,
     *out = table;
     return 0;
 }
+
+int oci_meta_merge(oci_meta_table_t *dst, const oci_meta_table_t *src)
+{
+    if (!dst || !src) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; i < src->len; i++) {
+        const oci_meta_entry_t *e = &src->entries[i];
+        if (oci_meta_record(dst, e->path, e->uid, e->gid, e->mode) < 0)
+            return -1;
+    }
+    return 0;
+}

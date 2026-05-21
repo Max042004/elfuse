@@ -336,7 +336,8 @@ static void test_unpack_layer_single_file_tar(void)
     oci_layer_apply_stats_t stats = {0};
     oci_meta_table_t *meta = oci_meta_table_new();
     const char *err = NULL;
-    int rc = oci_unpack_layer(bs, &desc, stage_dir, &stats, meta, NULL, &err);
+    int rc = oci_unpack_layer(bs, &desc, stage_dir, NULL, &stats, meta, NULL,
+                              &err);
     if (rc != 0) {
         report_fail("unpack_layer single-file tar",
                     err ? err : "rc != 0 with no err");
@@ -425,7 +426,8 @@ static void test_unpack_layer_digest_mismatch_rejected(void)
     oci_meta_table_t *meta = oci_meta_table_new();
     const char *err = NULL;
     errno = 0;
-    int rc = oci_unpack_layer(bs, &desc, stage_dir, NULL, meta, NULL, &err);
+    int rc = oci_unpack_layer(bs, &desc, stage_dir, NULL, NULL, meta, NULL,
+                              &err);
     if (rc != -1 || errno != EINVAL)
         report_fail("unpack_layer digest mismatch",
                     "expected -1/EINVAL after corrupting blob");
@@ -467,7 +469,8 @@ static void test_unpack_layer_null_stats_meta_log(void)
         goto close_bs;
 
     const char *err = NULL;
-    int rc = oci_unpack_layer(bs, &desc, stage_dir, NULL, NULL, NULL, &err);
+    int rc = oci_unpack_layer(bs, &desc, stage_dir, NULL, NULL, NULL, NULL,
+                              &err);
     if (rc != 0) {
         report_fail("unpack_layer null args", err ? err : "rc != 0");
         goto free_body;
@@ -482,6 +485,279 @@ free_body:
     bb_free(&body);
 close_bs:
     oci_blob_store_close(bs);
+cleanup:
+    rm_rf(stage_dir);
+    rm_rf(store_root);
+}
+
+/* --- Plan 3 C3.2: per-layer snapshot cache ------------------------------ */
+
+/* Confirm the cache miss path persists stage_dir contents and the meta
+ * sidecar into <store>/layers/sha256/<hex>/. The test exercises the
+ * snapshot half of the round-trip; cache hit is covered separately.
+ */
+static void test_unpack_layer_cache_miss_populates(void)
+{
+    const char *name = "unpack_layer cache miss populates layers/<algo>/<hex>";
+    char store_root[] = "/tmp/elfuse-unpack-cache-miss-XXXXXX";
+    char stage_dir[] = "/tmp/elfuse-unpack-stage-XXXXXX";
+    if (!mkdtemp(store_root)) {
+        report_fail(name, "mkdtemp store");
+        return;
+    }
+    if (!mkdtemp(stage_dir)) {
+        report_fail(name, "mkdtemp stage");
+        rmdir(store_root);
+        return;
+    }
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        report_fail(name, "store_open");
+        goto cleanup;
+    }
+    oci_blob_store_t *bs = oci_store_blobs(store);
+
+    bb_t body = {0};
+    oci_descriptor_t desc = {0};
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (build_single_file_blob(name, bs, &body, &desc, hex) < 0)
+        goto close_store;
+
+    oci_meta_table_t *meta = oci_meta_table_new();
+    oci_unpack_layer_options_t lopts = {.cache_store = store,
+                                        .diff_id = desc.digest_str};
+    const char *err = NULL;
+    int rc = oci_unpack_layer(bs, &desc, stage_dir, &lopts, NULL, meta, NULL,
+                              &err);
+    if (rc != 0) {
+        report_fail(name, err ? err : "rc != 0 on cache miss");
+        goto free_meta;
+    }
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/layers/sha256/%s", store_root,
+             hex);
+    struct stat st;
+    if (stat(cache_dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "cache directory not created");
+        goto free_meta;
+    }
+    char cached_file[1280];
+    snprintf(cached_file, sizeof(cached_file), "%s/hello.txt", cache_dir);
+    if (!file_contents_match(cached_file, "hello, layer\n")) {
+        report_fail(name, "cache directory missing layer contents");
+        goto free_meta;
+    }
+    char cached_meta[1280];
+    snprintf(cached_meta, sizeof(cached_meta), "%s/.elfuse-meta.json",
+             cache_dir);
+    if (access(cached_meta, F_OK) != 0) {
+        report_fail(name, "cache directory missing .elfuse-meta.json");
+        goto free_meta;
+    }
+    char stage_file[1024];
+    snprintf(stage_file, sizeof(stage_file), "%s/hello.txt", stage_dir);
+    if (!file_contents_match(stage_file, "hello, layer\n")) {
+        report_fail(name, "stage_dir missing layer contents");
+        goto free_meta;
+    }
+    report_pass(name);
+
+free_meta:
+    oci_meta_table_free(meta);
+    bb_free(&body);
+close_store:
+    oci_store_close(store);
+cleanup:
+    rm_rf(stage_dir);
+    rm_rf(store_root);
+}
+
+/* Cache hit must skip the reverify + decompress + apply chain. The test
+ * stages a cache entry for a diff_id, corrupts the underlying blob (which
+ * would normally fail reverify), and calls oci_unpack_layer with cache
+ * options. A successful return with the cached marker visible in stage_dir
+ * proves the hit path short-circuited the extract.
+ */
+static void test_unpack_layer_cache_hit_skips_extract(void)
+{
+    const char *name = "unpack_layer cache hit skips re-extract";
+    char store_root[] = "/tmp/elfuse-unpack-cache-hit-XXXXXX";
+    char stage_dir[] = "/tmp/elfuse-unpack-stage-XXXXXX";
+    if (!mkdtemp(store_root)) {
+        report_fail(name, "mkdtemp store");
+        return;
+    }
+    if (!mkdtemp(stage_dir)) {
+        report_fail(name, "mkdtemp stage");
+        rmdir(store_root);
+        return;
+    }
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        report_fail(name, "store_open");
+        goto cleanup;
+    }
+    oci_blob_store_t *bs = oci_store_blobs(store);
+
+    bb_t body = {0};
+    oci_descriptor_t desc = {0};
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (build_single_file_blob(name, bs, &body, &desc, hex) < 0)
+        goto close_store;
+
+    /* Corrupt the blob so reverify would EINVAL if cache hit is bypassed. */
+    char blob_path[1024];
+    if (oci_blob_store_path(bs, desc.algo, desc.hex, blob_path,
+                            sizeof(blob_path)) < 0) {
+        report_fail(name, "blob_store_path");
+        goto free_body;
+    }
+    FILE *bf = fopen(blob_path, "ab");
+    if (!bf) {
+        report_fail(name, "fopen blob append");
+        goto free_body;
+    }
+    fputc('X', bf);
+    fclose(bf);
+
+    /* Pre-populate the cache directory with a marker file the test can
+     * uniquely identify. Skip the meta sidecar so the hit path also
+     * exercises the ENOENT-on-meta benign branch.
+     */
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/layers/sha256/%s", store_root,
+             hex);
+    if (mkdir(cache_dir, 0755) < 0) {
+        report_fail(name, "mkdir cache_dir");
+        goto free_body;
+    }
+    char marker_path[1280];
+    snprintf(marker_path, sizeof(marker_path), "%s/cached_marker", cache_dir);
+    FILE *mf = fopen(marker_path, "w");
+    if (!mf) {
+        report_fail(name, "fopen cached_marker");
+        goto free_body;
+    }
+    fputs("from_cache\n", mf);
+    fclose(mf);
+
+    oci_meta_table_t *meta = oci_meta_table_new();
+    oci_unpack_layer_options_t lopts = {.cache_store = store,
+                                        .diff_id = desc.digest_str};
+    const char *err = NULL;
+    int rc = oci_unpack_layer(bs, &desc, stage_dir, &lopts, NULL, meta, NULL,
+                              &err);
+    if (rc != 0) {
+        report_fail(name, err ? err : "rc != 0 on cache hit");
+        goto free_meta;
+    }
+    char stage_marker[1280];
+    snprintf(stage_marker, sizeof(stage_marker), "%s/cached_marker",
+             stage_dir);
+    if (!file_contents_match(stage_marker, "from_cache\n")) {
+        report_fail(name, "stage_dir missing cached_marker (hit path?)");
+        goto free_meta;
+    }
+    char stage_hello[1280];
+    snprintf(stage_hello, sizeof(stage_hello), "%s/hello.txt", stage_dir);
+    if (access(stage_hello, F_OK) == 0) {
+        report_fail(name,
+                    "stage_dir has hello.txt (extract ran despite cache hit)");
+        goto free_meta;
+    }
+    report_pass(name);
+
+free_meta:
+    oci_meta_table_free(meta);
+free_body:
+    bb_free(&body);
+close_store:
+    oci_store_close(store);
+cleanup:
+    rm_rf(stage_dir);
+    rm_rf(store_root);
+}
+
+/* Cache hit must merge the cached .elfuse-meta.json sidecar back into the
+ * caller's in-memory meta table so a subsequent oci_meta_write reproduces
+ * the cumulative uid/gid/mode state without re-walking the tar.
+ */
+static void test_unpack_layer_cache_hit_merges_meta(void)
+{
+    const char *name = "unpack_layer cache hit merges meta sidecar";
+    char store_root[] = "/tmp/elfuse-unpack-meta-merge-XXXXXX";
+    char stage_dir[] = "/tmp/elfuse-unpack-stage-XXXXXX";
+    if (!mkdtemp(store_root)) {
+        report_fail(name, "mkdtemp store");
+        return;
+    }
+    if (!mkdtemp(stage_dir)) {
+        report_fail(name, "mkdtemp stage");
+        rmdir(store_root);
+        return;
+    }
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        report_fail(name, "store_open");
+        goto cleanup;
+    }
+    oci_blob_store_t *bs = oci_store_blobs(store);
+
+    bb_t body = {0};
+    oci_descriptor_t desc = {0};
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (build_single_file_blob(name, bs, &body, &desc, hex) < 0)
+        goto close_store;
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/layers/sha256/%s", store_root,
+             hex);
+    if (mkdir(cache_dir, 0755) < 0) {
+        report_fail(name, "mkdir cache_dir");
+        goto free_body;
+    }
+    char meta_path[1280];
+    snprintf(meta_path, sizeof(meta_path), "%s/.elfuse-meta.json", cache_dir);
+    FILE *mf = fopen(meta_path, "w");
+    if (!mf) {
+        report_fail(name, "fopen .elfuse-meta.json");
+        goto free_body;
+    }
+    fputs("{\"version\":1,\"entries\":["
+          "{\"p\":\"/hello.txt\",\"u\":1234,\"g\":5678,\"m\":420}"
+          "]}\n",
+          mf);
+    fclose(mf);
+
+    oci_meta_table_t *meta = oci_meta_table_new();
+    oci_unpack_layer_options_t lopts = {.cache_store = store,
+                                        .diff_id = desc.digest_str};
+    const char *err = NULL;
+    int rc = oci_unpack_layer(bs, &desc, stage_dir, &lopts, NULL, meta, NULL,
+                              &err);
+    if (rc != 0) {
+        report_fail(name, err ? err : "rc != 0 on cache hit");
+        goto free_meta;
+    }
+    uint64_t uid = 0, gid = 0;
+    uint32_t mode = 0;
+    if (oci_meta_lookup(meta, "/hello.txt", &uid, &gid, &mode) < 0) {
+        report_fail(name, "meta entry not merged back");
+        goto free_meta;
+    }
+    if (uid != 1234 || gid != 5678 || mode != 420) {
+        report_fail(name, "merged meta tuple mismatch");
+        goto free_meta;
+    }
+    report_pass(name);
+
+free_meta:
+    oci_meta_table_free(meta);
+free_body:
+    bb_free(&body);
+close_store:
+    oci_store_close(store);
 cleanup:
     rm_rf(stage_dir);
     rm_rf(store_root);
@@ -516,6 +792,9 @@ int main(void)
     test_unpack_layer_single_file_tar();
     test_unpack_layer_digest_mismatch_rejected();
     test_unpack_layer_null_stats_meta_log();
+    test_unpack_layer_cache_miss_populates();
+    test_unpack_layer_cache_hit_skips_extract();
+    test_unpack_layer_cache_hit_merges_meta();
     test_end_to_end_gated();
     printf("\nResults: %d/%d passed\n", passed, total);
     return passed == total ? 0 : 1;

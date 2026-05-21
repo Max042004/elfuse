@@ -290,3 +290,80 @@ typedef struct {
 int oci_store_prune(oci_store_t *s,
                     oci_store_prune_options_t *opts,
                     const char **err);
+
+/* Plan 3 C3.2: per-layer unpack snapshot cache.
+ *
+ * Layer caches live under <root>/layers/<algo>/<hex>/ in the same content-
+ * addressed shape as <root>/blobs/<algo>/<hex>. Each cache directory holds a
+ * snapshot of the unpack stage_dir state immediately after applying that
+ * layer's tar payload. clonefile(2) populates and consumes the snapshots so
+ * the cache and the live unpack stage must live on the same APFS volume; an
+ * EXDEV during snapshot is propagated as a hard error rather than silently
+ * falling back to a copy.
+ *
+ * Cache semantics are CUMULATIVE: the directory at layers/sha256/<hex>/
+ * holds the stage_dir state assembled by the unpacker WHEN this layer was
+ * applied, which means it includes every prior layer's contribution along
+ * with the current layer. A second unpack of the same image short-circuits
+ * the extract loop entirely. Cross-image dedup (two images sharing a base
+ * layer prefix but diverging upstream) is NOT yet correct under this scheme;
+ * Plan 3 C3.3 introduces raw-tar staging + clonefile-stack assembly to fix
+ * the cross-image case. C3.2 lands the directory layout, the path helpers,
+ * and the per-image fast path the C3.3 rewrite will build on.
+ *
+ * C3.2 deliberately does NOT extend oci_store_collect_roots / oci_store_prune
+ * to walk layers/. The cache grows monotonically until C3.5's
+ * `oci image rebuild-cache` (or C3.3's prune work) consumes it. Skipping the
+ * keep-set walk now keeps this commit focused on the layout invariants.
+ *
+ * No refcount sidecar is written. Reachability is recomputed at GC time from
+ * each manifest's image-config rootfs.diff_ids list, mirroring how blobs/
+ * reachability is recomputed by oci_store_collect_roots.
+ *
+ * Concurrency: cache_has is a single stat(2) and is inherently racy with
+ * concurrent writers, but the worst outcome is a redundant extract.
+ * oci_store_layer_commit publishes via rename(2) (atomic) and treats
+ * EEXIST / ENOTEMPTY at the destination as a benign loss to a racing
+ * winner: the loser's staging directory is removed and 0 is returned so the
+ * caller can proceed as though the entry was already on disk. No store-wide
+ * lock is required.
+ */
+
+/* Probe whether <root>/layers/<algo>/<hex>/ exists. diff_id is in canonical
+ * "<algo>:<hex>" form. Returns 1 (present, is a directory), 0 (absent), or
+ * -1 with errno preserved on any unexpected IO error. A malformed diff_id
+ * returns -1 with errno=EINVAL.
+ */
+int oci_store_layer_has(oci_store_t *s, const char *diff_id);
+
+/* Compose <root>/layers/<algo>/<hex>/ for diff_id into out. Trailing slash
+ * included so a downstream strcat(child) composes cleanly. Pure path
+ * computation; does not stat or mkdir. Returns 0 on success, -1 with errno
+ * EINVAL on malformed diff_id, ENAMETOOLONG on buffer overflow.
+ */
+int oci_store_layer_resolve(oci_store_t *s,
+                            const char *diff_id,
+                            char *out, size_t cap);
+
+/* Compose <root>/layers/.staging/<algo>-<hex>-<rand12> for diff_id into out.
+ * The path is unique per call; the directory is NOT created (clonefile(2)
+ * creates it as a side effect). Returns 0 on success, -1 with errno EINVAL
+ * on malformed diff_id, ENAMETOOLONG on overflow, or other errno values
+ * propagated from getentropy(2).
+ */
+int oci_store_layer_stage_path(oci_store_t *s,
+                               const char *diff_id,
+                               char *out, size_t cap);
+
+/* Atomically publish a populated staging directory as the layer cache entry
+ * for diff_id via rename(stage_path, <root>/layers/<algo>/<hex>/). If the
+ * destination already exists (EEXIST / ENOTEMPTY: a concurrent writer landed
+ * the same entry first) the staging directory is removed and 0 is returned.
+ * Any other failure returns -1 with errno preserved and *err (when non-NULL)
+ * populated; the staging directory is left in place so the caller can retry
+ * or inspect it.
+ */
+int oci_store_layer_commit(oci_store_t *s,
+                           const char *stage_path,
+                           const char *diff_id,
+                           const char **err);
