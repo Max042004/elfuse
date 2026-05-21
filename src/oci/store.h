@@ -379,3 +379,65 @@ int oci_store_layer_commit(oci_store_t *s,
                            const char *stage_path,
                            const char *diff_id,
                            const char **err);
+
+/* Plan 3 C3.3c: ChainID-keyed assembled-stack cache.
+ *
+ * The stack cache lives under <root>/layers/stacks/<algo>/<hex>/ in the same
+ * content-addressed shape as the per-layer raw cache. Each entry holds an
+ * assembled cumulative stage_dir state through some prefix of an image's
+ * layer list, keyed by the OCI ChainID for the terminating layer (see
+ * src/oci/digest.h::oci_chainid_compute). Cross-image dedup works because
+ * any two images that share the same ordered layer prefix produce the same
+ * ChainID for that prefix; the longest-prefix match short-circuits the
+ * per-layer assembly during oci_unpack.
+ *
+ * Staging shares the <root>/layers/.staging/ directory with the per-layer
+ * raw cache. Stack stage paths are prefixed with "stack-" so a debug walk
+ * of .staging/ can tell the two artifact families apart at a glance. The
+ * commit destination is what disambiguates the two on disk.
+ *
+ * Concurrency mirrors the layer-cache APIs: stack_has is a single stat(2)
+ * (racy with concurrent writers; worst case is one redundant assembly),
+ * stack_commit publishes via rename(2) and treats EEXIST / ENOTEMPTY as a
+ * benign loss to the racing winner with the staging tree torn down. No
+ * store-wide lock is required.
+ */
+
+/* Probe whether <root>/layers/stacks/<algo>/<hex>/ exists. chain_id is in
+ * canonical "<algo>:<hex>" form. Returns 1 (present, is a directory), 0
+ * (absent), or -1 with errno preserved on any unexpected IO error. A
+ * malformed chain_id returns -1 with errno=EINVAL.
+ */
+int oci_store_stack_has(oci_store_t *s, const char *chain_id);
+
+/* Compose <root>/layers/stacks/<algo>/<hex>/ for chain_id into out.
+ * Trailing slash included so a downstream strcat(child) composes cleanly.
+ * Pure path computation; does not stat or mkdir. Returns 0 on success, -1
+ * with errno EINVAL on malformed chain_id, ENAMETOOLONG on buffer overflow.
+ */
+int oci_store_stack_resolve(oci_store_t *s,
+                            const char *chain_id,
+                            char *out, size_t cap);
+
+/* Compose <root>/layers/.staging/stack-<algo>-<hex>-<rand12> for chain_id
+ * into out. The path is unique per call; the directory is NOT created
+ * (clonefile(2) creates it as a side effect). Returns 0 on success, -1 with
+ * errno EINVAL on malformed chain_id, ENAMETOOLONG on overflow, or other
+ * errno values propagated from getentropy(2).
+ */
+int oci_store_stack_stage_path(oci_store_t *s,
+                               const char *chain_id,
+                               char *out, size_t cap);
+
+/* Atomically publish a populated staging directory as the stack cache entry
+ * for chain_id via rename(stage_path, <root>/layers/stacks/<algo>/<hex>/).
+ * If the destination already exists (EEXIST / ENOTEMPTY: a concurrent writer
+ * landed the same entry first) the staging directory is removed and 0 is
+ * returned. Any other failure returns -1 with errno preserved and *err
+ * (when non-NULL) populated; the staging directory is left in place so the
+ * caller can retry or inspect it.
+ */
+int oci_store_stack_commit(oci_store_t *s,
+                           const char *stage_path,
+                           const char *chain_id,
+                           const char **err);

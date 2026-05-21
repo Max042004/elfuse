@@ -156,18 +156,23 @@ static unsigned long layout_seq(void)
     return __sync_add_and_fetch(&n, 1);
 }
 
-/* Ensure <root>/layers/sha256/ and <root>/layers/.staging/ exist on open. The
- * Plan 3 C3.2 per-layer snapshot cache depends on both directories: the first
- * holds committed cache entries and the second is the in-flight staging area
- * for clonefile(2) snapshots. The blob store already created <root> itself
- * (oci_blob_store_open mkdirs the root tree), so this helper only adds the
- * layers/ subtree. mkdir EEXIST is benign so reopens are idempotent.
+/* Ensure <root>/layers/sha256/, <root>/layers/stacks/sha256/, and
+ * <root>/layers/.staging/ exist on open. The Plan 3 layer caches depend on
+ * three subtrees: layers/sha256/ holds committed per-layer raw entries
+ * (C3.3c), layers/stacks/sha256/ holds committed ChainID-keyed assembled
+ * stack snapshots (C3.3c), and layers/.staging/ is the shared in-flight
+ * staging area for clonefile(2) writers in both families. The blob store
+ * already created <root> itself (oci_blob_store_open mkdirs the root
+ * tree), so this helper only adds the layers/ subtree. mkdir EEXIST is
+ * benign so reopens are idempotent.
  */
 static int ensure_layer_dirs(const char *root)
 {
     static const char *const subdirs[] = {
         "layers",
         "layers/sha256",
+        "layers/stacks",
+        "layers/stacks/sha256",
         "layers/.staging",
     };
     for (size_t i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
@@ -2095,22 +2100,25 @@ done:;
 
 /* --- Plan 3 C3.2: layer cache helpers ---------------------------------- */
 
-/* Parse a "<algo>:<hex>" diff_id into its components and the lowercase
- * algorithm name used as the cache subdir. Validation matches the digest
- * library; oci_digest_parse already rejects unknown algos and bad hex.
+/* Parse a "<algo>:<hex>" digest into its components and the lowercase
+ * algorithm name used as the cache subdir. Shared by the per-layer raw
+ * cache (keyed by diff_id) and the ChainID-keyed stack cache (C3.3c),
+ * both of which materialise as <root>/layers/.../<algo>/<hex>/ on disk.
+ * Validation matches the digest library; oci_digest_parse already rejects
+ * unknown algos and bad hex.
  */
-static int parse_diff_id_for_cache(const char *diff_id,
+static int parse_digest_for_cache_dir(const char *digest_str,
                                    oci_digest_algo_t *out_algo,
                                    char *out_hex,
                                    const char **out_algo_name)
 {
-    if (!diff_id || !*diff_id) {
+    if (!digest_str || !*digest_str) {
         errno = EINVAL;
         return -1;
     }
     oci_digest_algo_t algo;
     char hex[OCI_DIGEST_HEX_MAX + 1];
-    if (!oci_digest_parse(diff_id, &algo, hex)) {
+    if (!oci_digest_parse(digest_str, &algo, hex)) {
         errno = EINVAL;
         return -1;
     }
@@ -2134,7 +2142,7 @@ int oci_store_layer_has(oci_store_t *s, const char *diff_id)
     oci_digest_algo_t algo;
     char hex[OCI_DIGEST_HEX_MAX + 1];
     const char *algo_name = NULL;
-    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0)
+    if (parse_digest_for_cache_dir(diff_id, &algo, hex, &algo_name) < 0)
         return -1;
 
     char path[STORE_PATH_MAX];
@@ -2168,7 +2176,7 @@ int oci_store_layer_resolve(oci_store_t *s,
     oci_digest_algo_t algo;
     char hex[OCI_DIGEST_HEX_MAX + 1];
     const char *algo_name = NULL;
-    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0)
+    if (parse_digest_for_cache_dir(diff_id, &algo, hex, &algo_name) < 0)
         return -1;
     int n = snprintf(out, cap, "%s/layers/%s/%s/", s->root, algo_name, hex);
     if (n < 0 || (size_t) n >= cap) {
@@ -2207,7 +2215,7 @@ int oci_store_layer_stage_path(oci_store_t *s,
     oci_digest_algo_t algo;
     char hex[OCI_DIGEST_HEX_MAX + 1];
     const char *algo_name = NULL;
-    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0)
+    if (parse_digest_for_cache_dir(diff_id, &algo, hex, &algo_name) < 0)
         return -1;
     char rand_suffix[13];
     if (layer_stage_rand_suffix(rand_suffix) < 0)
@@ -2280,7 +2288,7 @@ int oci_store_layer_commit(oci_store_t *s,
     oci_digest_algo_t algo;
     char hex[OCI_DIGEST_HEX_MAX + 1];
     const char *algo_name = NULL;
-    if (parse_diff_id_for_cache(diff_id, &algo, hex, &algo_name) < 0) {
+    if (parse_digest_for_cache_dir(diff_id, &algo, hex, &algo_name) < 0) {
         *err = "layer_commit: invalid diff_id";
         return -1;
     }
@@ -2305,6 +2313,140 @@ int oci_store_layer_commit(oci_store_t *s,
         return 0;
     }
     *err = "layer_commit: rename to layers/<algo>/<hex>/ failed";
+    errno = saved;
+    return -1;
+}
+
+/* --- Plan 3 C3.3c: ChainID stack cache helpers ------------------------- */
+
+int oci_store_stack_has(oci_store_t *s, const char *chain_id)
+{
+    if (!s) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_digest_for_cache_dir(chain_id, &algo, hex, &algo_name) < 0)
+        return -1;
+
+    char path[STORE_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/layers/stacks/%s/%s", s->root,
+                     algo_name, hex);
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    struct stat st;
+    if (stat(path, &st) < 0) {
+        if (errno == ENOENT)
+            return 0;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 1;
+}
+
+int oci_store_stack_resolve(oci_store_t *s,
+                            const char *chain_id,
+                            char *out, size_t cap)
+{
+    if (!s || !out || cap == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_digest_for_cache_dir(chain_id, &algo, hex, &algo_name) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/layers/stacks/%s/%s/", s->root, algo_name,
+                     hex);
+    if (n < 0 || (size_t) n >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+int oci_store_stack_stage_path(oci_store_t *s,
+                               const char *chain_id,
+                               char *out, size_t cap)
+{
+    if (!s || !out || cap == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_digest_for_cache_dir(chain_id, &algo, hex, &algo_name) < 0)
+        return -1;
+    char rand_suffix[13];
+    if (layer_stage_rand_suffix(rand_suffix) < 0)
+        return -1;
+    /* The "stack-" prefix keeps stack stage paths visually distinct from
+     * per-layer raw cache stage paths inside the shared .staging/ dir.
+     * Commit publishes to a different destination tree so the prefix is
+     * purely a debug aid; the rename is what actually disambiguates the
+     * two artifact families.
+     */
+    int n = snprintf(out, cap, "%s/layers/.staging/stack-%s-%s-%s", s->root,
+                     algo_name, hex, rand_suffix);
+    if (n < 0 || (size_t) n >= cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+int oci_store_stack_commit(oci_store_t *s,
+                           const char *stage_path,
+                           const char *chain_id,
+                           const char **err)
+{
+    static const char *dummy_err;
+    if (!err)
+        err = &dummy_err;
+    *err = NULL;
+    if (!s || !stage_path || !*stage_path) {
+        *err = "stack_commit: NULL argument";
+        errno = EINVAL;
+        return -1;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    const char *algo_name = NULL;
+    if (parse_digest_for_cache_dir(chain_id, &algo, hex, &algo_name) < 0) {
+        *err = "stack_commit: invalid chain_id";
+        return -1;
+    }
+    char dest[STORE_PATH_MAX];
+    int n = snprintf(dest, sizeof(dest), "%s/layers/stacks/%s/%s", s->root,
+                     algo_name, hex);
+    if (n < 0 || (size_t) n >= sizeof(dest)) {
+        *err = "stack_commit: dest path exceeds STORE_PATH_MAX";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (rename(stage_path, dest) == 0)
+        return 0;
+    int saved = errno;
+    if (saved == EEXIST || saved == ENOTEMPTY) {
+        /* Concurrent writer landed the same entry first; drop the loser's
+         * staging tree and treat this as a benign success. Stack snapshots
+         * are content-addressed via ChainID so the winning entry is byte-
+         * equivalent.
+         */
+        (void) layer_stage_rm(stage_path);
+        errno = 0;
+        return 0;
+    }
+    *err = "stack_commit: rename to layers/stacks/<algo>/<hex>/ failed";
     errno = saved;
     return -1;
 }

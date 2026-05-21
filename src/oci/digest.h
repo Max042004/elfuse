@@ -90,3 +90,39 @@ size_t oci_digest_bytes(oci_digest_algo_t algo,
                         const void *buf,
                         size_t len,
                         char *out_hex);
+
+/* Compute the OCI image-spec ChainID for one layer in canonical
+ * "<algo>:<hex>" form. ChainID is the cumulative content key used by the
+ * Plan 3 C3.3 stack cache: ChainID(L0) == DiffID(L0), and for any later
+ * layer ChainID(Li) == sha256("<prev_chain> <diff_id>") where the input is
+ * the previous chain string, an ASCII space (0x20), and the current layer's
+ * diff_id string, both in their canonical "<algo>:<hex>" form. See OCI
+ * image-spec v1.0.2 section 3.4 "Layer ChainID" for the reference text.
+ *
+ * The output is always sha256-prefixed regardless of diff_id's algorithm:
+ * ChainID composition is defined over the textual digest representation, so
+ * a sha512 diff_id contributes its full "sha512:<hex>" string but the result
+ * is hashed with SHA-256 (the only ChainID algorithm the spec defines).
+ *
+ * Parameters:
+ *   prev_chain  NULL signals the L0 case; the helper copies diff_id into
+ *               out verbatim and returns 0. Non-NULL must be a valid
+ *               "<algo>:<hex>" string in canonical lowercase form.
+ *   diff_id     This layer's diff_id; must be non-NULL and "<algo>:<hex>".
+ *   out         Receives the new ChainID string (NUL-terminated, always
+ *               "sha256:<64-hex>" when prev_chain != NULL, or a copy of
+ *               diff_id when prev_chain == NULL).
+ *   cap         Capacity of out in bytes. Must be at least
+ *               OCI_DIGEST_HEX_MAX + 16 so a sha512 diff_id fits in the L0
+ *               passthrough path.
+ *
+ * Returns 0 on success, -1 with errno set on failure:
+ *   EINVAL        diff_id NULL, prev_chain non-NULL but malformed, or
+ *                 diff_id malformed
+ *   ENAMETOOLONG  cap too small to hold the result
+ *   ENOMEM        internal SHA-256 digester allocation failed
+ */
+int oci_chainid_compute(const char *prev_chain,
+                        const char *diff_id,
+                        char *out,
+                        size_t cap);

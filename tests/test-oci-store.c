@@ -3360,6 +3360,18 @@ static void test_open_creates_layer_dirs(const char *scratch)
         oci_store_close(s);
         return;
     }
+    snprintf(path, sizeof(path), "%s/layers/stacks", root);
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "layers/stacks/ missing");
+        oci_store_close(s);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/layers/stacks/sha256", root);
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        report_fail(name, "layers/stacks/sha256/ missing");
+        oci_store_close(s);
+        return;
+    }
     snprintf(path, sizeof(path), "%s/layers/.staging", root);
     if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         report_fail(name, "layers/.staging/ missing");
@@ -3527,6 +3539,292 @@ static void test_layer_commit_rename_race_benign(const char *scratch)
     /* Pre-existing dest must remain untouched. */
     if (stat(dest, &st) != 0 || !S_ISDIR(st.st_mode)) {
         report_fail(name, "winner cache dir removed by commit");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+/* --- Plan 3 C3.3c: ChainID stack cache tests --------------------------- */
+
+static void test_stack_resolve_format(const char *scratch)
+{
+    const char *name = "stack_resolve_format";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-stack-resolve", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    static const char CHAIN[] =
+        "sha256:"
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    char out[1280];
+    if (oci_store_stack_resolve(s, CHAIN, out, sizeof(out)) < 0) {
+        report_fail(name, "resolve returned -1");
+        oci_store_close(s);
+        return;
+    }
+    char want[1408];
+    snprintf(want, sizeof(want),
+             "%s/layers/stacks/sha256/"
+             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/",
+             root);
+    if (strcmp(out, want) != 0) {
+        report_fail(name, "resolved path mismatch");
+        oci_store_close(s);
+        return;
+    }
+    errno = 0;
+    if (oci_store_stack_resolve(s, "not-a-digest", out, sizeof(out)) != -1 ||
+        errno != EINVAL) {
+        report_fail(name, "malformed chain_id not rejected");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_stack_has_present_absent(const char *scratch)
+{
+    const char *name = "stack_has_present_absent";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-stack-has", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    const char *chain_id =
+        "sha256:"
+        "3333333333333333333333333333333333333333333333333333333333333333";
+    int rc = oci_store_stack_has(s, chain_id);
+    if (rc != 0) {
+        report_fail(name, "absent stack reported as present");
+        oci_store_close(s);
+        return;
+    }
+    char dir[1408];
+    snprintf(dir, sizeof(dir), "%s/layers/stacks/sha256/%s", root,
+             chain_id + 7);
+    if (mkdir(dir, 0755) < 0) {
+        report_fail(name, "mkdir stack_dir failed");
+        oci_store_close(s);
+        return;
+    }
+    rc = oci_store_stack_has(s, chain_id);
+    if (rc != 1) {
+        report_fail(name, "present stack reported as absent");
+        oci_store_close(s);
+        return;
+    }
+    errno = 0;
+    if (oci_store_stack_has(s, "sha256:not-hex") != -1 || errno != EINVAL) {
+        report_fail(name, "malformed chain_id not rejected");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_stack_stage_path_uniqueness(const char *scratch)
+{
+    const char *name = "stack_stage_path_uniqueness";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-stack-stage", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    const char *chain_id =
+        "sha256:"
+        "4444444444444444444444444444444444444444444444444444444444444444";
+    char a[1280];
+    char b[1280];
+    if (oci_store_stack_stage_path(s, chain_id, a, sizeof(a)) < 0 ||
+        oci_store_stack_stage_path(s, chain_id, b, sizeof(b)) < 0) {
+        report_fail(name, "stage_path failed");
+        oci_store_close(s);
+        return;
+    }
+    /* Both paths must sit under <root>/layers/.staging/stack-... so a
+     * shared staging dir suffices for both raw and stack writers, and the
+     * random suffix prevents collisions inside a single process.
+     */
+    char prefix[1280];
+    snprintf(prefix, sizeof(prefix), "%s/layers/.staging/stack-sha256-", root);
+    if (strncmp(a, prefix, strlen(prefix)) != 0 ||
+        strncmp(b, prefix, strlen(prefix)) != 0) {
+        report_fail(name, "stage path prefix mismatch");
+        oci_store_close(s);
+        return;
+    }
+    if (strcmp(a, b) == 0) {
+        report_fail(name, "two stage paths collided");
+        oci_store_close(s);
+        return;
+    }
+    errno = 0;
+    if (oci_store_stack_stage_path(s, "garbage", a, sizeof(a)) != -1 ||
+        errno != EINVAL) {
+        report_fail(name, "malformed chain_id not rejected");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_stack_commit_round_trip(const char *scratch)
+{
+    const char *name = "stack_commit_round_trip";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-stack-commit", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    const char *chain_id =
+        "sha256:"
+        "5555555555555555555555555555555555555555555555555555555555555555";
+
+    char stage[1280];
+    if (oci_store_stack_stage_path(s, chain_id, stage, sizeof(stage)) < 0) {
+        report_fail(name, "stage_path failed");
+        oci_store_close(s);
+        return;
+    }
+    if (mkdir(stage, 0755) < 0) {
+        report_fail(name, "stage mkdir failed");
+        oci_store_close(s);
+        return;
+    }
+    char marker[1408];
+    snprintf(marker, sizeof(marker), "%s/marker", stage);
+    int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "stage marker open failed");
+        oci_store_close(s);
+        return;
+    }
+    close(fd);
+
+    const char *err = NULL;
+    if (oci_store_stack_commit(s, stage, chain_id, &err) < 0) {
+        report_fail(name, err ? err : "commit returned -1");
+        oci_store_close(s);
+        return;
+    }
+    /* stage_path is gone, dest is in place with the marker preserved. */
+    struct stat st;
+    if (stat(stage, &st) == 0) {
+        report_fail(name, "stage dir survived a successful commit");
+        oci_store_close(s);
+        return;
+    }
+    if (oci_store_stack_has(s, chain_id) != 1) {
+        report_fail(name, "stack_has reports absent after commit");
+        oci_store_close(s);
+        return;
+    }
+    char dest[1408];
+    snprintf(dest, sizeof(dest), "%s/layers/stacks/sha256/%s/marker", root,
+             chain_id + 7);
+    if (stat(dest, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail(name, "marker missing in committed stack dir");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass(name);
+}
+
+static void test_stack_commit_rename_race_benign(const char *scratch)
+{
+    const char *name = "stack_commit_rename_race_benign";
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-stack-race", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail(name, "store_open");
+        return;
+    }
+    const char *chain_id =
+        "sha256:"
+        "6666666666666666666666666666666666666666666666666666666666666666";
+
+    char dest[1408];
+    snprintf(dest, sizeof(dest), "%s/layers/stacks/sha256/%s", root,
+             chain_id + 7);
+    if (mkdir(dest, 0755) < 0) {
+        report_fail(name, "mkdir dest failed");
+        oci_store_close(s);
+        return;
+    }
+    /* Drop a sentinel inside the pre-seeded dest so we can assert the
+     * winner survives the race.
+     */
+    char winner_marker[1536];
+    snprintf(winner_marker, sizeof(winner_marker), "%s/winner", dest);
+    int fd = open(winner_marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "winner sentinel open failed");
+        oci_store_close(s);
+        return;
+    }
+    close(fd);
+
+    char stage[1280];
+    if (oci_store_stack_stage_path(s, chain_id, stage, sizeof(stage)) < 0) {
+        report_fail(name, "stage_path failed");
+        oci_store_close(s);
+        return;
+    }
+    if (mkdir(stage, 0755) < 0) {
+        report_fail(name, "stage mkdir failed");
+        oci_store_close(s);
+        return;
+    }
+    char loser_marker[1408];
+    snprintf(loser_marker, sizeof(loser_marker), "%s/loser", stage);
+    fd = open(loser_marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        report_fail(name, "loser marker open failed");
+        oci_store_close(s);
+        return;
+    }
+    close(fd);
+
+    const char *err = NULL;
+    if (oci_store_stack_commit(s, stage, chain_id, &err) < 0) {
+        report_fail(name, err ? err : "commit returned -1 on race");
+        oci_store_close(s);
+        return;
+    }
+    struct stat st;
+    if (stat(stage, &st) == 0) {
+        report_fail(name, "stage dir not cleaned up after race loss");
+        oci_store_close(s);
+        return;
+    }
+    if (stat(winner_marker, &st) != 0 || !S_ISREG(st.st_mode)) {
+        report_fail(name, "winner sentinel removed by losing commit");
+        oci_store_close(s);
+        return;
+    }
+    /* Loser's marker never made it across because rename failed and the
+     * loser tree was rm'd; the destination must contain only the winner.
+     */
+    char loser_in_dest[1536];
+    snprintf(loser_in_dest, sizeof(loser_in_dest), "%s/loser", dest);
+    if (stat(loser_in_dest, &st) == 0) {
+        report_fail(name, "loser marker leaked into dest");
         oci_store_close(s);
         return;
     }
@@ -3954,6 +4252,11 @@ int main(void)
     test_layer_resolve_format(scratch);
     test_layer_has_present_absent(scratch);
     test_layer_commit_rename_race_benign(scratch);
+    test_stack_resolve_format(scratch);
+    test_stack_has_present_absent(scratch);
+    test_stack_stage_path_uniqueness(scratch);
+    test_stack_commit_round_trip(scratch);
+    test_stack_commit_rename_race_benign(scratch);
     test_layer_schema_written_on_fresh_open(scratch);
     test_layer_schema_idempotent_reopen(scratch);
     test_layer_schema_v1_wipe_on_first_open(scratch);

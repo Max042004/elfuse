@@ -7,6 +7,7 @@
 #include "digest.h"
 
 #include <CommonCrypto/CommonDigest.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -204,4 +205,77 @@ size_t oci_digest_bytes(oci_digest_algo_t algo,
     size_t n = oci_digester_finish_hex(d, out_hex);
     oci_digester_free(d);
     return n;
+}
+
+int oci_chainid_compute(const char *prev_chain,
+                        const char *diff_id,
+                        char *out,
+                        size_t cap)
+{
+    if (!diff_id || !out || cap == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Validate the diff_id is well-formed before any hashing so the L0
+     * passthrough path and the Li hash path agree on input validation.
+     */
+    oci_digest_algo_t diff_algo;
+    char diff_hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(diff_id, &diff_algo, diff_hex)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!prev_chain) {
+        /* L0 case: ChainID(L0) == DiffID(L0). Copy verbatim so a sha512
+         * diff_id round-trips unchanged through the layer-0 slot.
+         */
+        size_t diff_len = strlen(diff_id);
+        if (diff_len + 1 > cap) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(out, diff_id, diff_len + 1);
+        return 0;
+    }
+
+    /* Li case: validate prev_chain shape too. The spec allows any
+     * <algo>:<hex> digest string in the textual concatenation; in practice
+     * every ChainID this helper produces is sha256-prefixed, but the
+     * parser accepts both sha256 and sha512 so a future L0 sha512 diff_id
+     * still composes correctly with subsequent layers.
+     */
+    oci_digest_algo_t prev_algo;
+    char prev_hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(prev_chain, &prev_algo, prev_hex)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Output is always sha256-prefixed: ChainID composition is defined
+     * with SHA-256 in the OCI image-spec, regardless of the algorithm
+     * used for the constituent digests.
+     */
+    static const char OUT_PREFIX[] = "sha256:";
+    size_t out_need = sizeof(OUT_PREFIX) - 1 + OCI_DIGEST_SHA256_HEX_LEN + 1;
+    if (cap < out_need) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    oci_digester_t *d = oci_digester_new(OCI_DIGEST_SHA256);
+    if (!d) {
+        errno = ENOMEM;
+        return -1;
+    }
+    oci_digester_update(d, prev_chain, strlen(prev_chain));
+    static const char SP = ' ';
+    oci_digester_update(d, &SP, 1);
+    oci_digester_update(d, diff_id, strlen(diff_id));
+
+    memcpy(out, OUT_PREFIX, sizeof(OUT_PREFIX) - 1);
+    oci_digester_finish_hex(d, out + sizeof(OUT_PREFIX) - 1);
+    oci_digester_free(d);
+    return 0;
 }

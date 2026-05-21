@@ -9,6 +9,7 @@
  * regression in the chunking or hex encoder shows up immediately.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -289,6 +290,141 @@ int main(void)
         else
             report_fail("algo_from_name accepts known and rejects unknown",
                         NULL);
+    }
+
+    /* --- ChainID --------------------------------------------------------
+     *
+     * OCI image-spec v1.0.2 section 3.4: ChainID(L0) == DiffID(L0), and
+     * ChainID(Li) == SHA-256("<prev_chain> <diff_id>"). The Li tests
+     * recompute the expected value via the same digester library used by
+     * the helper rather than hard-coding a magic hex string, so the test
+     * stays sensitive to drift in the input encoding (e.g. accidentally
+     * dropping the space, swapping argument order, or hashing only the
+     * hex portion instead of the full "<algo>:<hex>" digest).
+     */
+    printf("oci_chainid_compute\n");
+
+    static const char DIFF_A[] =
+        "sha256:"
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    static const char DIFF_B[] =
+        "sha256:"
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    static const char DIFF_512[] =
+        "sha512:"
+        "3333333333333333333333333333333333333333333333333333333333333333"
+        "3333333333333333333333333333333333333333333333333333333333333333";
+
+    {
+        /* L0 case: helper copies diff_id verbatim, regardless of algo. */
+        char out[OCI_DIGEST_HEX_MAX + 16];
+        if (oci_chainid_compute(NULL, DIFF_A, out, sizeof(out)) != 0) {
+            report_fail("chainid L0 sha256 passthrough", "rc != 0");
+        } else if (strcmp(out, DIFF_A) != 0) {
+            report_fail("chainid L0 sha256 passthrough", out);
+        } else {
+            report_pass("chainid L0 sha256 passthrough");
+        }
+        if (oci_chainid_compute(NULL, DIFF_512, out, sizeof(out)) != 0) {
+            report_fail("chainid L0 sha512 passthrough", "rc != 0");
+        } else if (strcmp(out, DIFF_512) != 0) {
+            report_fail("chainid L0 sha512 passthrough", out);
+        } else {
+            report_pass("chainid L0 sha512 passthrough");
+        }
+    }
+
+    {
+        /* Li case: helper hashes prev + " " + diff. Independently compute
+         * the expected hash here so the test catches off-by-one mistakes
+         * (e.g. trailing NUL leaking into the hash, missing space).
+         */
+        char want_hex[OCI_DIGEST_HEX_MAX + 1];
+        char concat[256];
+        snprintf(concat, sizeof(concat), "%s %s", DIFF_A, DIFF_B);
+        oci_digest_bytes(OCI_DIGEST_SHA256, concat, strlen(concat), want_hex);
+        char want[OCI_DIGEST_HEX_MAX + 16];
+        snprintf(want, sizeof(want), "sha256:%s", want_hex);
+
+        char got[OCI_DIGEST_HEX_MAX + 16];
+        if (oci_chainid_compute(DIFF_A, DIFF_B, got, sizeof(got)) != 0) {
+            report_fail("chainid Li matches OCI spec composition", "rc != 0");
+        } else if (strcmp(got, want) != 0) {
+            char detail[1024];
+            snprintf(detail, sizeof(detail), "got=%s want=%s", got, want);
+            report_fail("chainid Li matches OCI spec composition", detail);
+        } else {
+            report_pass("chainid Li matches OCI spec composition");
+        }
+    }
+
+    {
+        /* Chain three layers and confirm the helper composes left-to-right
+         * (the iteration order any caller uses).
+         */
+        char chain0[OCI_DIGEST_HEX_MAX + 16];
+        char chain1[OCI_DIGEST_HEX_MAX + 16];
+        char chain2[OCI_DIGEST_HEX_MAX + 16];
+        if (oci_chainid_compute(NULL, DIFF_A, chain0, sizeof(chain0)) != 0 ||
+            oci_chainid_compute(chain0, DIFF_B, chain1, sizeof(chain1)) != 0 ||
+            oci_chainid_compute(chain1, DIFF_A, chain2, sizeof(chain2)) != 0) {
+            report_fail("chainid three-layer chain composes", "rc != 0");
+        } else if (strncmp(chain1, "sha256:", 7) != 0 ||
+                   strncmp(chain2, "sha256:", 7) != 0) {
+            report_fail("chainid three-layer chain composes",
+                        "non-sha256 prefix");
+        } else if (strcmp(chain1, chain2) == 0) {
+            /* The two Li hashes consume different prev_chain values, so
+             * they cannot collide unless the helper ignored prev_chain.
+             */
+            report_fail("chainid three-layer chain composes",
+                        "chain1 == chain2 (prev_chain ignored?)");
+        } else {
+            report_pass("chainid three-layer chain composes");
+        }
+    }
+
+    {
+        /* Output buffer too small => ENAMETOOLONG, no write past cap. */
+        char small[8];
+        memset(small, 'X', sizeof(small));
+        errno = 0;
+        int rc = oci_chainid_compute(DIFF_A, DIFF_B, small, sizeof(small));
+        if (rc != -1 || errno != ENAMETOOLONG) {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "rc=%d errno=%d", rc, errno);
+            report_fail("chainid rejects small cap with ENAMETOOLONG", detail);
+        } else {
+            report_pass("chainid rejects small cap with ENAMETOOLONG");
+        }
+    }
+
+    {
+        /* Malformed diff_id => EINVAL. */
+        char out[OCI_DIGEST_HEX_MAX + 16];
+        errno = 0;
+        if (oci_chainid_compute(DIFF_A, "not-a-digest", out, sizeof(out)) !=
+                -1 ||
+            errno != EINVAL) {
+            report_fail("chainid rejects malformed diff_id", "wrong errno");
+        } else {
+            report_pass("chainid rejects malformed diff_id");
+        }
+        errno = 0;
+        if (oci_chainid_compute("not-a-digest", DIFF_B, out, sizeof(out)) !=
+                -1 ||
+            errno != EINVAL) {
+            report_fail("chainid rejects malformed prev_chain", "wrong errno");
+        } else {
+            report_pass("chainid rejects malformed prev_chain");
+        }
+        errno = 0;
+        if (oci_chainid_compute(DIFF_A, NULL, out, sizeof(out)) != -1 ||
+            errno != EINVAL) {
+            report_fail("chainid rejects NULL diff_id", "wrong errno");
+        } else {
+            report_pass("chainid rejects NULL diff_id");
+        }
     }
 
     printf("\nResults: %d/%d passed\n", passed, total);
