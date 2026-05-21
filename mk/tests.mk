@@ -9,6 +9,7 @@
         test-oci-ref test-oci-digest test-oci-blob-store test-oci-manifest \
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-tar test-oci-decompress test-oci-meta \
+        test-oci-origin \
         test-oci-layer-apply test-oci-volume test-oci-clone \
         test-oci-unpack test-oci-runspec test-oci-path-resolve \
         test-oci-run test-oci-compat oci-fixture-builder \
@@ -60,6 +61,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-decompress
 	@printf "\n$(BLUE)━━━ OCI sidecar metadata unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-meta
+	@printf "\n$(BLUE)━━━ OCI origin sidecar unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-origin
 	@printf "\n$(BLUE)━━━ OCI layer applier unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-layer-apply
 	@printf "\n$(BLUE)━━━ OCI volume bootstrap unit tests ━━━$(RESET)\n"
@@ -127,6 +130,13 @@ test-oci-decompress: $(BUILD_DIR)/test-oci-decompress
 ## Run the OCI sidecar metadata unit tests (native, no HVF, no network)
 test-oci-meta: $(BUILD_DIR)/test-oci-meta
 	@$(BUILD_DIR)/test-oci-meta
+
+## Run the OCI origin sidecar unit tests (native, no HVF, no network).
+## Covers oci_origin_write + cJSON parse-back round-trips. Phase 3 sees
+## the file in unpacked image directories; Plan 1's root-set walker
+## consumes it to attribute layer blobs back to live sysroots.
+test-oci-origin: $(BUILD_DIR)/test-oci-origin
+	@$(BUILD_DIR)/test-oci-origin
 
 ## Run the OCI layer applier unit tests (native, no HVF, no network)
 test-oci-layer-apply: $(BUILD_DIR)/test-oci-layer-apply

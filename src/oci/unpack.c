@@ -22,6 +22,7 @@
 #include "oci/layer-meta.h"
 #include "oci/manifest.h"
 #include "oci/media-type.h"
+#include "oci/origin-meta.h"
 #include "oci/ref.h"
 #include "oci/store.h"
 #include "oci/tar.h"
@@ -461,6 +462,62 @@ int oci_unpack(oci_store_t *store,
         goto fail_stage_dir;
     }
     oci_meta_table_free(meta);
+
+    /* Read + parse the image-config blob so the origin sidecar can
+     * record the diff_ids the Plan 1 root-set walker needs. A missing
+     * origin file would let prune silently delete layer blobs still
+     * backing this unpacked tree, so any failure here aborts the
+     * commit.
+     */
+    {
+        uint8_t *cfg_body = NULL;
+        size_t cfg_len = 0;
+        if (read_blob(bs, manifest.config.algo, manifest.config.hex, &cfg_body,
+                      &cfg_len, err) < 0) {
+            free(image_hex);
+            oci_manifest_free(&manifest);
+            goto fail_stage_dir;
+        }
+        oci_image_config_t cfg = {0};
+        const char *cparse_err = NULL;
+        if (oci_image_config_parse((const char *) cfg_body, cfg_len, &cfg,
+                                   &cparse_err) < 0) {
+            set_err(err,
+                    cparse_err ? cparse_err
+                               : "unpack: image config parse failed",
+                    EINVAL);
+            free(cfg_body);
+            free(image_hex);
+            oci_manifest_free(&manifest);
+            goto fail_stage_dir;
+        }
+        free(cfg_body);
+
+        char manifest_full[OCI_DIGEST_HEX_MAX + 16];
+        if ((size_t) snprintf(manifest_full, sizeof(manifest_full), "sha256:%s",
+                              image_hex) >= sizeof(manifest_full)) {
+            oci_image_config_free(&cfg);
+            set_err(err, "unpack: manifest digest overflow", ENAMETOOLONG);
+            free(image_hex);
+            oci_manifest_free(&manifest);
+            goto fail_stage_dir;
+        }
+
+        const char *origin_err = NULL;
+        if (oci_origin_write(stage_dir, manifest_full,
+                             manifest.config.digest_str, cfg.rootfs_diff_ids,
+                             &origin_err) < 0) {
+            set_err(err,
+                    origin_err ? origin_err : "unpack: origin write failed",
+                    errno ? errno : EIO);
+            oci_image_config_free(&cfg);
+            free(image_hex);
+            oci_manifest_free(&manifest);
+            goto fail_stage_dir;
+        }
+        oci_image_config_free(&cfg);
+    }
+
     oci_manifest_free(&manifest);
 
     /* Atomic commit. */

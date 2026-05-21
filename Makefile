@@ -79,6 +79,7 @@ SRCS := \
     oci/decompress.c \
     oci/layer-meta.c \
     oci/layer-apply.c \
+    oci/origin-meta.c \
     oci/volume.c \
     oci/clone-rootfs.c \
     oci/unpack.c \
@@ -272,7 +273,7 @@ $(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD
 ## the test ships an in-file elfuse_launch stub that aborts when called,
 ## and every case installs a launch hook via oci_run_set_launch_for_testing
 ## before invoking oci_run, so the real VM bring-up never runs from a test.
-$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
@@ -294,6 +295,13 @@ $(BUILD_DIR)/oci/decompress.o: CFLAGS += -I$(ZSTD_DIR)/lib
 ## C; links against cJSON for the JSON round-trip plus the layer-meta
 ## translation unit.
 $(BUILD_DIR)/test-oci-meta: $(BUILD_DIR)/test-oci-meta.o $(BUILD_DIR)/oci/layer-meta.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI origin sidecar unit test (native macOS, no HVF). Drives
+## oci_origin_write against a tmpdir and verifies the resulting
+## .elfuse-origin.json by parsing it back through cJSON.
+$(BUILD_DIR)/test-oci-origin: $(BUILD_DIR)/test-oci-origin.o $(BUILD_DIR)/oci/origin-meta.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
@@ -321,7 +329,7 @@ $(BUILD_DIR)/test-oci-clone: $(BUILD_DIR)/test-oci-clone.o $(BUILD_DIR)/oci/clon
 ## Build the OCI unpack orchestrator integration smoke (native macOS,
 ## no HVF). Pulls in the full Phase 2 OCI stack so the dependency
 ## edges between modules are exercised at link time.
-$(BUILD_DIR)/test-oci-unpack: $(BUILD_DIR)/test-oci-unpack.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-unpack: $(BUILD_DIR)/test-oci-unpack.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
