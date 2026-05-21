@@ -53,6 +53,16 @@ int oci_ref_parse(const char *input, oci_ref_t *out, const char **err_msg);
  */
 char *oci_ref_canonical(const oci_ref_t *ref);
 
+/* Render the canonical pin-name form "registry/repository:tag" used as the
+ * value of the org.opencontainers.image.ref.name annotation in the store's
+ * index.json. The digest segment is intentionally dropped: pin entries are
+ * keyed by tag-name and the digest is stored separately in the descriptor.
+ * Returns NULL with errno=EINVAL when ref->tag is unset (digest-only refs
+ * are self-pinning and cannot be inserted into the pin table) or with
+ * errno=ENOMEM on allocation failure. The caller frees the result.
+ */
+char *oci_ref_canonical_name(const oci_ref_t *ref);
+
 /* Release any heap fields. Safe on a zero-initialised or partially populated
  * struct; resets all fields to NULL.
  */

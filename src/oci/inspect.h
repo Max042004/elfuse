@@ -11,7 +11,8 @@
  *
  * Manifest digest resolution order:
  *   1. ref->digest, when set (digest-pinned reference)
- *   2. Pin file <root>/refs/<registry>/<repository>/<tag>
+ *   2. Pin descriptor in <root>/index.json whose ref.name annotation matches
+ *      the canonical "<registry>/<repository>:<tag>" form
  *   3. Neither: print "(no local manifest...)" and return 0 (informational)
  *
  * Render policy:

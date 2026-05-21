@@ -223,8 +223,9 @@ $(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/lib/oci-
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
 
 ## Build the OCI local store unit test (native macOS, no HVF). Pure C; links
-## against the store wrapper plus its blob-store and digest dependencies.
-$(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/ref.o | $(BUILD_DIR)
+## against the store wrapper plus its blob-store, digest, and cJSON deps.
+## cJSON is required because store.c now reads / writes index.json.
+$(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

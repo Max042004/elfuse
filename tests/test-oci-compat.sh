@@ -125,12 +125,16 @@ else
     bad "fixture: oci-fixture-builder" "$(cat "${SCRATCH}/builder.err")"
 fi
 
-# Pin file must exist somewhere under refs/.
-pin_files=$(find "${STORE}/refs" -type f 2>/dev/null | wc -l | tr -d ' ')
-if [ "${pin_files}" -ge 1 ]; then
-    ok "fixture: ref pin written"
+# Pin must appear as a manifests[] entry in index.json. Use grep over the
+# raw bytes so the test stays portable (jq is not on the macOS default
+# install). The canonical ref-name annotation is what oci_store_put_ref
+# emits for local/scratch:v1.
+if [ -f "${STORE}/index.json" ] &&
+   grep -q '"org.opencontainers.image.ref.name"' "${STORE}/index.json" &&
+   grep -q 'docker.io/local/scratch:v1' "${STORE}/index.json"; then
+    ok "fixture: ref pin written to index.json"
 else
-    bad "fixture: ref pin" "no file under refs/"
+    bad "fixture: ref pin" "no matching ref.name annotation in index.json"
 fi
 
 # Blob count: layer + config + manifest = 3.

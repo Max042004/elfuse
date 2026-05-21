@@ -31,8 +31,10 @@
  *     computed diff_ids, then hashed and stored.
  *   - Manifest JSON references the config + every layer in order.
  *     Hashed and stored.
- *   - The ref pin is written to refs/<registry>/<repository>/<tag>
- *     pointing at the manifest digest.
+ *   - The ref pin is recorded in <root>/index.json as a manifests[]
+ *     descriptor whose org.opencontainers.image.ref.name annotation
+ *     carries the canonical "<registry>/<repository>:<tag>" form and
+ *     whose digest field points at the manifest digest.
  *
  * Exit codes:
  *   0  fixture built and pinned successfully

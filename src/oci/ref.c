@@ -14,6 +14,7 @@
 #include "ref.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -424,6 +425,34 @@ char *oci_ref_canonical(const oci_ref_t *ref)
         memcpy(p, ref->digest, dig_len);
         p += dig_len;
     }
+    *p = '\0';
+    return buf;
+}
+
+char *oci_ref_canonical_name(const oci_ref_t *ref)
+{
+    if (!ref || !ref->registry || !ref->repository || !ref->tag) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t reg_len = strlen(ref->registry);
+    size_t repo_len = strlen(ref->repository);
+    size_t tag_len = strlen(ref->tag);
+    size_t total = reg_len + 1 + repo_len + 1 + tag_len + 1;
+    char *buf = (char *) malloc(total);
+    if (!buf) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    char *p = buf;
+    memcpy(p, ref->registry, reg_len);
+    p += reg_len;
+    *p++ = '/';
+    memcpy(p, ref->repository, repo_len);
+    p += repo_len;
+    *p++ = ':';
+    memcpy(p, ref->tag, tag_len);
+    p += tag_len;
     *p = '\0';
     return buf;
 }
