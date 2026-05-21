@@ -242,6 +242,106 @@ else
     bad "prune-smoke: --commit disk" "got ${blob_after_commit} (want 3)"
 fi
 
+# ── C1.4 filter smoke (--older-than / --keep-bytes) ──────────────────
+
+# Stage two fresh dangling blobs and backdate one so --older-than 1d
+# distinguishes them. The fresh one must survive; the backdated one
+# must be reclaimed and counted in the skipped line that only renders
+# when at least one candidate was spared.
+mkdir -p "${SCRATCH}/c14"
+echo "filter-fresh" > "${SCRATCH}/c14/fresh"
+echo "filter-stale" > "${SCRATCH}/c14/stale"
+for f in "${SCRATCH}/c14/fresh" "${SCRATCH}/c14/stale"; do
+    if command -v shasum >/dev/null 2>&1; then
+        hex=$(shasum -a 256 "$f" | awk '{print $1}')
+    else
+        hex=$(sha256sum "$f" | awk '{print $1}')
+    fi
+    cp "$f" "${STORE}/blobs/sha256/${hex}"
+    case "${f}" in
+        *stale)
+            stale_hex="${hex}"
+            ;;
+        *fresh)
+            fresh_hex="${hex}"
+            ;;
+    esac
+done
+# touch -t accepts [[CC]YY]MMDDhhmm[.SS]; pick 1970-01-02 so the blob
+# is unambiguously older than any 1-day cutoff regardless of TZ.
+touch -t 197001020000 "${STORE}/blobs/sha256/${stale_hex}"
+
+older_out=$("${ELFUSE}" oci prune --store "${STORE}" --commit --older-than 1d 2>&1)
+rc=$?
+case "${older_out}" in
+    *"reclaimed: 1 blobs"*"skipped:"*"1 blobs"*)
+        if [ "${rc}" = 0 ]; then
+            ok "prune-smoke: --older-than reclaims stale, skips fresh"
+        else
+            bad "prune-smoke: --older-than" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "prune-smoke: --older-than output" "${older_out}"
+        ;;
+esac
+
+if [ ! -e "${STORE}/blobs/sha256/${stale_hex}" ] \
+   && [ -e "${STORE}/blobs/sha256/${fresh_hex}" ]; then
+    ok "prune-smoke: --older-than only the stale blob was unlinked"
+else
+    bad "prune-smoke: --older-than disk state" \
+        "stale=${stale_hex} fresh=${fresh_hex}"
+fi
+
+# --keep-bytes 0 must behave as no filter (the C1.4 spec): the fresh
+# blob that survived the previous step is dangling and gets reclaimed.
+keep_out=$("${ELFUSE}" oci prune --store "${STORE}" --commit --keep-bytes 0 2>&1)
+rc=$?
+case "${keep_out}" in
+    *"reclaimed: 1 blobs"*)
+        if [ "${rc}" = 0 ]; then
+            ok "prune-smoke: --keep-bytes 0 disables the budget filter"
+        else
+            bad "prune-smoke: --keep-bytes 0" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "prune-smoke: --keep-bytes 0 output" "${keep_out}"
+        ;;
+esac
+
+# Invalid duration -> non-zero exit, stderr describes the failure.
+bad_dur_out=$("${ELFUSE}" oci prune --store "${STORE}" --older-than foo 2>&1)
+rc=$?
+case "${bad_dur_out}" in
+    *"invalid duration"*)
+        if [ "${rc}" != 0 ]; then
+            ok "prune-smoke: invalid --older-than rejected"
+        else
+            bad "prune-smoke: invalid duration" "rc=${rc} (want non-zero)"
+        fi
+        ;;
+    *)
+        bad "prune-smoke: invalid duration message" "${bad_dur_out}"
+        ;;
+esac
+
+bad_size_out=$("${ELFUSE}" oci prune --store "${STORE}" --keep-bytes foo 2>&1)
+rc=$?
+case "${bad_size_out}" in
+    *"invalid byte size"*)
+        if [ "${rc}" != 0 ]; then
+            ok "prune-smoke: invalid --keep-bytes rejected"
+        else
+            bad "prune-smoke: invalid byte size" "rc=${rc} (want non-zero)"
+        fi
+        ;;
+    *)
+        bad "prune-smoke: invalid byte size message" "${bad_size_out}"
+        ;;
+esac
+
 # ── Heavy mode (full E2E launches) ───────────────────────────────────
 
 if [ -n "${OCI_COMPAT_TEST:-}" ]; then

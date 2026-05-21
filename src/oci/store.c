@@ -55,6 +55,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../../externals/cjson/cJSON.h"
@@ -1639,26 +1640,106 @@ static const oci_digest_algo_t PRUNE_ALGOS[] = {
     OCI_DIGEST_SHA512,
 };
 
-/* Sweep one blobs/<algo>/ directory. For every regular file whose name is
- * a valid lowercase hex digest of the right length, build the canonical
- * "<algo>:<hex>" digest string and consult the keep set; anything not in
- * the set is counted as pruned, and when commit is true also unlink()ed.
- * lstat ENOENT mid-walk is treated as a concurrent prune and counted
- * silently. Subdirectories and otherwise-shaped entries (tmp leftovers,
- * dotfiles, files with non-hex names) are skipped without surfacing as
- * errors because the OCI image-layout spec only blesses the regular-blob
- * shape; foreign state is not ours to delete.
- *
- * Returns 0 on success and -1 with errno preserved on an unrecoverable
- * IO failure (failed opendir other than ENOENT, failed unlink in commit
- * mode, etc).
+/* One dangling-blob entry produced by the classify phase and consumed
+ * by the apply phase. path is heap-owned. verdict starts at PRUNE and
+ * may be flipped to SKIP by the older-than veto or the keep-bytes
+ * budget. size is the on-disk byte count (st_size at classify time);
+ * mtime is st_mtime, used as the sort key for the LRU budget and the
+ * comparison source for the older-than cutoff.
  */
-static int sweep_algo_dir(oci_store_t *s,
-                          oci_digest_algo_t algo,
-                          const oci_digest_set_t *keep,
-                          bool commit,
-                          oci_store_prune_options_t *stats,
-                          const char **err)
+typedef enum {
+    PRUNE_VERDICT_PRUNE = 0,
+    PRUNE_VERDICT_SKIP = 1,
+} prune_verdict_t;
+
+typedef struct {
+    char *path;
+    uint64_t size;
+    time_t mtime;
+    prune_verdict_t verdict;
+} prune_candidate_t;
+
+typedef struct {
+    prune_candidate_t *items;
+    size_t count;
+    size_t cap;
+} prune_candidate_list_t;
+
+/* Append one dangling-blob entry. Doubles cap from 32 so the realloc
+ * cost amortizes across a typical store's tens-to-hundreds of blobs.
+ * On alloc failure returns -1 with errno=ENOMEM; the caller is
+ * responsible for cleaning up entries staged so far via
+ * prune_candidate_list_free.
+ */
+static int prune_candidate_list_append(prune_candidate_list_t *list,
+                                       char *path, uint64_t size, time_t mtime)
+{
+    if (list->count == list->cap) {
+        size_t new_cap = list->cap ? list->cap * 2 : 32;
+        prune_candidate_t *grown =
+            realloc(list->items, new_cap * sizeof(*grown));
+        if (!grown) {
+            errno = ENOMEM;
+            return -1;
+        }
+        list->items = grown;
+        list->cap = new_cap;
+    }
+    list->items[list->count].path = path;
+    list->items[list->count].size = size;
+    list->items[list->count].mtime = mtime;
+    list->items[list->count].verdict = PRUNE_VERDICT_PRUNE;
+    list->count++;
+    return 0;
+}
+
+static void prune_candidate_list_free(prune_candidate_list_t *list)
+{
+    if (!list)
+        return;
+    for (size_t i = 0; i < list->count; i++)
+        free(list->items[i].path);
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->cap = 0;
+}
+
+/* qsort comparator over an indirection array of candidate pointers
+ * (prune_candidate_t **). Sort key is ascending mtime with the path
+ * as tie-breaker so order stays deterministic on stores that
+ * materialize blobs in quick succession (the test suite needs
+ * stable LRU picks against a fixture).
+ */
+static int prune_candidate_ptr_cmp_mtime_asc(const void *a, const void *b)
+{
+    const prune_candidate_t *pa = *(const prune_candidate_t * const *) a;
+    const prune_candidate_t *pb = *(const prune_candidate_t * const *) b;
+    if (pa->mtime < pb->mtime)
+        return -1;
+    if (pa->mtime > pb->mtime)
+        return 1;
+    return strcmp(pa->path, pb->path);
+}
+
+/* Classify one blobs/<algo>/ directory. For every regular file whose
+ * name is a valid lowercase hex digest of the right length, build the
+ * canonical "<algo>:<hex>" digest, look it up in the keep set, and
+ * either bump kept_blobs (reachable) or append a candidate (dangling).
+ * lstat ENOENT mid-walk is treated as a concurrent prune and skipped
+ * silently. Subdirectories, dotfiles, and otherwise-shaped entries
+ * pass through untouched so the OCI image-layout spec's regular-blob
+ * convention is preserved without trampling foreign state.
+ *
+ * Returns 0 on success and -1 on unrecoverable IO failure with errno
+ * preserved.
+ */
+static int classify_algo_dir(oci_store_t *s,
+                             oci_digest_algo_t algo,
+                             const oci_digest_set_t *keep,
+                             oci_store_prune_options_t *stats,
+                             prune_candidate_list_t *list,
+                             const char **err)
 {
     const char *algo_name = oci_digest_algo_name(algo);
     if (!algo_name) {
@@ -1698,9 +1779,9 @@ static int sweep_algo_dir(oci_store_t *s,
         if (name[0] == '.')
             continue;
         /* Reject anything that is not the expected hex shape before
-         * paying for an lstat. This both filters subdirectories (whose
-         * names rarely happen to be 64 hex chars) and shields the
-         * digest_set lookup from non-blob filenames.
+         * paying for an lstat. This both filters subdirectories
+         * (whose names rarely happen to be 64 hex chars) and shields
+         * the digest_set lookup from non-blob filenames.
          */
         if (strlen(name) != hex_len)
             continue;
@@ -1730,10 +1811,6 @@ static int sweep_algo_dir(oci_store_t *s,
         if (!S_ISREG(st.st_mode))
             continue;
 
-        /* Canonical "<algo>:<hex>" for the keep-set lookup. The set
-         * stores digests in this form (see digest-set.h note about
-         * pre-validated input from oci_digest_parse).
-         */
         char digest[OCI_DIGEST_HEX_MAX + 16];
         int dn = snprintf(digest, sizeof(digest), "%s:%s", algo_name, name);
         if (dn < 0 || (size_t) dn >= sizeof(digest)) {
@@ -1749,28 +1826,138 @@ static int sweep_algo_dir(oci_store_t *s,
             continue;
         }
 
-        stats->pruned_blobs++;
-        stats->pruned_bytes += (uint64_t) st.st_size;
-
-        if (commit) {
-            if (unlink(blob_path) < 0) {
-                /* ENOENT here matches a concurrent prune in another
-                 * process: the count already moved, so the deletion is
-                 * effectively done. Anything else is fatal because
-                 * leaving a partial sweep would let the caller's stats
-                 * report bytes we did not actually reclaim.
-                 */
-                if (errno == ENOENT)
-                    continue;
-                if (err)
-                    *err = "prune: unlink on dangling blob failed";
-                rc = -1;
-                break;
-            }
+        char *path_copy = strdup(blob_path);
+        if (!path_copy) {
+            if (err)
+                *err = "prune: strdup blob path failed";
+            errno = ENOMEM;
+            rc = -1;
+            break;
+        }
+        if (prune_candidate_list_append(list, path_copy, (uint64_t) st.st_size,
+                                        st.st_mtime) < 0) {
+            free(path_copy);
+            if (err)
+                *err = "prune: candidate list grow failed";
+            rc = -1;
+            break;
         }
     }
     closedir(dp);
     return rc;
+}
+
+/* Apply the C1.4 filter passes to the candidate list. Both passes
+ * mutate verdict only; nothing is unlinked here. The caller invokes
+ * apply_verdicts afterwards to count + (when commit) unlink.
+ *
+ * older-than veto (B1) inspects each candidate independently: when
+ * older_than_sec is non-zero and (now - mtime) is less than the
+ * cutoff, verdict flips to SKIP. now is provided by the caller so a
+ * single time(NULL) snapshot drives the whole filter pass (avoids
+ * the boundary case where a candidate flips between PRUNE and SKIP
+ * across two sequential time(NULL) reads).
+ *
+ * keep-bytes budget (B2) operates over the candidates still in PRUNE
+ * state after B1. Their pointers are gathered, sorted by mtime
+ * ascending, and walked newest-first. The newest candidates whose
+ * cumulative size fits keep_bytes flip to SKIP; the first candidate
+ * that does not fit terminates the walk so any older candidate stays
+ * in PRUNE even if its own size would have fit alone. This matches
+ * LRU semantics: oldest evicted first, regardless of size.
+ */
+static int apply_filters(oci_store_prune_options_t *opts,
+                         prune_candidate_list_t *list,
+                         time_t now, const char **err)
+{
+    if (opts->older_than_sec > 0) {
+        time_t cutoff = (time_t) opts->older_than_sec;
+        for (size_t i = 0; i < list->count; i++) {
+            if (list->items[i].verdict != PRUNE_VERDICT_PRUNE)
+                continue;
+            time_t age = now - list->items[i].mtime;
+            if (age < cutoff)
+                list->items[i].verdict = PRUNE_VERDICT_SKIP;
+        }
+    }
+
+    if (opts->keep_bytes > 0 && list->count > 0) {
+        prune_candidate_t **active =
+            (prune_candidate_t **) malloc(list->count * sizeof(*active));
+        if (!active) {
+            if (err)
+                *err = "prune: out of memory ranking candidates";
+            errno = ENOMEM;
+            return -1;
+        }
+        size_t na = 0;
+        for (size_t i = 0; i < list->count; i++) {
+            if (list->items[i].verdict == PRUNE_VERDICT_PRUNE)
+                active[na++] = &list->items[i];
+        }
+        if (na > 0) {
+            /* Sort the active subset through an indirection array so
+             * the candidate-list iteration order in apply_verdicts
+             * stays in insertion order (the test suite is easier to
+             * reason about when path verdicts read in the same order
+             * the classify phase produced them).
+             */
+            qsort((void *) active, na, sizeof(*active),
+                  prune_candidate_ptr_cmp_mtime_asc);
+            uint64_t running = 0;
+            for (ssize_t i = (ssize_t) na - 1; i >= 0; i--) {
+                /* Use unsigned arithmetic with an overflow guard so a
+                 * pathological size never wraps the accumulator.
+                 */
+                uint64_t next = running + active[i]->size;
+                if (next < running) {
+                    /* Overflow: cannot fit any more blobs under the
+                     * budget, so stop reclassifying.
+                     */
+                    break;
+                }
+                if (next <= opts->keep_bytes) {
+                    active[i]->verdict = PRUNE_VERDICT_SKIP;
+                    running = next;
+                } else {
+                    break;
+                }
+            }
+        }
+        free((void *) active);
+    }
+    return 0;
+}
+
+/* Materialise filter verdicts onto disk and stats. Every candidate
+ * contributes to exactly one output bucket: SKIP -> skipped_*, PRUNE
+ * -> pruned_* (and unlink when commit). The unlink failure policy
+ * mirrors C1.3: ENOENT is treated as a concurrent prune and counted
+ * silently; any other unlink errno is fatal so the caller's stats
+ * never report bytes we did not actually reclaim.
+ */
+static int apply_verdicts(prune_candidate_list_t *list, bool commit,
+                          oci_store_prune_options_t *stats, const char **err)
+{
+    for (size_t i = 0; i < list->count; i++) {
+        if (list->items[i].verdict == PRUNE_VERDICT_SKIP) {
+            stats->skipped_blobs++;
+            stats->skipped_bytes += list->items[i].size;
+            continue;
+        }
+        stats->pruned_blobs++;
+        stats->pruned_bytes += list->items[i].size;
+        if (!commit)
+            continue;
+        if (unlink(list->items[i].path) < 0) {
+            if (errno == ENOENT)
+                continue;
+            if (err)
+                *err = "prune: unlink on dangling blob failed";
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int oci_store_prune(oci_store_t *s,
@@ -1791,6 +1978,8 @@ int oci_store_prune(oci_store_t *s,
     opts->kept_blobs = 0;
     opts->pruned_blobs = 0;
     opts->pruned_bytes = 0;
+    opts->skipped_blobs = 0;
+    opts->skipped_bytes = 0;
 
     /* Serialize against oci_store_put_ref so a pull cannot publish a
      * new pin between collect_roots and sweep. Mark and sweep both run
@@ -1808,15 +1997,32 @@ int oci_store_prune(oci_store_t *s,
         return -1;
     }
 
+    prune_candidate_list_t candidates = {0};
     int rc = 0;
     for (size_t i = 0; i < sizeof(PRUNE_ALGOS) / sizeof(PRUNE_ALGOS[0]); i++) {
-        if (sweep_algo_dir(s, PRUNE_ALGOS[i], &keep, opts->commit, opts, err) <
-            0) {
+        if (classify_algo_dir(s, PRUNE_ALGOS[i], &keep, opts, &candidates,
+                              err) < 0) {
             rc = -1;
-            break;
+            goto done;
         }
     }
+
+    /* Filters short-circuit when no candidates exist or when neither
+     * input flag is set; in either case verdicts stay PRUNE and the
+     * apply pass behaves exactly like the C1.3 sweep.
+     */
+    if (apply_filters(opts, &candidates, time(NULL), err) < 0) {
+        rc = -1;
+        goto done;
+    }
+    if (apply_verdicts(&candidates, opts->commit, opts, err) < 0) {
+        rc = -1;
+        goto done;
+    }
+
+done:;
     int saved = errno;
+    prune_candidate_list_free(&candidates);
     oci_digest_set_free(&keep);
     close(lock_fd);
     errno = saved;

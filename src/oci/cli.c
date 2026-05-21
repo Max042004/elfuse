@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +86,14 @@ static int print_usage(FILE *out)
         "roots\n"
         "  --commit              Actually unlink dangling blobs "
         "(default: dry-run)\n"
+        "  --older-than DUR      Skip dangling blobs younger than DUR\n"
+        "                        (suffixes: s, m, h, d, w; plain integer = "
+        "seconds;\n"
+        "                         0 = no filter)\n"
+        "  --keep-bytes SIZE     Keep up to SIZE bytes of newest dangling "
+        "blobs;\n"
+        "                        (suffixes: K, M, G; KiB-based; 0 = no "
+        "budget)\n"
         "\n"
         "Refs follow the docker/containerd grammar:\n"
         "  alpine, alpine:3.20, user/repo, ghcr.io/owner/img:tag,\n"
@@ -615,12 +624,146 @@ static int cmd_not_implemented(const char *name)
  * actually unlinks. --volume mirrors the same flag in unpack/clone so
  * the same volume root the user uses for unpacked sysroots also feeds
  * the keep-set walk; without --volume only pins contribute.
+ *
+ * older_than_sec / keep_bytes default to 0, which the store API
+ * interprets as "no filter" so an operator that does not opt in sees
+ * the C1.3 behaviour (every dangling blob is pruned). The CLI does
+ * not distinguish between "not specified" and "--older-than 0" /
+ * "--keep-bytes 0" because both compose to the same zero-filter
+ * behaviour; a future structured-output mode (Plan 4 oci status) can
+ * surface filter state from the rendered options struct directly.
  */
 typedef struct {
     const char *store_root;
     const char *volume_root;
     bool commit;
+    uint64_t older_than_sec;
+    uint64_t keep_bytes;
 } prune_args_t;
+
+/* Parse a duration string into seconds. Accepted shapes are
+ *   <n>            pure integer interpreted as seconds
+ *   <n>s           seconds
+ *   <n>m           minutes (60s)
+ *   <n>h           hours   (3600s)
+ *   <n>d           days    (86400s)
+ *   <n>w           weeks   (604800s)
+ * where <n> is a decimal unsigned integer with no sign character. The
+ * trailing suffix, when present, is a single ASCII letter; any other
+ * trailing bytes are rejected. Overflow is detected by checking the
+ * intermediate product against UINT64_MAX before applying it. Returns
+ * 0 on success with the value written to *out; -1 on any parse or
+ * overflow failure with errno=EINVAL.
+ */
+static int parse_duration(const char *s, uint64_t *out)
+{
+    if (!s || !*s) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* strtoull silently accepts a leading '-' and wraps the result;
+     * detect a negative sign and the leading-whitespace skip
+     * explicitly so a user-facing flag never quietly parses "-5d" as
+     * a huge positive duration.
+     */
+    if (*s == '-' || *s == '+' || *s == ' ' || *s == '\t') {
+        errno = EINVAL;
+        return -1;
+    }
+    char *endp = NULL;
+    errno = 0;
+    unsigned long long raw = strtoull(s, &endp, 10);
+    if (errno == ERANGE) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!endp || endp == s) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t value = (uint64_t) raw;
+    uint64_t multiplier = 1;
+    if (*endp != '\0') {
+        if (endp[1] != '\0') {
+            errno = EINVAL;
+            return -1;
+        }
+        switch (*endp) {
+        case 's': multiplier = 1; break;
+        case 'm': multiplier = 60; break;
+        case 'h': multiplier = 3600; break;
+        case 'd': multiplier = 86400; break;
+        case 'w': multiplier = 604800; break;
+        default:
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    if (multiplier != 0 && value > UINT64_MAX / multiplier) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out = value * multiplier;
+    return 0;
+}
+
+/* Parse a byte-size string into bytes. Accepted shapes are
+ *   <n>            pure integer interpreted as bytes
+ *   <n>K / <n>KB   1024 bytes per unit
+ *   <n>M / <n>MB   1024 * 1024 bytes per unit
+ *   <n>G / <n>GB   1024 * 1024 * 1024 bytes per unit
+ * matching du / df conventions (KiB-based, not decimal). The
+ * trailing suffix is at most two letters, case-sensitive, and the
+ * second letter when present must be 'B'. Negative inputs and
+ * arithmetic overflow are rejected with EINVAL; on success returns 0
+ * and stores the byte count in *out.
+ */
+static int parse_byte_size(const char *s, uint64_t *out)
+{
+    if (!s || !*s) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (*s == '-' || *s == '+' || *s == ' ' || *s == '\t') {
+        errno = EINVAL;
+        return -1;
+    }
+    char *endp = NULL;
+    errno = 0;
+    unsigned long long raw = strtoull(s, &endp, 10);
+    if (errno == ERANGE) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!endp || endp == s) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint64_t value = (uint64_t) raw;
+    uint64_t multiplier = 1;
+    if (*endp != '\0') {
+        char unit = *endp;
+        char trailer = endp[1];
+        if (trailer != '\0' && (trailer != 'B' || endp[2] != '\0')) {
+            errno = EINVAL;
+            return -1;
+        }
+        switch (unit) {
+        case 'K': multiplier = 1024ULL; break;
+        case 'M': multiplier = 1024ULL * 1024ULL; break;
+        case 'G': multiplier = 1024ULL * 1024ULL * 1024ULL; break;
+        default:
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    if (multiplier != 0 && value > UINT64_MAX / multiplier) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out = value * multiplier;
+    return 0;
+}
 
 static int parse_prune_args(int argc, char **argv, prune_args_t *out)
 {
@@ -649,6 +792,28 @@ static int parse_prune_args(int argc, char **argv, prune_args_t *out)
                 return -1;
             }
             out->volume_root = argv[i];
+        } else if (!strcmp(a, "--older-than")) {
+            if (++i >= argc) {
+                fputs("error: --older-than needs an argument\n", stderr);
+                return -1;
+            }
+            if (parse_duration(argv[i], &out->older_than_sec) < 0) {
+                fprintf(stderr,
+                        "error: --older-than: invalid duration '%s'\n",
+                        argv[i]);
+                return -1;
+            }
+        } else if (!strcmp(a, "--keep-bytes")) {
+            if (++i >= argc) {
+                fputs("error: --keep-bytes needs an argument\n", stderr);
+                return -1;
+            }
+            if (parse_byte_size(argv[i], &out->keep_bytes) < 0) {
+                fprintf(stderr,
+                        "error: --keep-bytes: invalid byte size '%s'\n",
+                        argv[i]);
+                return -1;
+            }
         } else {
             fprintf(stderr, "error: unknown prune option: %s\n", a);
             return -1;
@@ -695,6 +860,8 @@ static int cmd_prune(int argc, char **argv)
     oci_store_prune_options_t opts = {
         .commit = args.commit,
         .volume_root = args.volume_root,
+        .older_than_sec = args.older_than_sec,
+        .keep_bytes = args.keep_bytes,
     };
     const char *err = NULL;
     int rc = oci_store_prune(store, &opts, &err);
@@ -709,10 +876,16 @@ static int cmd_prune(int argc, char **argv)
     if (args.commit) {
         printf("reclaimed: %zu blobs (%llu bytes)\n", opts.pruned_blobs,
                (unsigned long long) opts.pruned_bytes);
+        if (opts.skipped_blobs > 0)
+            printf("skipped:   %zu blobs (%llu bytes)\n", opts.skipped_blobs,
+                   (unsigned long long) opts.skipped_bytes);
         printf("kept:      %zu blobs\n", opts.kept_blobs);
     } else {
         printf("reclaimable: %zu blobs (%llu bytes)\n", opts.pruned_blobs,
                (unsigned long long) opts.pruned_bytes);
+        if (opts.skipped_blobs > 0)
+            printf("skipped:     %zu blobs (%llu bytes)\n", opts.skipped_blobs,
+                   (unsigned long long) opts.skipped_bytes);
         printf("kept:        %zu blobs\n", opts.kept_blobs);
         printf("(dry-run; pass --commit to delete)\n");
     }

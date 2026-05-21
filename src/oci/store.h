@@ -206,16 +206,44 @@ int oci_store_collect_roots(oci_store_t *s,
 /* Options + stats for oci_store_prune. Output fields are filled
  * regardless of dry-run vs commit so callers can render a uniform
  * report from the same struct.
+ *
+ * older_than_sec and keep_bytes shape which dangling blobs survive
+ * the sweep. Both default to 0 with the documented meaning of "no
+ * filter" so the C1.3 behaviour (every dangling blob is pruned) is
+ * preserved when the caller does not opt in.
+ *
+ *   older_than_sec > 0 vetoes per-blob: a dangling blob whose mtime
+ *   is younger than (now - older_than_sec) is reported in
+ *   skipped_blobs / skipped_bytes and left on disk. This is the
+ *   grace window for a half-completed pull whose blob has been
+ *   committed but whose put_ref has not landed yet.
+ *
+ *   keep_bytes > 0 enforces a global LRU budget over the candidates
+ *   that survive the older-than veto: candidates are sorted by mtime
+ *   ascending and walked newest-first, the newest blobs whose
+ *   cumulative size fits under keep_bytes are reclassified as
+ *   skipped, the rest stay pruned. A single candidate that does not
+ *   fit the budget terminates the keep walk so older candidates are
+ *   always evicted first even when an older blob would fit alone.
+ *
+ * The two filters compose by running older-than first and keep-bytes
+ * second: a transient just-pulled blob never enters the LRU budget
+ * computation so the grace window holds. skipped_blobs counts the
+ * union of both filter outcomes.
  */
 typedef struct {
     /* Inputs */
     bool commit;             /* false (default) = dry-run; true = unlink */
     const char *volume_root; /* NULL = pin-only walk (see collect_roots) */
+    uint64_t older_than_sec; /* 0 = no mtime filter */
+    uint64_t keep_bytes;     /* 0 = no size budget (no filter) */
 
     /* Outputs */
     size_t kept_blobs;
     size_t pruned_blobs;
     uint64_t pruned_bytes;
+    size_t skipped_blobs;   /* dangling but spared by older_than_sec or keep_bytes */
+    uint64_t skipped_bytes; /* sum of st_size for skipped_blobs */
 } oci_store_prune_options_t;
 
 /* Garbage-collect dangling blobs from <root>/blobs/<algo>/. The mark
@@ -237,13 +265,22 @@ typedef struct {
  * yet (and the corresponding blob commit either has not happened or
  * is treated as a transient resource the caller will re-fetch).
  *
- * On entry opts->kept_blobs / pruned_blobs / pruned_bytes are reset
- * to zero so the caller does not have to memset between invocations.
- * Subdirectories under blobs/<algo>/ and files whose names are not
- * valid lowercase hex for that algorithm are skipped without
- * surfacing as errors (the directory is part of the OCI image-layout
- * spec only for regular blob files; anything else is treated as
- * foreign state we must not touch).
+ * On entry opts->kept_blobs / pruned_blobs / pruned_bytes /
+ * skipped_blobs / skipped_bytes are reset to zero so the caller does
+ * not have to memset between invocations. Subdirectories under
+ * blobs/<algo>/ and files whose names are not valid lowercase hex for
+ * that algorithm are skipped without surfacing as errors (the
+ * directory is part of the OCI image-layout spec only for regular
+ * blob files; anything else is treated as foreign state we must not
+ * touch).
+ *
+ * When opts->older_than_sec or opts->keep_bytes is set, the sweep
+ * gathers dangling-blob candidates first and then applies the
+ * filters (older-than veto, then keep-bytes LRU budget) before any
+ * unlink. Candidates spared by either filter contribute to
+ * skipped_blobs / skipped_bytes rather than pruned_blobs /
+ * pruned_bytes so the caller can render a three-way kept/pruned/
+ * skipped split.
  *
  * Returns 0 on success and -1 on failure with errno preserved and
  * *err (when non-NULL) populated. Mark-phase failure is fatal and

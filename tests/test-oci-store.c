@@ -37,6 +37,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../externals/cjson/cJSON.h"
@@ -2836,6 +2838,473 @@ static void test_prune_decoy_subdir_ignored(const char *scratch)
     report_pass("prune_decoy_subdir_ignored");
 }
 
+/* ── C1.4 oci_store_prune filter tests ─────────────────────────────── */
+
+/* Adjust the on-disk mtime of a finalized blob to want_epoch. The
+ * C1.4 filters (older-than veto, keep-bytes LRU) sort by mtime, so
+ * staging tests need to drive that field deterministically rather
+ * than relying on wall-clock blob commit times. atime is set to
+ * match modtime so utimes does not bump it asymmetrically.
+ */
+static bool set_blob_mtime(const char *root, const char *digest_str,
+                           time_t want_epoch)
+{
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(digest_str, &algo, hex))
+        return false;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+    struct timeval times[2];
+    times[0].tv_sec = want_epoch;
+    times[0].tv_usec = 0;
+    times[1].tv_sec = want_epoch;
+    times[1].tv_usec = 0;
+    return utimes(path, times) == 0;
+}
+
+/* Stage one dangling blob whose body contains tag so the hash is
+ * unique per call site, then backdate its mtime by seconds_ago.
+ * out_digest receives the canonical "<algo>:<hex>" digest.
+ */
+static bool stage_dated_dangling(oci_blob_store_t *blobs, const char *root,
+                                 const char *tag, time_t seconds_ago,
+                                 char *out_digest, size_t cap)
+{
+    if (!stage_dangling(blobs, tag, out_digest, cap))
+        return false;
+    time_t now = time(NULL);
+    return set_blob_mtime(root, out_digest, now - seconds_ago);
+}
+
+static void test_prune_older_than_grace_window(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-older-than", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_older_than_grace_window", "open failed");
+        return;
+    }
+    char fresh_a[OCI_DIGEST_HEX_MAX + 16];
+    char fresh_b[OCI_DIGEST_HEX_MAX + 16];
+    char stale[OCI_DIGEST_HEX_MAX + 16];
+    /* 1 hour ago => well below the 7-day cutoff. 8 days ago => well
+     * above. Tagged payloads keep the three digests distinct.
+     */
+    if (!stage_dated_dangling(oci_store_blobs(s), root, "older-fresh-a",
+                              3600, fresh_a, sizeof(fresh_a)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "older-fresh-b",
+                              3600, fresh_b, sizeof(fresh_b)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "older-stale",
+                              8 * 86400, stale, sizeof(stale))) {
+        report_fail("prune_older_than_grace_window", "stage failed");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .older_than_sec = 7 * 86400,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail("prune_older_than_grace_window",
+                    err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 1 || opts.skipped_blobs != 2 ||
+        opts.kept_blobs != 0) {
+        report_fail("prune_older_than_grace_window",
+                    "stats mismatch (want pruned=1 skipped=2 kept=0)");
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 2) {
+        report_fail("prune_older_than_grace_window",
+                    "expected 2 fresh blobs to survive on disk");
+        oci_store_close(s);
+        return;
+    }
+    /* Spot check: the stale blob is the one that was unlinked. */
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(stale, &algo, hex)) {
+        report_fail("prune_older_than_grace_window", "digest parse");
+        oci_store_close(s);
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        report_fail("prune_older_than_grace_window",
+                    "stale blob survived despite older-than cutoff");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_older_than_grace_window");
+}
+
+static void test_prune_older_than_zero_disables(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-older-zero", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_older_than_zero_disables", "open failed");
+        return;
+    }
+    char d1[OCI_DIGEST_HEX_MAX + 16];
+    char d2[OCI_DIGEST_HEX_MAX + 16];
+    char d3[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dated_dangling(oci_store_blobs(s), root, "zero-a", 3600, d1,
+                              sizeof(d1)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "zero-b", 3600, d2,
+                              sizeof(d2)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "zero-c",
+                              8 * 86400, d3, sizeof(d3))) {
+        report_fail("prune_older_than_zero_disables", "stage failed");
+        oci_store_close(s);
+        return;
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .older_than_sec = 0,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail("prune_older_than_zero_disables",
+                    err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 3 || opts.skipped_blobs != 0) {
+        report_fail("prune_older_than_zero_disables",
+                    "stats mismatch (want pruned=3 skipped=0)");
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 0) {
+        report_fail("prune_older_than_zero_disables",
+                    "blobs survived despite zero-filter");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_older_than_zero_disables");
+}
+
+static void test_prune_keep_bytes_evicts_oldest_first(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-keep-bytes", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_keep_bytes_evicts_oldest_first", "open failed");
+        return;
+    }
+    /* Four blobs with strictly ascending mtimes (t1 < t2 < t3 < t4).
+     * Tag-suffixed payloads keep digests distinct; sizes do not need
+     * to match because keep-bytes is in bytes, not blob count, and
+     * the test just asserts which digests survive.
+     */
+    char d1[OCI_DIGEST_HEX_MAX + 16];
+    char d2[OCI_DIGEST_HEX_MAX + 16];
+    char d3[OCI_DIGEST_HEX_MAX + 16];
+    char d4[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dated_dangling(oci_store_blobs(s), root, "kb-t1", 4000, d1,
+                              sizeof(d1)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "kb-t2", 3000, d2,
+                              sizeof(d2)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "kb-t3", 2000, d3,
+                              sizeof(d3)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "kb-t4", 1000, d4,
+                              sizeof(d4))) {
+        report_fail("prune_keep_bytes_evicts_oldest_first", "stage failed");
+        oci_store_close(s);
+        return;
+    }
+    /* Measure d3 + d4's combined on-disk size and set the budget to
+     * exactly that so the newest two fit and the oldest two evict.
+     */
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    uint64_t budget = 0;
+    const char *newest[2] = {d3, d4};
+    for (int i = 0; i < 2; i++) {
+        if (!oci_digest_parse(newest[i], &algo, hex)) {
+            report_fail("prune_keep_bytes_evicts_oldest_first",
+                        "digest parse");
+            oci_store_close(s);
+            return;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+        struct stat st;
+        if (lstat(path, &st) != 0) {
+            report_fail("prune_keep_bytes_evicts_oldest_first", "lstat");
+            oci_store_close(s);
+            return;
+        }
+        budget += (uint64_t) st.st_size;
+    }
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .keep_bytes = budget,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail("prune_keep_bytes_evicts_oldest_first",
+                    err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 2 || opts.skipped_blobs != 2 ||
+        opts.kept_blobs != 0) {
+        report_fail("prune_keep_bytes_evicts_oldest_first",
+                    "stats mismatch (want pruned=2 skipped=2 kept=0)");
+        oci_store_close(s);
+        return;
+    }
+    /* d3 and d4 (newest) must survive; d1 and d2 (oldest) must be gone. */
+    const char *survive[2] = {d3, d4};
+    const char *evict[2] = {d1, d2};
+    for (int i = 0; i < 2; i++) {
+        if (!oci_digest_parse(survive[i], &algo, hex)) {
+            report_fail("prune_keep_bytes_evicts_oldest_first", "parse");
+            oci_store_close(s);
+            return;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+        struct stat st;
+        if (lstat(path, &st) != 0) {
+            report_fail("prune_keep_bytes_evicts_oldest_first",
+                        "newest evicted");
+            oci_store_close(s);
+            return;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (!oci_digest_parse(evict[i], &algo, hex)) {
+            report_fail("prune_keep_bytes_evicts_oldest_first", "parse");
+            oci_store_close(s);
+            return;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            report_fail("prune_keep_bytes_evicts_oldest_first",
+                        "oldest survived");
+            oci_store_close(s);
+            return;
+        }
+    }
+    oci_store_close(s);
+    report_pass("prune_keep_bytes_evicts_oldest_first");
+}
+
+static void test_prune_keep_bytes_zero_is_unlimited(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-keep-zero", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_keep_bytes_zero_is_unlimited", "open failed");
+        return;
+    }
+    char d1[OCI_DIGEST_HEX_MAX + 16];
+    char d2[OCI_DIGEST_HEX_MAX + 16];
+    char d3[OCI_DIGEST_HEX_MAX + 16];
+    char d4[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dated_dangling(oci_store_blobs(s), root, "kz-a", 4000, d1,
+                              sizeof(d1)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "kz-b", 3000, d2,
+                              sizeof(d2)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "kz-c", 2000, d3,
+                              sizeof(d3)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "kz-d", 1000, d4,
+                              sizeof(d4))) {
+        report_fail("prune_keep_bytes_zero_is_unlimited", "stage failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .keep_bytes = 0,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail("prune_keep_bytes_zero_is_unlimited",
+                    err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 4 || opts.skipped_blobs != 0) {
+        report_fail("prune_keep_bytes_zero_is_unlimited",
+                    "stats mismatch (want pruned=4 skipped=0)");
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 0) {
+        report_fail("prune_keep_bytes_zero_is_unlimited",
+                    "blobs survived despite zero-budget");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_keep_bytes_zero_is_unlimited");
+}
+
+static void test_prune_combined_older_then_budget(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-combined", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_combined_older_then_budget", "open failed");
+        return;
+    }
+    /* Three fresh (1 hour ago) plus two expired (10 days, 8 days
+     * ago). older-than 7d skips all three fresh blobs. The remaining
+     * two expired candidates feed keep-bytes; budget = newest-
+     * expired's size so the newer-expired survives and the older-
+     * expired alone gets pruned.
+     */
+    char fresh_a[OCI_DIGEST_HEX_MAX + 16];
+    char fresh_b[OCI_DIGEST_HEX_MAX + 16];
+    char fresh_c[OCI_DIGEST_HEX_MAX + 16];
+    char old_newer[OCI_DIGEST_HEX_MAX + 16];
+    char old_older[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dated_dangling(oci_store_blobs(s), root, "cmb-fresh-a", 3600,
+                              fresh_a, sizeof(fresh_a)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "cmb-fresh-b", 3600,
+                              fresh_b, sizeof(fresh_b)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "cmb-fresh-c", 3600,
+                              fresh_c, sizeof(fresh_c)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "cmb-old-newer",
+                              8 * 86400, old_newer, sizeof(old_newer)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "cmb-old-older",
+                              10 * 86400, old_older, sizeof(old_older))) {
+        report_fail("prune_combined_older_then_budget", "stage failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(old_newer, &algo, hex)) {
+        report_fail("prune_combined_older_then_budget", "digest parse");
+        oci_store_close(s);
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        report_fail("prune_combined_older_then_budget", "lstat newer-expired");
+        oci_store_close(s);
+        return;
+    }
+    uint64_t budget = (uint64_t) st.st_size;
+
+    oci_store_prune_options_t opts = {
+        .commit = true,
+        .older_than_sec = 7 * 86400,
+        .keep_bytes = budget,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail("prune_combined_older_then_budget",
+                    err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 1 || opts.skipped_blobs != 4 ||
+        opts.kept_blobs != 0) {
+        report_fail("prune_combined_older_then_budget",
+                    "stats mismatch (want pruned=1 skipped=4 kept=0)");
+        oci_store_close(s);
+        return;
+    }
+    /* old_older must be gone; the other four (fresh + old_newer) survive. */
+    if (!oci_digest_parse(old_older, &algo, hex)) {
+        report_fail("prune_combined_older_then_budget", "parse old_older");
+        oci_store_close(s);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/blobs/sha256/%s", root, hex);
+    if (lstat(path, &st) == 0) {
+        report_fail("prune_combined_older_then_budget",
+                    "oldest expired survived");
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 4) {
+        report_fail("prune_combined_older_then_budget",
+                    "expected 4 blobs to survive on disk");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_combined_older_then_budget");
+}
+
+static void test_prune_dry_run_with_filters_no_disk_touch(const char *scratch)
+{
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/case-prune-dry-filters", scratch);
+    oci_store_t *s = oci_store_open(root);
+    if (!s) {
+        report_fail("prune_dry_run_with_filters_no_disk_touch", "open failed");
+        return;
+    }
+    char fresh_a[OCI_DIGEST_HEX_MAX + 16];
+    char fresh_b[OCI_DIGEST_HEX_MAX + 16];
+    char stale[OCI_DIGEST_HEX_MAX + 16];
+    if (!stage_dated_dangling(oci_store_blobs(s), root, "dryf-a", 3600,
+                              fresh_a, sizeof(fresh_a)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "dryf-b", 3600,
+                              fresh_b, sizeof(fresh_b)) ||
+        !stage_dated_dangling(oci_store_blobs(s), root, "dryf-stale",
+                              8 * 86400, stale, sizeof(stale))) {
+        report_fail("prune_dry_run_with_filters_no_disk_touch",
+                    "stage failed");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_prune_options_t opts = {
+        .commit = false,
+        .older_than_sec = 7 * 86400,
+    };
+    const char *err = NULL;
+    if (oci_store_prune(s, &opts, &err) < 0) {
+        report_fail("prune_dry_run_with_filters_no_disk_touch",
+                    err ? err : "prune failed");
+        oci_store_close(s);
+        return;
+    }
+    if (opts.pruned_blobs != 1 || opts.skipped_blobs != 2) {
+        report_fail("prune_dry_run_with_filters_no_disk_touch",
+                    "stats mismatch (want pruned=1 skipped=2)");
+        oci_store_close(s);
+        return;
+    }
+    if (count_sha256_blobs(root) != 3) {
+        report_fail("prune_dry_run_with_filters_no_disk_touch",
+                    "dry-run touched the disk");
+        oci_store_close(s);
+        return;
+    }
+    oci_store_close(s);
+    report_pass("prune_dry_run_with_filters_no_disk_touch");
+}
+
 static void test_prune_invalid_args_rejected(const char *scratch)
 {
     (void) scratch;
@@ -2907,6 +3376,12 @@ int main(void)
     test_prune_idempotent(scratch);
     test_prune_decoy_subdir_ignored(scratch);
     test_prune_invalid_args_rejected(scratch);
+    test_prune_older_than_grace_window(scratch);
+    test_prune_older_than_zero_disables(scratch);
+    test_prune_keep_bytes_evicts_oldest_first(scratch);
+    test_prune_keep_bytes_zero_is_unlimited(scratch);
+    test_prune_combined_older_then_budget(scratch);
+    test_prune_dry_run_with_filters_no_disk_touch(scratch);
 
     wipe_dir(scratch);
     free(scratch);
