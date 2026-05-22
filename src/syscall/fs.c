@@ -93,13 +93,19 @@ static const char *proc_stateful_file_path(const char *path)
 
 static void fd_note_proc_path(int guest_fd, const char *path)
 {
-    if (!path || strncmp(path, "/proc", 5) != 0)
+    if (!path)
         return;
 
+    const char *virt = NULL;
     char virt_buf[64];
-    const char *virt = proc_virtual_dir_path(path, virt_buf, sizeof(virt_buf));
-    if (!virt)
-        virt = proc_stateful_file_path(path);
+
+    if (strncmp(path, "/proc", 5) == 0) {
+        virt = proc_virtual_dir_path(path, virt_buf, sizeof(virt_buf));
+        if (!virt)
+            virt = proc_stateful_file_path(path);
+    } else if (strncmp(path, "/dev", 4) == 0) {
+        virt = proc_dev_special_path(path);
+    }
 
     if (virt)
         str_copy_trunc(fd_table[guest_fd].proc_path, virt,

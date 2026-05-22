@@ -86,3 +86,12 @@ const char *proc_get_shm_dir(void);
 int proc_dev_shm_resolve(const char *guest_suffix,
                          char *host_path,
                          size_t host_path_sz);
+
+/* Returns the canonical proc_path tag for runtime-emulated /dev paths
+ * whose write semantics require FD-level dispatch (currently /dev/full,
+ * which must answer ENOSPC for any non-zero write), or NULL when the
+ * path needs no special tagging. Callers store the tag in
+ * fd_entry_t.proc_path so proc_intercept_write can recognise the FD on
+ * later writes.
+ */
+const char *proc_dev_special_path(const char *path);

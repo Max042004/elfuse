@@ -1443,6 +1443,25 @@ int proc_intercept_open(const guest_t *g,
             host_accmode = O_RDWR;
     } else if (!strcmp(path, "/dev/tty"))
         host_dev = "/dev/tty";
+    else if (!strcmp(path, "/dev/full")) {
+        /* Linux /dev/full read returns a NUL stream like /dev/zero, while
+         * any non-zero write must fail with ENOSPC. Back the FD with host
+         * /dev/zero so read and lseek work without extra plumbing; the
+         * proc_path tag set by fd_note_proc_path() routes writes through
+         * proc_intercept_write below for the ENOSPC short-circuit.
+         */
+        host_dev = "/dev/zero";
+        if (host_accmode == O_WRONLY)
+            host_accmode = O_RDWR;
+    } else if (!strcmp(path, "/dev/console")) {
+        /* macOS /dev/console is reserved for the kernel and non-root
+         * processes cannot open it. Container runtimes synthesise the
+         * guest /dev/console from the controlling tty; mirror that by
+         * redirecting to host /dev/tty so guest writes reach the
+         * controlling terminal when one exists.
+         */
+        host_dev = "/dev/tty";
+    }
 
     if (host_dev) {
         /* Restrict to access mode plus descriptor flags. Creation/truncation
@@ -2712,6 +2731,20 @@ int proc_intercept_readv(int guest_fd,
     return 1;
 }
 
+const char *proc_dev_special_path(const char *path)
+{
+    /* /dev/full is the only runtime-emulated /dev node that needs a
+     * post-open proc_path tag right now: read/lseek borrow host
+     * /dev/zero behaviour, but every non-zero write must fail with
+     * ENOSPC, and proc_intercept_write keys that off the tag below.
+     * Other /dev nodes (null, zero, random, urandom, tty, console) use
+     * the host device directly and need no FD-level dispatch.
+     */
+    if (path && !strcmp(path, "/dev/full"))
+        return "/dev/full";
+    return NULL;
+}
+
 int proc_intercept_write(int guest_fd,
                          int host_fd,
                          const void *buf,
@@ -2723,6 +2756,20 @@ int proc_intercept_write(int guest_fd,
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))
         return 0;
+
+    /* /dev/full: any non-zero write must fail with ENOSPC. The POSIX
+     * zero-length write rule (return 0 with no side effect) still
+     * applies and short-circuits before the device error.
+     */
+    if (!strcmp(snap.proc_path, "/dev/full")) {
+        if (count == 0) {
+            *written_out = 0;
+            return 1;
+        }
+        errno = ENOSPC;
+        return -1;
+    }
+
     int kind = proc_oom_path_kind(snap.proc_path);
     if (kind == OOM_PATH_SCORE) {
         /* Linux: oom_score has no write handler. proc_reg_write returns
