@@ -49,6 +49,15 @@ typedef struct {
      * (empty body, ETag echoed).
      */
     char if_none_match[256];
+    /* HTTP Range request parsed from "Range: bytes=<start>-[<end>]". When
+     * has_range is true the start byte is in range_start; range_end is the
+     * inclusive end byte, or -1 for an open-ended request. Handlers use
+     * this to decide 206 Partial Content vs 200 OK. Set by parse_request;
+     * unaffected by other captured headers.
+     */
+    long range_start;
+    long range_end;
+    bool has_range;
 } oci_mock_request_t;
 
 #define OCI_MOCK_LOG_MAX 16
@@ -70,6 +79,18 @@ struct oci_mock_server {
     void *ctx;
     SSL_CTX *ssl_ctx;
     char ca_pem_path[256];
+    /* Per-connection sleep applied before the handler runs. Lets parallel
+     * test cases scope a controllable per-request latency so the C5.1
+     * curl_multi wall-time assertion can compare serial vs parallel pulls
+     * with reproducible numbers. Default 0 = no delay.
+     */
+    int response_delay_ms;
+    /* Live connection counter: each worker bumps it on entry and decrements
+     * on exit so concurrency-cap tests can observe the running watermark.
+     * Reset to 0 by oci_mock_set_handler.
+     */
+    int in_flight;
+    int in_flight_max;
 };
 
 /* Start the mock server. scratch_root is a writable directory used as the
@@ -95,6 +116,17 @@ void oci_mock_set_handler(oci_mock_server_t *s, oci_mock_handler_t h,
  * requests but the count is clamped to the log capacity.
  */
 int oci_mock_request_count(oci_mock_server_t *s);
+
+/* Pause each accepted connection by ms milliseconds before invoking the
+ * handler. Lets parallel tests amplify the per-request latency so the
+ * curl_multi wall-time speedup is reproducible.
+ */
+void oci_mock_set_response_delay_ms(oci_mock_server_t *s, int ms);
+
+/* Peek at the high-water mark of in-flight connections since the last
+ * oci_mock_set_handler. Drives the C5.1 concurrency-cap assertion.
+ */
+int oci_mock_in_flight_max(oci_mock_server_t *s);
 
 /* Per-connection ctx accessor used by handlers. Equivalent to s->ctx but
  * documents the intent in handler bodies.

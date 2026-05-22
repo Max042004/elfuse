@@ -68,6 +68,18 @@ oci_blob_writer_t *oci_blob_writer_begin(oci_blob_store_t *s,
                                          oci_digest_algo_t algo,
                                          const char *expected_hex);
 
+/* Same contract as oci_blob_writer_begin but stages into
+ * tmp/blob-<hex prefix 16>-XXXXXX. The digest prefix in the filename lets
+ * parallel batch callers find their in-flight partials by digest (used by
+ * the curl_multi pull path's resume + sweep, plan-doc Plan 5). Both writer
+ * entry points produce final blobs at the same blobs/<algo>/<hex> path and
+ * are otherwise interchangeable; pickers can choose based on whether they
+ * need digest-keyed staging.
+ */
+oci_blob_writer_t *oci_blob_writer_begin_named(oci_blob_store_t *s,
+                                               oci_digest_algo_t algo,
+                                               const char *expected_hex);
+
 /* Append data to the staging file and the running digest. Returns true on
  * success or false on a short write / I/O error with errno preserved. On
  * failure the writer is left in a state where the only valid next call is

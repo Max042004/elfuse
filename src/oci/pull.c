@@ -467,31 +467,59 @@ int oci_pull(oci_fetcher_t *fetcher,
         goto out;
     }
 
-    /* 4. Fetch config blob. */
-    bool config_cached = oci_blob_store_has(oci_store_blobs(store),
-                                            manifest.config.algo,
-                                            manifest.config.hex);
-    if (oci_fetch_blob(fetcher, ref, &manifest.config, oci_store_blobs(store),
-                       err_msg) < 0) {
-        goto out;
-    }
-    progress_line(progress, "config", manifest.config.digest_str,
-                  manifest.config.size,
-                  config_cached ? "cached" : "downloaded",
-                  oci_media_type_name(manifest.config.media_type));
-
-    /* 5. Fetch each layer blob in manifest order. */
-    for (size_t i = 0; i < manifest.nlayers; i++) {
-        const oci_descriptor_t *layer = &manifest.layers[i];
-        bool cached = oci_blob_store_has(oci_store_blobs(store), layer->algo,
-                                         layer->hex);
-        if (oci_fetch_blob(fetcher, ref, layer, oci_store_blobs(store),
-                           err_msg) < 0) {
+    /* 4+5. Fetch config + every layer blob in parallel via the batch fetcher
+     * (oci-improvements-plan Plan 5 C5.1). The progress lines below are
+     * still per-blob and still preserve the cached/downloaded annotation,
+     * so the store-has lookup is captured before the batch call hides the
+     * transfer / cache decision behind the multi event loop. The batch is
+     * atomic: any blob fail aborts every writer and the function bails.
+     */
+    {
+        bool batch_ok = false;
+        size_t batch_n = 1 + manifest.nlayers;
+        const oci_descriptor_t **batch_descs =
+            calloc(batch_n, sizeof(*batch_descs));
+        bool *cached = calloc(batch_n, sizeof(*cached));
+        if (!batch_descs || !cached) {
+            free(batch_descs);
+            free(cached);
+            if (err_msg)
+                *err_msg = "out of memory composing blob batch";
+            errno = ENOMEM;
             goto out;
         }
-        progress_line(progress, "layer", layer->digest_str, layer->size,
-                      cached ? "cached" : "downloaded",
-                      oci_media_type_name(layer->media_type));
+        batch_descs[0] = &manifest.config;
+        cached[0] = oci_blob_store_has(oci_store_blobs(store),
+                                       manifest.config.algo,
+                                       manifest.config.hex);
+        for (size_t i = 0; i < manifest.nlayers; i++) {
+            batch_descs[1 + i] = &manifest.layers[i];
+            cached[1 + i] = oci_blob_store_has(oci_store_blobs(store),
+                                               manifest.layers[i].algo,
+                                               manifest.layers[i].hex);
+        }
+        if (oci_fetch_blob_batch(fetcher, ref, batch_descs, batch_n,
+                                 oci_store_blobs(store), NULL, NULL,
+                                 err_msg) == 0) {
+            batch_ok = true;
+        }
+        if (batch_ok) {
+            progress_line(progress, "config", manifest.config.digest_str,
+                          manifest.config.size,
+                          cached[0] ? "cached" : "downloaded",
+                          oci_media_type_name(manifest.config.media_type));
+            for (size_t i = 0; i < manifest.nlayers; i++) {
+                const oci_descriptor_t *layer = &manifest.layers[i];
+                progress_line(progress, "layer", layer->digest_str,
+                              layer->size,
+                              cached[1 + i] ? "cached" : "downloaded",
+                              oci_media_type_name(layer->media_type));
+            }
+        }
+        free(batch_descs);
+        free(cached);
+        if (!batch_ok)
+            goto out;
     }
 
     /* 6. Pin tag -> top-level digest. Digest-only refs are self-pinning and

@@ -67,9 +67,36 @@ static ssize_t read_request_until_empty(oci_mock_io_t *io, char *buf, size_t cap
     return (ssize_t) off;
 }
 
+static void parse_range_value(const char *v, oci_mock_request_t *out)
+{
+    /* "bytes=<start>-[<end>]" per RFC 7233 5.4.1 -- only single-range form
+     * is honoured because no fetch path issues multi-range requests.
+     */
+    if (strncasecmp(v, "bytes=", 6) != 0)
+        return;
+    v += 6;
+    char *endp = NULL;
+    long start = strtol(v, &endp, 10);
+    if (endp == v || !endp || *endp != '-')
+        return;
+    v = endp + 1;
+    long end = -1;
+    if (*v && *v != '\r' && *v != '\n') {
+        char *endp2 = NULL;
+        long e = strtol(v, &endp2, 10);
+        if (endp2 != v)
+            end = e;
+    }
+    out->range_start = start;
+    out->range_end = end;
+    out->has_range = true;
+}
+
 static void parse_request(const char *raw, oci_mock_request_t *out)
 {
     memset(out, 0, sizeof(*out));
+    out->range_start = -1;
+    out->range_end = -1;
     const char *sp1 = strchr(raw, ' ');
     if (!sp1)
         return;
@@ -121,9 +148,92 @@ static void parse_request(const char *raw, oci_mock_request_t *out)
                 vlen = sizeof(out->if_none_match) - 1;
             memcpy(out->if_none_match, v, vlen);
             out->if_none_match[vlen] = '\0';
+        } else if (llen > 5 && !strncasecmp(line, "Range:", 6)) {
+            const char *v = line + 6;
+            while (*v == ' ')
+                v++;
+            char buf[128];
+            size_t vlen = (size_t) (eol - v);
+            if (vlen >= sizeof(buf))
+                vlen = sizeof(buf) - 1;
+            memcpy(buf, v, vlen);
+            buf[vlen] = '\0';
+            parse_range_value(buf, out);
         }
         line = eol + 2;
     }
+}
+
+/* Per-connection worker context. Owned by handle_connection; freed before
+ * the worker thread exits.
+ */
+typedef struct {
+    oci_mock_server_t *s;
+    int cfd;
+} worker_arg_t;
+
+static void *handle_connection(void *arg)
+{
+    worker_arg_t *w = arg;
+    oci_mock_server_t *s = w->s;
+    int cfd = w->cfd;
+    free(w);
+
+    pthread_mutex_lock(&s->lock);
+    s->in_flight++;
+    if (s->in_flight > s->in_flight_max)
+        s->in_flight_max = s->in_flight;
+    int delay_ms = s->response_delay_ms;
+    pthread_mutex_unlock(&s->lock);
+
+    SSL *ssl = SSL_new(s->ssl_ctx);
+    if (!ssl) {
+        close(cfd);
+        goto out;
+    }
+    SSL_set_fd(ssl, cfd);
+    if (SSL_accept(ssl) <= 0) {
+        /* Negative-trust tests deliberately abort the handshake; recycle the
+         * socket and let the request log stay empty so the caller can assert
+         * n_requests == 0.
+         */
+        SSL_free(ssl);
+        close(cfd);
+        goto out;
+    }
+    oci_mock_io_t io = {.ssl = ssl};
+    char buf[8192];
+    ssize_t got = read_request_until_empty(&io, buf, sizeof(buf));
+    if (got <= 0) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(cfd);
+        goto out;
+    }
+    oci_mock_request_t req;
+    parse_request(buf, &req);
+
+    pthread_mutex_lock(&s->lock);
+    if (s->n_requests < OCI_MOCK_LOG_MAX) {
+        s->log[s->n_requests++] = req;
+    }
+    oci_mock_handler_t h = s->handler;
+    pthread_mutex_unlock(&s->lock);
+
+    if (delay_ms > 0)
+        usleep((useconds_t) delay_ms * 1000);
+
+    if (h)
+        h(s, &io, &req);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(cfd);
+
+out:
+    pthread_mutex_lock(&s->lock);
+    s->in_flight--;
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
 }
 
 static void *mock_server_loop(void *arg)
@@ -141,45 +251,30 @@ static void *mock_server_loop(void *arg)
                 continue;
             break;
         }
-        SSL *ssl = SSL_new(s->ssl_ctx);
-        if (!ssl) {
-            close(cfd);
-            continue;
-        }
-        SSL_set_fd(ssl, cfd);
-        if (SSL_accept(ssl) <= 0) {
-            /* Negative-trust tests deliberately abort the handshake; just
-             * recycle the socket and let the request log stay empty so the
-             * caller can assert n_requests == 0.
-             */
-            SSL_free(ssl);
-            close(cfd);
-            continue;
-        }
-        oci_mock_io_t io = {.ssl = ssl};
-        char buf[8192];
-        ssize_t got = read_request_until_empty(&io, buf, sizeof(buf));
-        if (got <= 0) {
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(cfd);
-            continue;
-        }
-        oci_mock_request_t req;
-        parse_request(buf, &req);
-
+        /* The shutdown wake-up connect races against legitimate clients, so
+         * re-check stop with the socket already accepted.
+         */
         pthread_mutex_lock(&s->lock);
-        if (s->n_requests < OCI_MOCK_LOG_MAX) {
-            s->log[s->n_requests++] = req;
-        }
-        oci_mock_handler_t h = s->handler;
+        stop = s->stop;
         pthread_mutex_unlock(&s->lock);
-
-        if (h)
-            h(s, &io, &req);
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(cfd);
+        if (stop) {
+            close(cfd);
+            break;
+        }
+        worker_arg_t *w = malloc(sizeof(*w));
+        if (!w) {
+            close(cfd);
+            continue;
+        }
+        w->s = s;
+        w->cfd = cfd;
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, handle_connection, w) != 0) {
+            close(cfd);
+            free(w);
+            continue;
+        }
+        pthread_detach(worker);
     }
     return NULL;
 }
@@ -320,6 +415,7 @@ void oci_mock_set_handler(oci_mock_server_t *s, oci_mock_handler_t h, void *ctx)
     s->handler = h;
     s->ctx = ctx;
     s->n_requests = 0;
+    s->in_flight_max = 0;
     memset(s->log, 0, sizeof(s->log));
     pthread_mutex_unlock(&s->lock);
 }
@@ -328,6 +424,21 @@ int oci_mock_request_count(oci_mock_server_t *s)
 {
     pthread_mutex_lock(&s->lock);
     int n = s->n_requests;
+    pthread_mutex_unlock(&s->lock);
+    return n;
+}
+
+void oci_mock_set_response_delay_ms(oci_mock_server_t *s, int ms)
+{
+    pthread_mutex_lock(&s->lock);
+    s->response_delay_ms = ms < 0 ? 0 : ms;
+    pthread_mutex_unlock(&s->lock);
+}
+
+int oci_mock_in_flight_max(oci_mock_server_t *s)
+{
+    pthread_mutex_lock(&s->lock);
+    int n = s->in_flight_max;
     pthread_mutex_unlock(&s->lock);
     return n;
 }

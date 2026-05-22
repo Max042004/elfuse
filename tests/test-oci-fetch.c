@@ -24,12 +24,15 @@
  * make test-oci-fetch-online and is not part of make check.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <curl/curl.h>
@@ -963,6 +966,444 @@ static void test_ca_file_wrong_rejected(oci_mock_server_t *server,
     unlink(wrong_path);
 }
 
+/* ── Batch fetch (oci_fetch_blob_batch / curl_multi) ─────────────── */
+
+/* Per-blob scripted response. The handler thread looks the request up by
+ * path and either returns the configured body (200) or one of the failure
+ * modes set by the test: a forced status code or a count of leading
+ * requests that should respond 401 + Bearer challenge so the batch path
+ * can exercise its token-refresh round.
+ */
+typedef struct {
+    char digest_str[80];
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    char path[256];
+    char body[64];
+    size_t body_len;
+    int forced_status;       /* 0 = serve normally */
+    int return_401_first_n;  /* nonzero -> first N requests return 401 */
+    int call_count;          /* updated atomically by handler */
+} batch_blob_t;
+
+typedef struct {
+    batch_blob_t *blobs;
+    size_t n_blobs;
+    char base_url[80];
+    int token_call_count;    /* updated atomically by handler */
+    const char *token_value;
+} batch_ctx_t;
+
+static batch_blob_t *batch_find_by_path(batch_ctx_t *ctx, const char *path)
+{
+    for (size_t i = 0; i < ctx->n_blobs; i++) {
+        if (strcmp(ctx->blobs[i].path, path) == 0)
+            return &ctx->blobs[i];
+    }
+    return NULL;
+}
+
+static void h_batch(oci_mock_server_t *s, oci_mock_io_t *io,
+                    const oci_mock_request_t *req)
+{
+    batch_ctx_t *ctx = s->ctx;
+    if (strncmp(req->path, "/token", 6) == 0) {
+        __sync_fetch_and_add(&ctx->token_call_count, 1);
+        char body[256];
+        int n = snprintf(body, sizeof(body),
+                         "{\"token\":\"%s\",\"expires_in\":300}",
+                         ctx->token_value);
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL,
+                           body, (size_t) n);
+        return;
+    }
+    batch_blob_t *b = batch_find_by_path(ctx, req->path);
+    if (!b) {
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL,
+                           "nope", 4);
+        return;
+    }
+    int n = __sync_add_and_fetch(&b->call_count, 1);
+    if (b->forced_status) {
+        oci_mock_send_full(io, b->forced_status, "Error", "text/plain",
+                           NULL, NULL, NULL, "err", 3);
+        return;
+    }
+    if (b->return_401_first_n > 0 && n <= b->return_401_first_n) {
+        char challenge[512];
+        snprintf(challenge, sizeof(challenge),
+                 "Bearer realm=\"%s/token\",service=\"reg\"",
+                 ctx->base_url);
+        oci_mock_send_full(io, 401, "Unauthorized", "application/json",
+                           challenge, NULL, NULL, "{}", 2);
+        return;
+    }
+    oci_mock_send_full(io, 200, "OK", "application/octet-stream",
+                       NULL, NULL, NULL, b->body, b->body_len);
+}
+
+static void batch_blob_init(batch_blob_t *b, const char *repo, int seed)
+{
+    memset(b, 0, sizeof(*b));
+    int n = snprintf(b->body, sizeof(b->body), "blob-%02d-content-bytes", seed);
+    b->body_len = (size_t) n;
+    if (oci_digest_bytes(OCI_DIGEST_SHA256, b->body, b->body_len, b->hex) == 0) {
+        b->hex[0] = '\0';
+    }
+    snprintf(b->digest_str, sizeof(b->digest_str), "sha256:%s", b->hex);
+    snprintf(b->path, sizeof(b->path), "/v2/%s/blobs/%s", repo, b->digest_str);
+}
+
+static void batch_fill_descriptor(oci_descriptor_t *desc, batch_blob_t *b)
+{
+    memset(desc, 0, sizeof(*desc));
+    desc->algo = OCI_DIGEST_SHA256;
+    memcpy(desc->hex, b->hex, OCI_DIGEST_HEX_MAX + 1);
+    desc->digest_str = b->digest_str;
+    desc->size = (int64_t) b->body_len;
+    desc->media_type = OCI_MT_LAYER_OCI_TAR_GZIP;
+}
+
+/* Counts tmp files left in a store's tmp/ directory. The C5.1 batch must
+ * not leak partial files when it aborts. (C5.2 will deliberately keep
+ * partials around for resume; until then, tmp must end empty.)
+ */
+static int count_tmp_files(const char *store_root)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/tmp", store_root);
+    DIR *d = opendir(path);
+    if (!d)
+        return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static double wall_seconds_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (double) (t1.tv_sec - t0->tv_sec) +
+           (double) (t1.tv_nsec - t0->tv_nsec) / 1e9;
+}
+
+static double run_batch_under_concurrency(oci_mock_server_t *server,
+                                          const char *base_url,
+                                          const char *ca_path,
+                                          const char *store_root,
+                                          batch_ctx_t *ctx,
+                                          int concurrency,
+                                          int *out_rc,
+                                          const char **out_err)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", concurrency);
+    setenv("OCI_FETCH_MAX_CONCURRENT", buf, 1);
+    oci_mock_set_handler(server, h_batch, ctx);
+
+    oci_blob_store_t *store = oci_blob_store_open(store_root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {
+        .registry = "test.local",
+        .repository = "test",
+    };
+    oci_descriptor_t *ds = calloc(ctx->n_blobs, sizeof(*ds));
+    const oci_descriptor_t **dp = calloc(ctx->n_blobs, sizeof(*dp));
+    for (size_t i = 0; i < ctx->n_blobs; i++) {
+        batch_fill_descriptor(&ds[i], &ctx->blobs[i]);
+        dp[i] = &ds[i];
+    }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = oci_fetch_blob_batch(f, &ref, dp, ctx->n_blobs, store, NULL, NULL,
+                                  out_err);
+    double wall = wall_seconds_since(&t0);
+    if (out_rc)
+        *out_rc = rc;
+    free(ds);
+    free(dp);
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+    unsetenv("OCI_FETCH_MAX_CONCURRENT");
+    return wall;
+}
+
+static void test_batch_parallel_wall_time(oci_mock_server_t *server,
+                                          const char *base_url,
+                                          const char *ca_path,
+                                          const char *scratch_root)
+{
+    const char *name = "batch: parallel wall time beats serial by >=1.5x";
+    enum { NBLOBS = 8 };
+    batch_blob_t blobs[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++)
+        batch_blob_init(&blobs[i], "test", i);
+    batch_ctx_t ctx = {.blobs = blobs, .n_blobs = NBLOBS};
+
+    oci_mock_set_response_delay_ms(server, 150);
+
+    char serial_root[512];
+    snprintf(serial_root, sizeof(serial_root), "%s/batch-wall-serial",
+             scratch_root);
+    char parallel_root[512];
+    snprintf(parallel_root, sizeof(parallel_root), "%s/batch-wall-parallel",
+             scratch_root);
+
+    int rc_serial = 0;
+    const char *err_serial = NULL;
+    double t_serial = run_batch_under_concurrency(server, base_url, ca_path,
+                                                  serial_root, &ctx, 1,
+                                                  &rc_serial, &err_serial);
+    if (rc_serial != 0) {
+        oci_mock_set_response_delay_ms(server, 0);
+        report_fail(name, "serial rc=%d err=%s", rc_serial,
+                    err_serial ? err_serial : "(none)");
+        return;
+    }
+
+    for (int i = 0; i < NBLOBS; i++)
+        blobs[i].call_count = 0;
+    int rc_parallel = 0;
+    const char *err_parallel = NULL;
+    double t_parallel = run_batch_under_concurrency(server, base_url, ca_path,
+                                                    parallel_root, &ctx, 4,
+                                                    &rc_parallel,
+                                                    &err_parallel);
+    oci_mock_set_response_delay_ms(server, 0);
+    if (rc_parallel != 0) {
+        report_fail(name, "parallel rc=%d err=%s", rc_parallel,
+                    err_parallel ? err_parallel : "(none)");
+        return;
+    }
+    double ratio = t_parallel > 0 ? t_serial / t_parallel : 0.0;
+    if (ratio < 1.5) {
+        report_fail(name,
+                    "speedup %.2fx (serial %.3fs vs parallel %.3fs) < 1.5x",
+                    ratio, t_serial, t_parallel);
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_batch_atomic_abort(oci_mock_server_t *server,
+                                    const char *base_url,
+                                    const char *ca_path,
+                                    const char *scratch_root)
+{
+    const char *name = "batch: any blob fail aborts the whole batch";
+    enum { NBLOBS = 4 };
+    batch_blob_t blobs[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++)
+        batch_blob_init(&blobs[i], "atomic", i + 50);
+    blobs[2].forced_status = 500;
+    batch_ctx_t ctx = {.blobs = blobs, .n_blobs = NBLOBS};
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-atomic", scratch_root);
+    oci_blob_store_t *store = oci_blob_store_open(root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {.registry = "test.local", .repository = "atomic"};
+    oci_descriptor_t ds[NBLOBS];
+    const oci_descriptor_t *dp[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++) {
+        batch_fill_descriptor(&ds[i], &blobs[i]);
+        dp[i] = &ds[i];
+    }
+    const char *err = NULL;
+    int rc = oci_fetch_blob_batch(f, &ref, dp, NBLOBS, store, NULL, NULL, &err);
+    if (rc == 0) {
+        report_fail(name, "rc=0 (expected failure)");
+        goto cleanup;
+    }
+    for (int i = 0; i < NBLOBS; i++) {
+        if (oci_blob_store_has(store, OCI_DIGEST_SHA256, blobs[i].hex)) {
+            report_fail(name, "blob %d unexpectedly committed", i);
+            goto cleanup;
+        }
+    }
+    int leaked = count_tmp_files(root);
+    if (leaked != 0) {
+        report_fail(name, "tmp/ has %d leaked file(s)", leaked);
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+}
+
+static void test_batch_dedup_same_digest(oci_mock_server_t *server,
+                                         const char *base_url,
+                                         const char *ca_path,
+                                         const char *scratch_root)
+{
+    const char *name = "batch: duplicate digests fetch once";
+    batch_blob_t b;
+    batch_blob_init(&b, "dedup", 7);
+    batch_ctx_t ctx = {.blobs = &b, .n_blobs = 1};
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-dedup", scratch_root);
+    oci_blob_store_t *store = oci_blob_store_open(root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {.registry = "test.local", .repository = "dedup"};
+    oci_descriptor_t d;
+    batch_fill_descriptor(&d, &b);
+    const oci_descriptor_t *dp[2] = {&d, &d};
+    const char *err = NULL;
+    int rc = oci_fetch_blob_batch(f, &ref, dp, 2, store, NULL, NULL, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup;
+    }
+    if (!oci_blob_store_has(store, OCI_DIGEST_SHA256, b.hex)) {
+        report_fail(name, "blob missing after dedup batch");
+        goto cleanup;
+    }
+    if (b.call_count != 1) {
+        report_fail(name, "blob fetched %d times (want 1)", b.call_count);
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+}
+
+static void test_batch_token_refresh_under_parallel(oci_mock_server_t *server,
+                                                    const char *base_url,
+                                                    const char *ca_path,
+                                                    const char *scratch_root)
+{
+    const char *name = "batch: single token refresh covers all 401s";
+    enum { NBLOBS = 4 };
+    batch_blob_t blobs[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++) {
+        batch_blob_init(&blobs[i], "private", i + 100);
+        blobs[i].return_401_first_n = 1;
+    }
+    batch_ctx_t ctx = {
+        .blobs = blobs,
+        .n_blobs = NBLOBS,
+        .token_value = "batchtoken42",
+    };
+    snprintf(ctx.base_url, sizeof(ctx.base_url), "%s", base_url);
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-token-refresh", scratch_root);
+    oci_blob_store_t *store = oci_blob_store_open(root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {.registry = "test.local", .repository = "private"};
+    oci_descriptor_t ds[NBLOBS];
+    const oci_descriptor_t *dp[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++) {
+        batch_fill_descriptor(&ds[i], &blobs[i]);
+        dp[i] = &ds[i];
+    }
+    setenv("OCI_FETCH_MAX_CONCURRENT", "4", 1);
+    const char *err = NULL;
+    int rc = oci_fetch_blob_batch(f, &ref, dp, NBLOBS, store, NULL, NULL, &err);
+    unsetenv("OCI_FETCH_MAX_CONCURRENT");
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup;
+    }
+    for (int i = 0; i < NBLOBS; i++) {
+        if (!oci_blob_store_has(store, OCI_DIGEST_SHA256, blobs[i].hex)) {
+            report_fail(name, "blob %d missing after retry round", i);
+            goto cleanup;
+        }
+    }
+    if (ctx.token_call_count != 1) {
+        report_fail(name, "token endpoint hit %d times (want 1)",
+                    ctx.token_call_count);
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+}
+
+static void test_batch_concurrency_cap_respected(oci_mock_server_t *server,
+                                                 const char *base_url,
+                                                 const char *ca_path,
+                                                 const char *scratch_root)
+{
+    const char *name = "batch: OCI_FETCH_MAX_CONCURRENT caps in-flight";
+    enum { NBLOBS = 6 };
+    batch_blob_t blobs[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++)
+        batch_blob_init(&blobs[i], "cap", i + 200);
+    batch_ctx_t ctx = {.blobs = blobs, .n_blobs = NBLOBS};
+
+    oci_mock_set_handler(server, h_batch, &ctx);
+    oci_mock_set_response_delay_ms(server, 80);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-cap", scratch_root);
+    oci_blob_store_t *store = oci_blob_store_open(root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {.registry = "test.local", .repository = "cap"};
+    oci_descriptor_t ds[NBLOBS];
+    const oci_descriptor_t *dp[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++) {
+        batch_fill_descriptor(&ds[i], &blobs[i]);
+        dp[i] = &ds[i];
+    }
+    setenv("OCI_FETCH_MAX_CONCURRENT", "2", 1);
+    const char *err = NULL;
+    int rc = oci_fetch_blob_batch(f, &ref, dp, NBLOBS, store, NULL, NULL, &err);
+    unsetenv("OCI_FETCH_MAX_CONCURRENT");
+    oci_mock_set_response_delay_ms(server, 0);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup;
+    }
+    int high = oci_mock_in_flight_max(server);
+    if (high > 2) {
+        report_fail(name, "in_flight_max=%d > 2", high);
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+}
+
 /* ── Online smoke (opt-in) ───────────────────────────────────────── */
 
 static void test_online_dockerhub(void)
@@ -1114,6 +1555,21 @@ int main(void)
     test_insecure_non_loopback_rejected(&server, base_url, server.ca_pem_path);
     test_ca_file_missing_rejected(&server, base_url);
     test_ca_file_wrong_rejected(&server, base_url, scratch);
+
+    /* Plan 5 C5.1 batch fetch cases. Each builds its own store under a
+     * fresh subdir of `scratch` so the per-test setup never sees blobs left
+     * by a prior test, and toggles OCI_FETCH_MAX_CONCURRENT inline. The
+     * mock's thread-per-connection path is what makes the parallel
+     * wall-time assertion meaningful; the response_delay setter scopes the
+     * latency to the cases that actually want it.
+     */
+    test_batch_parallel_wall_time(&server, base_url, server.ca_pem_path, scratch);
+    test_batch_atomic_abort(&server, base_url, server.ca_pem_path, scratch);
+    test_batch_dedup_same_digest(&server, base_url, server.ca_pem_path, scratch);
+    test_batch_token_refresh_under_parallel(&server, base_url,
+                                            server.ca_pem_path, scratch);
+    test_batch_concurrency_cap_respected(&server, base_url, server.ca_pem_path,
+                                         scratch);
 
     free(base_url);
     oci_mock_server_stop(&server);

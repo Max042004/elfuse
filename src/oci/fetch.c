@@ -995,60 +995,475 @@ static size_t blob_stream_cb(char *ptr, size_t size, size_t nmemb, void *userdat
     return n;
 }
 
-static int perform_blob_get(oci_fetcher_t *f,
-                            const effective_opts_t *eff,
-                            const char *url,
-                            blob_stream_ctx_t *bctx,
-                            long *out_status,
-                            bearer_challenge_t *challenge_out,
-                            const char **err_msg)
+/* Per-handle state for a batch transfer. The handle owns its easy handle,
+ * staging writer, URL string, request-header slist, and any captured bearer
+ * challenge / response headers. batch_handle_free is safe to call on a
+ * zero-initialised slot, and safe to call multiple times.
+ */
+typedef enum {
+    BH_ACTIVE,        /* enqueueable: not yet completed this round */
+    BH_NEEDS_RETRY,   /* first round hit 401 + Bearer challenge */
+    BH_DONE_OK,       /* transfer completed; writer holds verified bytes */
+    BH_FAILED,        /* transport / status / size error; err_msg populated */
+} batch_state_t;
+
+typedef struct {
+    const oci_descriptor_t *desc;
+    oci_blob_writer_t *w;
+    char *url;
+    CURL *easy;
+    blob_stream_ctx_t bctx;
+    bearer_challenge_t challenge;
+    headers_ctx_t hctx;
+    struct curl_slist *hdrs;
+    long http_status;
+    CURLcode last_curl_rc;
+    batch_state_t state;
+    bool added;
+    const char *err_msg;
+} batch_handle_t;
+
+static int batch_max_concurrent(void)
 {
-    headers_ctx_t hctx = {.challenge_out = challenge_out};
-    if (challenge_out)
-        bearer_challenge_free(challenge_out);
+    const char *e = getenv("OCI_FETCH_MAX_CONCURRENT");
+    if (!e || !*e)
+        return 4;
+    long n = strtol(e, NULL, 10);
+    if (n < 1)
+        n = 1;
+    if (n > 16)
+        n = 16;
+    return (int) n;
+}
 
-    curl_easy_reset(f->easy);
-    apply_security_opts(f->easy, eff);
-    curl_easy_setopt(f->easy, CURLOPT_URL, url);
-    curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(f->easy, CURLOPT_USERAGENT, "elfuse-oci/1");
-    curl_easy_setopt(f->easy, CURLOPT_WRITEFUNCTION, blob_stream_cb);
-    curl_easy_setopt(f->easy, CURLOPT_WRITEDATA, bctx);
-    curl_easy_setopt(f->easy, CURLOPT_HEADERFUNCTION, header_cb);
-    curl_easy_setopt(f->easy, CURLOPT_HEADERDATA, &hctx);
-    struct curl_slist *hdrs = build_request_headers(f, NULL, NULL);
-    if (hdrs)
-        curl_easy_setopt(f->easy, CURLOPT_HTTPHEADER, hdrs);
+static void batch_handle_free(batch_handle_t *h)
+{
+    if (h->w) {
+        oci_blob_writer_abort(h->w);
+        h->w = NULL;
+    }
+    if (h->easy) {
+        curl_easy_cleanup(h->easy);
+        h->easy = NULL;
+    }
+    if (h->hdrs) {
+        curl_slist_free_all(h->hdrs);
+        h->hdrs = NULL;
+    }
+    free(h->url);
+    h->url = NULL;
+    bearer_challenge_free(&h->challenge);
+    free(h->hctx.content_type);
+    h->hctx.content_type = NULL;
+    free(h->hctx.docker_content_digest);
+    h->hctx.docker_content_digest = NULL;
+    free(h->hctx.etag);
+    h->hctx.etag = NULL;
+}
 
-    CURLcode rc = curl_easy_perform(f->easy);
-    long status = 0;
-    curl_easy_getinfo(f->easy, CURLINFO_RESPONSE_CODE, &status);
-    if (hdrs)
-        curl_slist_free_all(hdrs);
-    free(hctx.content_type);
-    free(hctx.docker_content_digest);
+/* Configure an easy handle for a blob fetch. Used both at initial prepare
+ * time and (after a writer + slist reset) during the post-401 retry round.
+ * The challenge capture slot is wired only on round 0 since the existing
+ * single-blob path only attempts one refresh.
+ */
+static void batch_configure_easy(oci_fetcher_t *f, const effective_opts_t *eff,
+                                 batch_handle_t *h, bool capture_challenge)
+{
+    h->bctx.w = h->w;
+    h->bctx.bytes_seen = 0;
+    h->bctx.bytes_expected = h->desc->size;
+    h->bctx.overflow = false;
+    h->bctx.write_failed = false;
+    h->hctx.challenge_out = capture_challenge ? &h->challenge : NULL;
 
-    *out_status = status;
-    if (rc != CURLE_OK) {
-        if (bctx->overflow) {
-            if (err_msg)
-                *err_msg = "blob exceeded declared size";
-            errno = EPROTO;
-            return -1;
-        }
-        if (bctx->write_failed) {
-            if (err_msg)
-                *err_msg = "blob writer rejected payload";
-            errno = EIO;
-            return -1;
-        }
+    apply_security_opts(h->easy, eff);
+    curl_easy_setopt(h->easy, CURLOPT_URL, h->url);
+    curl_easy_setopt(h->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h->easy, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(h->easy, CURLOPT_USERAGENT, "elfuse-oci/1");
+    curl_easy_setopt(h->easy, CURLOPT_WRITEFUNCTION, blob_stream_cb);
+    curl_easy_setopt(h->easy, CURLOPT_WRITEDATA, &h->bctx);
+    curl_easy_setopt(h->easy, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(h->easy, CURLOPT_HEADERDATA, &h->hctx);
+    h->hdrs = build_request_headers(f, NULL, NULL);
+    if (h->hdrs)
+        curl_easy_setopt(h->easy, CURLOPT_HTTPHEADER, h->hdrs);
+}
+
+static int batch_prepare_handle(oci_fetcher_t *f, const effective_opts_t *eff,
+                                const oci_ref_t *ref, batch_handle_t *h,
+                                oci_blob_store_t *store, const char **err_msg)
+{
+    h->w = oci_blob_writer_begin_named(store, h->desc->algo, h->desc->hex);
+    if (!h->w) {
         if (err_msg)
-            *err_msg = curl_easy_strerror(rc);
+            *err_msg = "failed to start blob writer";
+        return -1;
+    }
+    h->url = build_blob_url(f, ref, h->desc->digest_str);
+    if (!h->url) {
+        if (err_msg)
+            *err_msg = "out of memory";
+        errno = ENOMEM;
+        return -1;
+    }
+    h->easy = curl_easy_init();
+    if (!h->easy) {
+        if (err_msg)
+            *err_msg = "curl_easy_init failed";
         errno = EIO;
         return -1;
     }
+    h->state = BH_ACTIVE;
+    h->added = false;
+    h->http_status = 0;
+    h->last_curl_rc = CURLE_OK;
+    h->err_msg = NULL;
+    batch_configure_easy(f, eff, h, !f->bearer_token);
     return 0;
+}
+
+/* Re-arm a handle for the post-refresh retry round. The original writer is
+ * aborted (its staging file gets unlinked) and a fresh one starts from
+ * byte zero; the easy handle is reset and re-wired with the now-current
+ * bearer token. The challenge capture slot is disabled so the second-round
+ * 401-handling branch falls straight through to FAILED.
+ */
+static int batch_reset_for_retry(oci_fetcher_t *f, const effective_opts_t *eff,
+                                 batch_handle_t *h, oci_blob_store_t *store)
+{
+    oci_blob_writer_abort(h->w);
+    h->w = NULL;
+    if (h->hdrs) {
+        curl_slist_free_all(h->hdrs);
+        h->hdrs = NULL;
+    }
+    free(h->hctx.content_type);
+    h->hctx.content_type = NULL;
+    free(h->hctx.docker_content_digest);
+    h->hctx.docker_content_digest = NULL;
+    free(h->hctx.etag);
+    h->hctx.etag = NULL;
+    bearer_challenge_free(&h->challenge);
+
+    h->w = oci_blob_writer_begin_named(store, h->desc->algo, h->desc->hex);
+    if (!h->w)
+        return -1;
+    curl_easy_reset(h->easy);
+    h->state = BH_ACTIVE;
+    h->added = false;
+    h->http_status = 0;
+    h->last_curl_rc = CURLE_OK;
+    h->err_msg = NULL;
+    batch_configure_easy(f, eff, h, false);
+    return 0;
+}
+
+/* Score a completed CURLMSG_DONE entry. Translates a curl + HTTP status pair
+ * into a batch_state_t transition, mirroring the diagnostic strings the
+ * single-blob path historically produced so the test suite's err_msg
+ * assertions stay byte-identical.
+ */
+static void batch_score_done(batch_handle_t *h, CURLcode crc, long status,
+                             int round)
+{
+    h->http_status = status;
+    h->last_curl_rc = crc;
+    if (crc != CURLE_OK) {
+        if (h->bctx.overflow) {
+            h->err_msg = "blob exceeded declared size";
+            errno = EPROTO;
+        } else if (h->bctx.write_failed) {
+            h->err_msg = "blob writer rejected payload";
+            errno = EIO;
+        } else {
+            h->err_msg = curl_easy_strerror(crc);
+            errno = EIO;
+        }
+        h->state = BH_FAILED;
+        return;
+    }
+    if (status == 401 && h->challenge.realm && round == 0) {
+        h->state = BH_NEEDS_RETRY;
+        return;
+    }
+    if (status < 200 || status >= 300) {
+        h->err_msg = "blob fetch returned non-2xx status";
+        errno = EPROTO;
+        h->state = BH_FAILED;
+        return;
+    }
+    if (h->bctx.bytes_seen != h->desc->size) {
+        h->err_msg = "blob size mismatch";
+        errno = EPROTO;
+        h->state = BH_FAILED;
+        return;
+    }
+    h->state = BH_DONE_OK;
+}
+
+int oci_fetch_blob_batch(oci_fetcher_t *f,
+                         const oci_ref_t *ref,
+                         const oci_descriptor_t *const *descs,
+                         size_t n_descs,
+                         oci_blob_store_t *store,
+                         oci_fetch_blob_batch_progress_cb_t progress_cb,
+                         void *cb_user_data,
+                         const char **err_msg)
+{
+    (void) progress_cb;
+    (void) cb_user_data;
+    if (!f || !ref || !descs || !store) {
+        if (err_msg)
+            *err_msg = "invalid arguments";
+        errno = EINVAL;
+        return -1;
+    }
+    if (n_descs == 0)
+        return 0;
+
+    effective_opts_t eff;
+    if (resolve_effective(f, ref, &eff, err_msg) < 0)
+        return -1;
+    if (check_insecure_policy(&eff, ref, err_msg) < 0) {
+        effective_free(&eff);
+        return -1;
+    }
+
+    int rc = -1;
+    int max_concurrent = batch_max_concurrent();
+    bool any_failed = false;
+    CURLM *multi = NULL;
+
+    batch_handle_t *handles = calloc(n_descs, sizeof(*handles));
+    if (!handles) {
+        if (err_msg)
+            *err_msg = "out of memory";
+        errno = ENOMEM;
+        goto cleanup;
+    }
+
+    /* Dedup pass: drop blobs already in the store, collapse same-digest
+     * entries (the layers array can repeat a digest legitimately). nh is
+     * the number of handles that actually need a transfer.
+     */
+    size_t nh = 0;
+    for (size_t i = 0; i < n_descs; i++) {
+        const oci_descriptor_t *d = descs[i];
+        if (!d || d->size < 0) {
+            if (err_msg)
+                *err_msg = "descriptor size is negative";
+            errno = EINVAL;
+            goto cleanup;
+        }
+        if (oci_blob_store_has(store, d->algo, d->hex))
+            continue;
+        bool dup = false;
+        for (size_t j = 0; j < nh; j++) {
+            if (handles[j].desc->algo == d->algo &&
+                strcmp(handles[j].desc->hex, d->hex) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        handles[nh].desc = d;
+        nh++;
+    }
+    if (nh == 0) {
+        rc = 0;
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < nh; i++) {
+        if (batch_prepare_handle(f, &eff, ref, &handles[i], store, err_msg) < 0)
+            goto cleanup;
+    }
+
+    multi = curl_multi_init();
+    if (!multi) {
+        if (err_msg)
+            *err_msg = "curl_multi_init failed";
+        errno = EIO;
+        goto cleanup;
+    }
+
+    int round = 0;
+    /* Outer loop: each iteration tops up the multi up to max_concurrent
+     * ACTIVE handles and drains them until still_running hits zero. When no
+     * ACTIVE remain the loop checks for NEEDS_RETRY (single token refresh
+     * per batch) and either restarts those handles or exits.
+     */
+    while (1) {
+        size_t added_count = 0;
+        for (size_t i = 0; i < nh; i++) {
+            if (handles[i].added)
+                added_count++;
+        }
+        for (size_t i = 0;
+             i < nh && added_count < (size_t) max_concurrent; i++) {
+            if (handles[i].state == BH_ACTIVE && !handles[i].added) {
+                if (curl_multi_add_handle(multi, handles[i].easy) == CURLM_OK) {
+                    handles[i].added = true;
+                    added_count++;
+                }
+            }
+        }
+        if (added_count == 0)
+            break;
+
+        int still_running = 0;
+        do {
+            int num_fds = 0;
+            CURLMcode mrc = curl_multi_poll(multi, NULL, 0, 1000, &num_fds);
+            if (mrc != CURLM_OK) {
+                if (err_msg)
+                    *err_msg = curl_multi_strerror(mrc);
+                errno = EIO;
+                any_failed = true;
+                goto drained;
+            }
+            curl_multi_perform(multi, &still_running);
+            CURLMsg *msg;
+            int n_msgs = 0;
+            while ((msg = curl_multi_info_read(multi, &n_msgs)) != NULL) {
+                if (msg->msg != CURLMSG_DONE)
+                    continue;
+                batch_handle_t *h = NULL;
+                for (size_t i = 0; i < nh; i++) {
+                    if (handles[i].easy == msg->easy_handle) {
+                        h = &handles[i];
+                        break;
+                    }
+                }
+                if (!h)
+                    continue;
+                CURLcode crc = msg->data.result;
+                long status = 0;
+                curl_easy_getinfo(h->easy, CURLINFO_RESPONSE_CODE, &status);
+                curl_multi_remove_handle(multi, h->easy);
+                h->added = false;
+                batch_score_done(h, crc, status, round);
+            }
+        } while (still_running > 0);
+drained:
+        ;
+        /* If there are still ACTIVE slots not yet enqueued, fall back into
+         * the outer loop to add them; otherwise check for retries.
+         */
+        bool more_active = false;
+        for (size_t i = 0; i < nh; i++)
+            if (handles[i].state == BH_ACTIVE) {
+                more_active = true;
+                break;
+            }
+        if (more_active)
+            continue;
+
+        bool any_retry = false;
+        for (size_t i = 0; i < nh; i++)
+            if (handles[i].state == BH_NEEDS_RETRY) {
+                any_retry = true;
+                break;
+            }
+        if (!any_retry || any_failed)
+            break;
+
+        /* Single token refresh per batch. Steal one retry handle's challenge
+         * onto f->challenge so fetch_token sees the realm/service/scope, then
+         * re-arm every NEEDS_RETRY handle with the new bearer.
+         */
+        for (size_t i = 0; i < nh; i++) {
+            if (handles[i].state == BH_NEEDS_RETRY) {
+                bearer_challenge_free(&f->challenge);
+                f->challenge = handles[i].challenge;
+                memset(&handles[i].challenge, 0,
+                       sizeof(handles[i].challenge));
+                break;
+            }
+        }
+        if (fetch_token(f, &eff, err_msg) < 0) {
+            for (size_t i = 0; i < nh; i++) {
+                if (handles[i].state == BH_NEEDS_RETRY) {
+                    handles[i].state = BH_FAILED;
+                    handles[i].err_msg = "token refresh failed";
+                }
+            }
+            any_failed = true;
+            break;
+        }
+        round++;
+        for (size_t i = 0; i < nh; i++) {
+            if (handles[i].state == BH_NEEDS_RETRY) {
+                if (batch_reset_for_retry(f, &eff, &handles[i], store) < 0) {
+                    handles[i].state = BH_FAILED;
+                    handles[i].err_msg = "failed to reset writer for retry";
+                    any_failed = true;
+                }
+            }
+        }
+        if (any_failed)
+            break;
+    }
+
+    for (size_t i = 0; i < nh; i++) {
+        if (handles[i].state == BH_FAILED) {
+            any_failed = true;
+            if (err_msg && !*err_msg && handles[i].err_msg)
+                *err_msg = handles[i].err_msg;
+        } else if (handles[i].state == BH_ACTIVE ||
+                   handles[i].state == BH_NEEDS_RETRY) {
+            /* Should be unreachable: the loop only exits when nothing is
+             * still queued. Defensive: treat as failure rather than
+             * silently dropping the slot.
+             */
+            any_failed = true;
+            handles[i].state = BH_FAILED;
+            if (err_msg && !*err_msg)
+                *err_msg = "batch left a handle in a non-terminal state";
+        }
+    }
+    if (any_failed) {
+        if (err_msg && !*err_msg)
+            *err_msg = "batch blob fetch failed";
+        goto cleanup;
+    }
+
+    /* Commit only after every transfer succeeded. Commit consumes the writer
+     * (frees on success), so clear h->w to suppress the batch_handle_free
+     * abort. A digest mismatch here aborts any remaining unflushed writers
+     * and surfaces the historical "blob digest mismatch on commit" string.
+     */
+    for (size_t i = 0; i < nh; i++) {
+        if (handles[i].state != BH_DONE_OK)
+            continue;
+        if (oci_blob_writer_commit(handles[i].w) < 0) {
+            handles[i].w = NULL;
+            if (err_msg)
+                *err_msg = "blob digest mismatch on commit";
+            for (size_t j = i + 1; j < nh; j++) {
+                if (handles[j].state == BH_DONE_OK && handles[j].w) {
+                    oci_blob_writer_abort(handles[j].w);
+                    handles[j].w = NULL;
+                }
+            }
+            goto cleanup;
+        }
+        handles[i].w = NULL;
+    }
+    rc = 0;
+
+cleanup:
+    if (multi)
+        curl_multi_cleanup(multi);
+    if (handles) {
+        for (size_t i = 0; i < n_descs; i++)
+            batch_handle_free(&handles[i]);
+        free(handles);
+    }
+    effective_free(&eff);
+    return rc;
 }
 
 int oci_fetch_blob(oci_fetcher_t *f,
@@ -1057,113 +1472,11 @@ int oci_fetch_blob(oci_fetcher_t *f,
                    oci_blob_store_t *store,
                    const char **err_msg)
 {
-    if (!f || !ref || !desc || !store) {
+    if (!desc) {
         if (err_msg)
             *err_msg = "invalid arguments";
         errno = EINVAL;
         return -1;
     }
-    effective_opts_t eff;
-    if (resolve_effective(f, ref, &eff, err_msg) < 0)
-        return -1;
-    if (check_insecure_policy(&eff, ref, err_msg) < 0) {
-        effective_free(&eff);
-        return -1;
-    }
-    if (desc->size < 0) {
-        if (err_msg)
-            *err_msg = "descriptor size is negative";
-        errno = EINVAL;
-        effective_free(&eff);
-        return -1;
-    }
-    if (oci_blob_store_has(store, desc->algo, desc->hex)) {
-        effective_free(&eff);
-        return 0;
-    }
-
-    char *url = build_blob_url(f, ref, desc->digest_str);
-    if (!url) {
-        if (err_msg)
-            *err_msg = "out of memory";
-        errno = ENOMEM;
-        effective_free(&eff);
-        return -1;
-    }
-
-    oci_blob_writer_t *w = oci_blob_writer_begin(store, desc->algo, desc->hex);
-    if (!w) {
-        free(url);
-        if (err_msg)
-            *err_msg = "failed to start blob writer";
-        effective_free(&eff);
-        return -1;
-    }
-    blob_stream_ctx_t bctx = {.w = w, .bytes_expected = desc->size};
-
-    bearer_challenge_t challenge = {0};
-    long status = 0;
-    int rc = perform_blob_get(f, &eff, url, &bctx, &status,
-                              f->bearer_token ? NULL : &challenge, err_msg);
-    if (rc < 0) {
-        free(url);
-        oci_blob_writer_abort(w);
-        bearer_challenge_free(&challenge);
-        effective_free(&eff);
-        return -1;
-    }
-
-    if (status == 401 && challenge.realm) {
-        oci_blob_writer_abort(w);
-        bearer_challenge_free(&f->challenge);
-        f->challenge = challenge;
-        memset(&challenge, 0, sizeof(challenge));
-        if (fetch_token(f, &eff, err_msg) < 0) {
-            free(url);
-            effective_free(&eff);
-            return -1;
-        }
-        w = oci_blob_writer_begin(store, desc->algo, desc->hex);
-        if (!w) {
-            free(url);
-            if (err_msg)
-                *err_msg = "failed to restart blob writer";
-            effective_free(&eff);
-            return -1;
-        }
-        bctx = (blob_stream_ctx_t){.w = w, .bytes_expected = desc->size};
-        rc = perform_blob_get(f, &eff, url, &bctx, &status, NULL, err_msg);
-        if (rc < 0) {
-            free(url);
-            oci_blob_writer_abort(w);
-            effective_free(&eff);
-            return -1;
-        }
-    } else {
-        bearer_challenge_free(&challenge);
-    }
-
-    free(url);
-    effective_free(&eff);
-
-    if (status < 200 || status >= 300) {
-        oci_blob_writer_abort(w);
-        if (err_msg)
-            *err_msg = "blob fetch returned non-2xx status";
-        errno = EPROTO;
-        return -1;
-    }
-    if (bctx.bytes_seen != desc->size) {
-        oci_blob_writer_abort(w);
-        if (err_msg)
-            *err_msg = "blob size mismatch";
-        errno = EPROTO;
-        return -1;
-    }
-    if (oci_blob_writer_commit(w) < 0) {
-        if (err_msg)
-            *err_msg = "blob digest mismatch on commit";
-        return -1;
-    }
-    return 0;
+    return oci_fetch_blob_batch(f, ref, &desc, 1, store, NULL, NULL, err_msg);
 }

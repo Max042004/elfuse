@@ -168,9 +168,61 @@ int oci_fetch_manifest(oci_fetcher_t *f,
  *
  * Already-present blobs are an immediate success (store-side has() check)
  * with no network call.
+ *
+ * Implementation is a one-element forwarder onto oci_fetch_blob_batch; the
+ * separate entry point exists so callers that only need a single blob need
+ * not allocate a descriptor array.
  */
 int oci_fetch_blob(oci_fetcher_t *f,
                    const oci_ref_t *ref,
                    const oci_descriptor_t *desc,
                    oci_blob_store_t *store,
                    const char **err_msg);
+
+/* Per-blob progress callback. Invoked (potentially repeatedly) by the batch
+ * fetcher as bytes accrue. bytes_dl is the number of bytes already streamed
+ * for desc; bytes_total mirrors desc->size. Return value is reserved (C5.3
+ * may use a non-zero return to signal abort); C5.1 callers should return 0.
+ *
+ * Reserved typedef -- the callback parameter to oci_fetch_blob_batch is
+ * accepted but not yet invoked. C5.3 wires it through CURLOPT_XFERINFOFUNCTION
+ * for in-flight progress; the typedef is committed at C5.1 so the batch API
+ * surface does not move between Plan 5 commits.
+ */
+typedef int (*oci_fetch_blob_batch_progress_cb_t)(
+    const oci_descriptor_t *desc,
+    int64_t bytes_dl,
+    int64_t bytes_total,
+    void *user_data);
+
+/* Fetch multiple blobs in parallel via libcurl's multi interface.
+ *
+ *   descs / n_descs    array of descriptor pointers to fetch. Already-present
+ *                      blobs (store-side has() hit) are skipped before any
+ *                      handle is allocated. Duplicate digests within the batch
+ *                      are collapsed to one transfer.
+ *   progress_cb        optional per-blob progress callback (C5.3); pass NULL
+ *   cb_user_data       opaque pointer forwarded to progress_cb
+ *
+ * Concurrency cap reads OCI_FETCH_MAX_CONCURRENT (default 4, clamped to
+ * [1, 16]). The batch is atomic: any single-blob failure (network error,
+ * HTTP non-2xx after one auth retry, size or digest mismatch) aborts every
+ * in-flight writer and the function returns -1 with err_msg set. On success
+ * every blob is committed to the store before the function returns; commits
+ * happen sequentially after all transfers succeed.
+ *
+ * A single shared effective_opts_t is resolved at entry (policy + CLI merge
+ * for ref->registry). Token refresh is handled inline: when any first-round
+ * handle returns 401 with a Bearer challenge, the batch drains all
+ * in-flight handles, refreshes the fetcher's bearer token once, and restarts
+ * every 401 handle with the new bearer header. A second 401 fails the
+ * batch.
+ */
+int oci_fetch_blob_batch(oci_fetcher_t *f,
+                         const oci_ref_t *ref,
+                         const oci_descriptor_t *const *descs,
+                         size_t n_descs,
+                         oci_blob_store_t *store,
+                         oci_fetch_blob_batch_progress_cb_t progress_cb,
+                         void *cb_user_data,
+                         const char **err_msg);

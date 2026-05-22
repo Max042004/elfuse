@@ -194,9 +194,15 @@ static unsigned long writer_seq(void)
     return __sync_add_and_fetch(&n, 1);
 }
 
-oci_blob_writer_t *oci_blob_writer_begin(oci_blob_store_t *s,
-                                         oci_digest_algo_t algo,
-                                         const char *expected_hex)
+/* Shared writer construction. tmp_template_suffix is the part after
+ * "<root>/tmp/" -- the caller composes a pid/seq form (anonymous) or a
+ * digest-prefix form (named) and this helper opens mkstemp + chmod + the
+ * digester, identical between the two public entry points.
+ */
+static oci_blob_writer_t *writer_begin_with_template(oci_blob_store_t *s,
+                                                     oci_digest_algo_t algo,
+                                                     const char *expected_hex,
+                                                     const char *tmp_template_suffix)
 {
     if (!s || !oci_digest_hex_valid(algo, expected_hex)) {
         errno = EINVAL;
@@ -211,9 +217,8 @@ oci_blob_writer_t *oci_blob_writer_begin(oci_blob_store_t *s,
     memcpy(w->expected_hex, expected_hex, oci_digest_hex_len(algo) + 1);
     w->fd = -1;
 
-    int n = snprintf(w->tmp_path, sizeof(w->tmp_path),
-                     "%s/tmp/blob-%ld-%lu-XXXXXX",
-                     s->root, (long) getpid(), writer_seq());
+    int n = snprintf(w->tmp_path, sizeof(w->tmp_path), "%s/tmp/%s",
+                     s->root, tmp_template_suffix);
     if (n < 0 || (size_t) n >= sizeof(w->tmp_path)) {
         free(w);
         errno = ENAMETOOLONG;
@@ -248,6 +253,44 @@ oci_blob_writer_t *oci_blob_writer_begin(oci_blob_store_t *s,
         return NULL;
     }
     return w;
+}
+
+oci_blob_writer_t *oci_blob_writer_begin(oci_blob_store_t *s,
+                                         oci_digest_algo_t algo,
+                                         const char *expected_hex)
+{
+    char tmpl[128];
+    int n = snprintf(tmpl, sizeof(tmpl), "blob-%ld-%lu-XXXXXX",
+                     (long) getpid(), writer_seq());
+    if (n < 0 || (size_t) n >= sizeof(tmpl)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    return writer_begin_with_template(s, algo, expected_hex, tmpl);
+}
+
+#define OCI_BLOB_NAMED_HEX_PREFIX 16
+
+oci_blob_writer_t *oci_blob_writer_begin_named(oci_blob_store_t *s,
+                                               oci_digest_algo_t algo,
+                                               const char *expected_hex)
+{
+    if (!expected_hex) {
+        errno = EINVAL;
+        return NULL;
+    }
+    char prefix[OCI_BLOB_NAMED_HEX_PREFIX + 1];
+    size_t hl = strlen(expected_hex);
+    size_t use = hl < OCI_BLOB_NAMED_HEX_PREFIX ? hl : OCI_BLOB_NAMED_HEX_PREFIX;
+    memcpy(prefix, expected_hex, use);
+    prefix[use] = '\0';
+    char tmpl[64];
+    int n = snprintf(tmpl, sizeof(tmpl), "blob-%s-XXXXXX", prefix);
+    if (n < 0 || (size_t) n >= sizeof(tmpl)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    return writer_begin_with_template(s, algo, expected_hex, tmpl);
 }
 
 bool oci_blob_writer_write(oci_blob_writer_t *w, const void *buf, size_t len)
