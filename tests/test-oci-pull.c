@@ -1461,6 +1461,136 @@ teardown_env:
     policy_env_teardown(&pe);
 }
 
+/* ── C5.3 progress renderer (non-TTY path) ───────────────────────── */
+
+/* count_substr counts non-overlapping occurrences of needle in haystack.
+ * Used by the progress assertion to tally "downloaded" / "cached" /
+ * "kind" markers without writing a tokeniser.
+ */
+static int count_substr(const char *haystack, const char *needle)
+{
+    int n = 0;
+    const char *p = haystack;
+    size_t len = strlen(needle);
+    while ((p = strstr(p, needle)) != NULL) {
+        n++;
+        p += len;
+    }
+    return n;
+}
+
+static void test_pull_progress_non_tty(fixture_t *fx)
+{
+    /* Drive oci_pull with opts.progress pointing at a tmpfile() (always
+     * non-TTY) and verify the renderer emits exactly one "downloaded"
+     * line per blob the batch fetched plus the manifest progress lines
+     * that pre-date C5.3. The cached/downloaded annotation is the
+     * load-bearing contract for log-grep consumers; C5.3 must keep it
+     * byte-identical to the C5.1 / C5.2 wording.
+     */
+    const char *name = "pull: non-TTY progress emits one line per blob";
+    image_t *img = fx->img;
+    char dc[80];
+    snprintf(dc, sizeof(dc), "sha256:%s", img->index_hex);
+    router_ctx_t ctx = {0};
+    populate_routes_index(&ctx, img, dc);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-progress", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    if (!store) {
+        report_fail(name, "store open");
+        return;
+    }
+    oci_fetcher_options_t fopts = {
+        .base_url_override = fx->base_url,
+        .ca_file = fx->ca_pem_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    oci_ref_t ref = {0};
+    if (oci_ref_parse("alpine:3.20", &ref, NULL) < 0) {
+        report_fail(name, "ref parse");
+        oci_fetcher_free(f);
+        oci_store_close(store);
+        return;
+    }
+
+    FILE *fp = tmpfile();
+    if (!fp) {
+        report_fail(name, "tmpfile: %s", strerror(errno));
+        oci_ref_free(&ref);
+        oci_fetcher_free(f);
+        oci_store_close(store);
+        return;
+    }
+    oci_pull_options_t popts = {.progress = fp};
+    const char *err = NULL;
+    int rc = oci_pull(f, store, &ref, &popts, &err);
+    if (rc != 0) {
+        report_fail(name, "pull rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup_fp;
+    }
+
+    /* Slurp the captured progress buffer into memory so the assertion
+     * helpers can grep across it. The renderer never seeks or rewinds
+     * fp, so a single rewind+read covers everything.
+     */
+    if (fseek(fp, 0, SEEK_END) < 0) {
+        report_fail(name, "fseek end: %s", strerror(errno));
+        goto cleanup_fp;
+    }
+    long sz = ftell(fp);
+    rewind(fp);
+    char *buf = malloc((size_t) sz + 1);
+    if (!buf) {
+        report_fail(name, "oom slurping progress");
+        goto cleanup_fp;
+    }
+    size_t got = fread(buf, 1, (size_t) sz, fp);
+    buf[got] = '\0';
+
+    /* Layer count comes from the fixture; config is always exactly one.
+     * Two manifest lines: the top-level index and the linux/arm64
+     * sub-manifest, both flagged "downloaded" on a fresh store.
+     */
+    int dl = count_substr(buf, "downloaded");
+    int cached = count_substr(buf, "cached");
+    int layer_lines = count_substr(buf, "layer    ");
+    int config_lines = count_substr(buf, "config   ");
+    int manifest_lines = count_substr(buf, "manifest ");
+    int expected_dl = 1 /* config */ + (int) img->nlayers + 2 /* manifests */;
+
+    if (dl != expected_dl) {
+        report_fail(name, "downloaded=%d (want %d):\n%s", dl, expected_dl,
+                    buf);
+    } else if (cached != 0) {
+        report_fail(name, "cached=%d (want 0 on fresh store):\n%s", cached,
+                    buf);
+    } else if (layer_lines != (int) img->nlayers) {
+        report_fail(name, "layer lines=%d (want %zu):\n%s", layer_lines,
+                    img->nlayers, buf);
+    } else if (config_lines != 1) {
+        report_fail(name, "config lines=%d (want 1):\n%s", config_lines, buf);
+    } else if (manifest_lines != 2) {
+        report_fail(name, "manifest lines=%d (want 2):\n%s", manifest_lines,
+                    buf);
+    } else if (strstr(buf, "\033[") != NULL) {
+        report_fail(name,
+                    "non-TTY buffer contains a CSI escape sequence:\n%s",
+                    buf);
+    } else {
+        report_pass(name);
+    }
+    free(buf);
+
+cleanup_fp:
+    fclose(fp);
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+}
+
 /* ── main ────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1521,6 +1651,7 @@ int main(void)
     test_pull_policy_insecure_loopback(&fx);
     test_pull_policy_auth_file_bad_mode(&fx);
     test_pull_cli_overrides_policy_insecure(&fx);
+    test_pull_progress_non_tty(&fx);
 
     free_image(&img);
     free(base_url);

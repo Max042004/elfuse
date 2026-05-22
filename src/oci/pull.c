@@ -63,6 +63,193 @@ static void progress_line(FILE *fp, const char *kind, const char *digest_str,
     fflush(fp);
 }
 
+/* In-progress per-blob slot for the batch fetcher's xferinfo callback to
+ * update. Kept file-local because pull.c is the only caller. A second
+ * subcommand wiring the same progress callback would be the trigger to
+ * lift this and pull_progress_t into src/oci/progress.{c,h}.
+ */
+typedef struct {
+    const oci_descriptor_t *desc;
+    const char *kind;          /* "config" or "layer" */
+    const char *media_type;
+    int64_t bytes_dl;
+    int64_t bytes_total;
+    bool done_emitted;         /* non-TTY mode: per-blob one-shot guard */
+} pull_progress_slot_t;
+
+typedef struct {
+    FILE *fp;
+    bool is_tty;
+    bool started;              /* TTY: placeholder lines already printed */
+    pull_progress_slot_t *slots;
+    size_t n_slots;
+} pull_progress_t;
+
+static void pull_progress_print_inplace_line(FILE *fp,
+                                             const pull_progress_slot_t *slot)
+{
+    char short_digest[24];
+    snprintf(short_digest, sizeof(short_digest), "%.19s...",
+             slot->desc->digest_str);
+    int percent = 0;
+    if (slot->bytes_total > 0) {
+        int64_t p = (slot->bytes_dl * 100) / slot->bytes_total;
+        if (p < 0)
+            p = 0;
+        if (p > 100)
+            p = 100;
+        percent = (int) p;
+    }
+    const char *state =
+        slot->bytes_total > 0 && slot->bytes_dl >= slot->bytes_total
+            ? "downloaded"
+            : "pulling";
+    /* CSI 2K clears the entire line under the cursor; the trailing newline
+     * advances to the next slot row.
+     */
+    fprintf(fp,
+            "\033[2K  %-9s %-22s %8lld/%lldB %3d%%  %-11s %s\n",
+            slot->kind, short_digest,
+            (long long) slot->bytes_dl, (long long) slot->bytes_total,
+            percent, state,
+            slot->media_type ? slot->media_type : "");
+}
+
+/* TTY render path: cursor-up to the top of the redraw zone, reprint every
+ * slot in place. The redraw zone is exactly n_slots rows tall and the
+ * cursor ends up one row below the last slot, matching the post-init
+ * position.
+ */
+static void pull_progress_tty_redraw(pull_progress_t *pp)
+{
+    if (!pp->fp || pp->n_slots == 0)
+        return;
+    /* CSI nF moves the cursor up n lines to column 0; "1F" is a single row.
+     * n_slots is at most a few dozen so the integer width fits trivially.
+     */
+    fprintf(pp->fp, "\033[%zuF", pp->n_slots);
+    for (size_t i = 0; i < pp->n_slots; i++)
+        pull_progress_print_inplace_line(pp->fp, &pp->slots[i]);
+    fflush(pp->fp);
+}
+
+/* Walk descs[] and split it into already-cached (printed immediately, no
+ * slot) and to-be-downloaded (one slot each). Cached lines preserve the
+ * pre-C5.3 byte-identical wording so existing log-parsing pipelines do
+ * not regress. In TTY mode, after the cached lines, n_slots placeholder
+ * lines are printed and the cursor lands one row below the zone so the
+ * xferinfo redraw loop can repeatedly hop back to the zone top.
+ */
+static int pull_progress_init(pull_progress_t *pp, FILE *fp,
+                              const oci_descriptor_t *config,
+                              bool config_cached,
+                              const oci_descriptor_t *layers,
+                              size_t n_layers,
+                              const bool *layer_cached)
+{
+    memset(pp, 0, sizeof(*pp));
+    pp->fp = fp;
+    pp->is_tty = fp != NULL && isatty(fileno(fp));
+
+    size_t cap = 1 + n_layers;
+    pp->slots = calloc(cap, sizeof(*pp->slots));
+    if (!pp->slots)
+        return -1;
+
+    /* Emit cached lines immediately and reserve a slot for everything else.
+     * The slot's bytes_total is desc->size; bytes_dl starts at zero so the
+     * TTY placeholder shows 0/<size>B 0%.
+     */
+    if (config_cached) {
+        progress_line(fp, "config", config->digest_str, config->size,
+                      "cached",
+                      oci_media_type_name(config->media_type));
+    } else {
+        pp->slots[pp->n_slots++] = (pull_progress_slot_t){
+            .desc = config,
+            .kind = "config",
+            .media_type = oci_media_type_name(config->media_type),
+            .bytes_dl = 0,
+            .bytes_total = config->size,
+        };
+    }
+    for (size_t i = 0; i < n_layers; i++) {
+        const oci_descriptor_t *L = &layers[i];
+        if (layer_cached[i]) {
+            progress_line(fp, "layer", L->digest_str, L->size, "cached",
+                          oci_media_type_name(L->media_type));
+        } else {
+            pp->slots[pp->n_slots++] = (pull_progress_slot_t){
+                .desc = L,
+                .kind = "layer",
+                .media_type = oci_media_type_name(L->media_type),
+                .bytes_dl = 0,
+                .bytes_total = L->size,
+            };
+        }
+    }
+
+    /* TTY: print n_slots placeholder lines; the cursor lands on the row
+     * immediately below the zone. Non-TTY: defer per-blob output until
+     * the bytes_dl == bytes_total event in the callback.
+     */
+    if (pp->is_tty && pp->n_slots > 0) {
+        for (size_t i = 0; i < pp->n_slots; i++)
+            pull_progress_print_inplace_line(fp, &pp->slots[i]);
+        fflush(fp);
+        pp->started = true;
+    }
+    return 0;
+}
+
+static pull_progress_slot_t *pull_progress_find(pull_progress_t *pp,
+                                                const oci_descriptor_t *desc)
+{
+    for (size_t i = 0; i < pp->n_slots; i++) {
+        if (pp->slots[i].desc == desc)
+            return &pp->slots[i];
+    }
+    return NULL;
+}
+
+/* Callback handed to oci_fetch_blob_batch. Runs on the fetcher's thread
+ * (single-threaded curl_multi event loop) so the renderer's pp state
+ * needs no locking. Returning 0 lets the transfer continue; the C5.3
+ * renderer never aborts (a future cancellable pull would return non-zero
+ * here).
+ */
+static int pull_progress_cb(const oci_descriptor_t *desc, int64_t bytes_dl,
+                            int64_t bytes_total, void *user)
+{
+    pull_progress_t *pp = user;
+    if (!pp)
+        return 0;
+    pull_progress_slot_t *slot = pull_progress_find(pp, desc);
+    if (!slot)
+        return 0;
+    slot->bytes_dl = bytes_dl;
+    slot->bytes_total = bytes_total;
+    if (pp->is_tty) {
+        pull_progress_tty_redraw(pp);
+    } else if (!slot->done_emitted && bytes_total > 0 &&
+               bytes_dl >= bytes_total) {
+        /* Single line per blob on completion. Matches the line-per-event
+         * log shape that scripts grep against (digest, size, state).
+         */
+        progress_line(pp->fp, slot->kind, slot->desc->digest_str,
+                      slot->bytes_total, "downloaded", slot->media_type);
+        slot->done_emitted = true;
+    }
+    return 0;
+}
+
+static void pull_progress_dispose(pull_progress_t *pp)
+{
+    free(pp->slots);
+    pp->slots = NULL;
+    pp->n_slots = 0;
+}
+
 /* Case-insensitive prefix check for "sha256:" / "sha512:". */
 static bool digest_str_matches(const char *want, const char *got)
 {
@@ -479,45 +666,58 @@ int oci_pull(oci_fetcher_t *fetcher,
         size_t batch_n = 1 + manifest.nlayers;
         const oci_descriptor_t **batch_descs =
             calloc(batch_n, sizeof(*batch_descs));
-        bool *cached = calloc(batch_n, sizeof(*cached));
-        if (!batch_descs || !cached) {
+        bool config_cached = false;
+        bool *layer_cached = manifest.nlayers > 0
+            ? calloc(manifest.nlayers, sizeof(*layer_cached))
+            : NULL;
+        if (!batch_descs || (manifest.nlayers > 0 && !layer_cached)) {
             free(batch_descs);
-            free(cached);
+            free(layer_cached);
             if (err_msg)
                 *err_msg = "out of memory composing blob batch";
             errno = ENOMEM;
             goto out;
         }
         batch_descs[0] = &manifest.config;
-        cached[0] = oci_blob_store_has(oci_store_blobs(store),
-                                       manifest.config.algo,
-                                       manifest.config.hex);
+        config_cached = oci_blob_store_has(oci_store_blobs(store),
+                                           manifest.config.algo,
+                                           manifest.config.hex);
         for (size_t i = 0; i < manifest.nlayers; i++) {
             batch_descs[1 + i] = &manifest.layers[i];
-            cached[1 + i] = oci_blob_store_has(oci_store_blobs(store),
-                                               manifest.layers[i].algo,
-                                               manifest.layers[i].hex);
+            layer_cached[i] = oci_blob_store_has(oci_store_blobs(store),
+                                                  manifest.layers[i].algo,
+                                                  manifest.layers[i].hex);
         }
+
+        /* Set up the per-blob progress renderer before the batch call so
+         * the cached lines land in the same paragraph the C5.1 code path
+         * used to produce post-hoc. The downloaded blobs get rendered in
+         * place during the transfer (TTY) or one line each on completion
+         * (non-TTY) via pull_progress_cb. A NULL progress fp (--quiet)
+         * still produces zero output because pp.fp is NULL and the
+         * formatter functions short-circuit on that.
+         */
+        pull_progress_t pp;
+        if (pull_progress_init(&pp, progress, &manifest.config, config_cached,
+                               manifest.layers, manifest.nlayers,
+                               layer_cached) < 0) {
+            free(batch_descs);
+            free(layer_cached);
+            if (err_msg)
+                *err_msg = "out of memory initialising progress";
+            errno = ENOMEM;
+            goto out;
+        }
+
         if (oci_fetch_blob_batch(fetcher, ref, batch_descs, batch_n,
-                                 oci_store_blobs(store), NULL, NULL,
-                                 err_msg) == 0) {
+                                 oci_store_blobs(store), pull_progress_cb,
+                                 &pp, err_msg) == 0) {
             batch_ok = true;
         }
-        if (batch_ok) {
-            progress_line(progress, "config", manifest.config.digest_str,
-                          manifest.config.size,
-                          cached[0] ? "cached" : "downloaded",
-                          oci_media_type_name(manifest.config.media_type));
-            for (size_t i = 0; i < manifest.nlayers; i++) {
-                const oci_descriptor_t *layer = &manifest.layers[i];
-                progress_line(progress, "layer", layer->digest_str,
-                              layer->size,
-                              cached[1 + i] ? "cached" : "downloaded",
-                              oci_media_type_name(layer->media_type));
-            }
-        }
+
+        pull_progress_dispose(&pp);
         free(batch_descs);
-        free(cached);
+        free(layer_cached);
         if (!batch_ok)
             goto out;
     }

@@ -1057,8 +1057,39 @@ typedef struct {
      * of a server that ignored the Range request.
      */
     int64_t resume_offset;
+    /* Per-blob progress callback. Borrowed from the batch entry's argument;
+     * NULL when the caller did not request progress. The xferinfo wrapper
+     * forwards into this callback with bytes_dl adjusted to total-blob
+     * progress (libcurl's dlnow + resume_offset) so the renderer can pair
+     * bytes_dl with desc->size as a true completion ratio.
+     */
+    oci_fetch_blob_batch_progress_cb_t progress_cb;
+    void *progress_user;
     const char *err_msg;
 } batch_handle_t;
+
+/* libcurl xferinfo wrapper. clientp is the owning batch_handle_t so the
+ * callback can look up the descriptor and the resume offset without a
+ * separate context struct. dltotal is ignored because resumed transfers
+ * report dltotal == remaining bytes, not the full blob size -- desc->size
+ * is the authoritative total. The return value propagates from the
+ * caller's progress_cb so a future renderer can abort a transfer by
+ * returning non-zero, matching libcurl's xferinfo contract.
+ */
+static int batch_xferinfo_cb(void *clientp, curl_off_t dltotal,
+                             curl_off_t dlnow, curl_off_t ultotal,
+                             curl_off_t ulnow)
+{
+    (void) dltotal;
+    (void) ultotal;
+    (void) ulnow;
+    batch_handle_t *h = clientp;
+    if (!h || !h->progress_cb)
+        return 0;
+    int64_t bytes_dl = (int64_t) dlnow + h->resume_offset;
+    return h->progress_cb(h->desc, bytes_dl, h->desc->size,
+                          h->progress_user);
+}
 
 static int batch_max_concurrent(void)
 {
@@ -1133,6 +1164,12 @@ static void batch_configure_easy(oci_fetcher_t *f, const effective_opts_t *eff,
         char range[64];
         snprintf(range, sizeof(range), "%lld-", (long long) h->resume_offset);
         curl_easy_setopt(h->easy, CURLOPT_RANGE, range);
+    }
+    if (h->progress_cb) {
+        curl_easy_setopt(h->easy, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(h->easy, CURLOPT_XFERINFOFUNCTION,
+                         batch_xferinfo_cb);
+        curl_easy_setopt(h->easy, CURLOPT_XFERINFODATA, h);
     }
     h->hdrs = build_request_headers(f, NULL, NULL);
     if (h->hdrs)
@@ -1274,6 +1311,14 @@ static void batch_score_done(batch_handle_t *h, CURLcode crc, long status,
         return;
     }
     h->state = BH_DONE_OK;
+    /* libcurl's xferinfo does not guarantee a final dlnow == dltotal tick,
+     * so the renderer would otherwise stall one update short of "done".
+     * One explicit invocation at the score boundary normalises the
+     * sequence the user-side callback sees, regardless of socket pacing.
+     */
+    if (h->progress_cb)
+        (void) h->progress_cb(h->desc, h->desc->size, h->desc->size,
+                              h->progress_user);
 }
 
 int oci_fetch_blob_batch(oci_fetcher_t *f,
@@ -1285,8 +1330,6 @@ int oci_fetch_blob_batch(oci_fetcher_t *f,
                          void *cb_user_data,
                          const char **err_msg)
 {
-    (void) progress_cb;
-    (void) cb_user_data;
     if (!f || !ref || !descs || !store) {
         if (err_msg)
             *err_msg = "invalid arguments";
@@ -1352,6 +1395,8 @@ int oci_fetch_blob_batch(oci_fetcher_t *f,
         if (dup)
             continue;
         handles[nh].desc = d;
+        handles[nh].progress_cb = progress_cb;
+        handles[nh].progress_user = cb_user_data;
         nh++;
     }
     if (nh == 0) {

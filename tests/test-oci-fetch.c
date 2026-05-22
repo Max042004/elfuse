@@ -1733,6 +1733,111 @@ static void test_batch_sweep_stale_partial(oci_mock_server_t *server,
     report_pass(name);
 }
 
+/* ── C5.3 progress callback contract ─────────────────────────────── */
+
+#define PROGRESS_LOG_MAX 256
+
+typedef struct {
+    int n_events;
+    int64_t bytes_dl[PROGRESS_LOG_MAX];
+    int64_t bytes_total[PROGRESS_LOG_MAX];
+    const oci_descriptor_t *desc[PROGRESS_LOG_MAX];
+} progress_log_t;
+
+static int progress_log_cb(const oci_descriptor_t *desc, int64_t bytes_dl,
+                           int64_t bytes_total, void *user)
+{
+    progress_log_t *log = user;
+    int slot = __sync_fetch_and_add(&log->n_events, 1);
+    if (slot < PROGRESS_LOG_MAX) {
+        log->desc[slot] = desc;
+        log->bytes_dl[slot] = bytes_dl;
+        log->bytes_total[slot] = bytes_total;
+    }
+    return 0;
+}
+
+static void test_batch_progress_cb_contract(oci_mock_server_t *server,
+                                            const char *base_url,
+                                            const char *ca_path,
+                                            const char *scratch_root)
+{
+    /* The batch fetcher must call progress_cb with bytes_total == desc->size
+     * (a stable upper bound) and must guarantee at least one final event
+     * where bytes_dl == bytes_total for every successfully-fetched blob.
+     * The explicit final invocation from batch_score_done's BH_DONE_OK
+     * branch is what carries this contract across libcurl's variable
+     * xferinfo pacing.
+     */
+    const char *name = "batch: progress_cb sees per-blob final event";
+    enum { NBLOBS = 3 };
+    batch_blob_t blobs[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++)
+        batch_blob_init(&blobs[i], "prog", i + 400);
+    batch_ctx_t ctx = {.blobs = blobs, .n_blobs = NBLOBS};
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-progress", scratch_root);
+    oci_blob_store_t *store = oci_blob_store_open(root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {.registry = "test.local", .repository = "prog"};
+    oci_descriptor_t ds[NBLOBS];
+    const oci_descriptor_t *dp[NBLOBS];
+    for (int i = 0; i < NBLOBS; i++) {
+        batch_fill_descriptor(&ds[i], &blobs[i]);
+        dp[i] = &ds[i];
+    }
+    progress_log_t log = {0};
+    const char *err = NULL;
+    int rc = oci_fetch_blob_batch(f, &ref, dp, NBLOBS, store, progress_log_cb,
+                                  &log, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup;
+    }
+    if (log.n_events < NBLOBS) {
+        report_fail(name, "n_events=%d < %d (want >= one per blob)",
+                    log.n_events, NBLOBS);
+        goto cleanup;
+    }
+    /* Exactly one final-event per descriptor: bytes_dl == bytes_total ==
+     * desc->size. Track via a small fixed array because NBLOBS is small.
+     */
+    int final_count[NBLOBS] = {0};
+    for (int i = 0; i < log.n_events && i < PROGRESS_LOG_MAX; i++) {
+        for (int j = 0; j < NBLOBS; j++) {
+            if (log.desc[i] != &ds[j])
+                continue;
+            if (log.bytes_total[i] != ds[j].size) {
+                report_fail(name,
+                            "bytes_total=%lld != desc[%d].size=%lld",
+                            (long long) log.bytes_total[i], j,
+                            (long long) ds[j].size);
+                goto cleanup;
+            }
+            if (log.bytes_dl[i] == ds[j].size)
+                final_count[j]++;
+        }
+    }
+    for (int j = 0; j < NBLOBS; j++) {
+        if (final_count[j] < 1) {
+            report_fail(name, "blob %d missing final event (count=%d)", j,
+                        final_count[j]);
+            goto cleanup;
+        }
+    }
+    report_pass(name);
+
+cleanup:
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+}
+
 /* ── Online smoke (opt-in) ───────────────────────────────────────── */
 
 static void test_online_dockerhub(void)
@@ -1914,6 +2019,14 @@ int main(void)
                                           server.ca_pem_path, scratch);
     test_batch_sweep_stale_partial(&server, base_url, server.ca_pem_path,
                                    scratch);
+
+    /* Plan 5 C5.3 progress callback contract case. Independent of the
+     * pull.c renderer; verifies the fetcher's wire-level promise that
+     * every BH_DONE_OK blob produces at least one progress event with
+     * bytes_dl == bytes_total == desc->size.
+     */
+    test_batch_progress_cb_contract(&server, base_url, server.ca_pem_path,
+                                    scratch);
 
     free(base_url);
     oci_mock_server_stop(&server);
