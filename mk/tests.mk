@@ -14,7 +14,7 @@
         test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-origin \
         test-oci-layer-apply test-oci-volume test-oci-clone \
-        test-oci-unpack test-oci-runspec test-oci-path-resolve \
+        test-oci-unpack test-oci-runspec test-oci-user test-oci-path-resolve \
         test-oci-runtime-files \
         test-oci-run test-oci-compat oci-fixture-builder \
         test-sysroot-rename \
@@ -85,6 +85,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-unpack
 	@printf "\n$(BLUE)━━━ OCI runspec resolver unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-runspec
+	@printf "\n$(BLUE)━━━ OCI User-field resolver unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-user
 	@printf "\n$(BLUE)━━━ OCI path-resolve unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-path-resolve
 	@printf "\n$(BLUE)━━━ OCI runtime-files injection unit tests ━━━$(RESET)\n"
@@ -199,11 +201,20 @@ test-oci-unpack: $(BUILD_DIR)/test-oci-unpack
 	@$(BUILD_DIR)/test-oci-unpack
 
 ## Run the OCI runspec resolver unit tests (native, no HVF, no network).
-## Pure data: feeds hand-built oci_image_runtime_t literals plus synthetic
-## CLI flags through oci_runspec_build and asserts argv / envp / uid / cwd
-## outputs against the Phase 3 override matrix and Env policy.
+## Feeds hand-built oci_image_runtime_t literals plus synthetic CLI flags
+## through oci_runspec_build and asserts argv / envp / uid / cwd outputs
+## against the Phase 3 override matrix and Env policy. Phase 4 symbolic
+## User cases write scratch /tmp rootfses for /etc/passwd lookup.
 test-oci-runspec: $(BUILD_DIR)/test-oci-runspec
 	@$(BUILD_DIR)/test-oci-runspec
+
+## Run the OCI User-field resolver unit tests (native, no HVF, no network).
+## Phase 4 F4.7: validates oci_user_lookup against scratch rootfses
+## carrying synthetic /etc/passwd / /etc/group; covers the seven OCI
+## image-spec User shapes plus the policy edges (digit-name collision,
+## missing passwd, name-not-found, invalid characters).
+test-oci-user: $(BUILD_DIR)/test-oci-user
+	@$(BUILD_DIR)/test-oci-user
 
 ## Run the OCI guest PATH resolver unit tests (native, no HVF, no network).
 ## Builds a fake sysroot tree under /tmp and drives oci_path_resolve

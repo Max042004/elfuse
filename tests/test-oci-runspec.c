@@ -17,17 +17,21 @@
  *     default PATH gate, container=elfuse forced injection
  *   - DYLD_* hard rejection on CLI overrides
  *   - User: numeric UID, UID:GID, image User, CLI --user precedence,
- *     symbolic User diagnostic, non-numeric --user diagnostic
+ *     symbolic User with rootfs_for_nss + the variant gid shapes,
+ *     symbolic User without rootfs hard-fail, name-not-found diagnostic
  *   - WorkingDir: image-only, override-only, default, relative reject,
  *     "..\" segment reject
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "oci/manifest.h"
 #include "oci/runspec.h"
@@ -668,14 +672,16 @@ static void case_user_no_creds_inherits(void)
     oci_runspec_free(&spec);
 }
 
-static void case_user_symbolic_image_rejected(void)
+static void case_user_symbolic_no_rootfs_rejected(void)
 {
     const char *name =
-        "user: symbolic image User 'nginx' rejected with Phase 4 pointer";
+        "user: symbolic image User without rootfs_for_nss -> EINVAL";
     oci_image_runtime_t cfg = {
         .cmd = STR_ARR("/bin/echo"),
         .user = "nginx",
     };
+    /* rootfs_for_nss defaults to NULL: the resolver must reject the
+     * symbolic token rather than reach into the host filesystem. */
     oci_runspec_flags_t flags = empty_flags();
 
     oci_runspec_t spec = {0};
@@ -686,8 +692,7 @@ static void case_user_symbolic_image_rejected(void)
         report_fail(name, "rc=%d (want -1)", rc);
     } else if (errno != EINVAL) {
         report_fail(name, "errno=%d (want EINVAL)", errno);
-    } else if (!err || !strstr(err, "'nginx'") || !strstr(err, "not numeric") ||
-               !strstr(err, "Phase 4")) {
+    } else if (!err || !strstr(err, "'nginx'") || !strstr(err, "no rootfs")) {
         report_fail(name, "err=%s", err ? err : "(null)");
     } else {
         report_pass(name);
@@ -697,7 +702,12 @@ static void case_user_symbolic_image_rejected(void)
 
 static void case_user_cli_non_numeric(void)
 {
-    const char *name = "user: non-numeric --user rejected with EINVAL";
+    /* Without rootfs_for_nss the CLI symbolic token must surface as a
+     * "no rootfs available" diagnostic so the user can tell why their
+     * --user alice rejection has nothing to do with parsing.
+     */
+    const char *name =
+        "user: --user 'alice' without rootfs -> EINVAL no-rootfs";
     oci_image_runtime_t cfg = {.cmd = STR_ARR("/bin/echo")};
     oci_runspec_flags_t flags = empty_flags();
     flags.user_override = "alice";
@@ -707,13 +717,171 @@ static void case_user_cli_non_numeric(void)
     errno = 0;
     int rc = oci_runspec_build(&cfg, &flags, HOST_BASIC, &spec, &err);
     if (rc != -1 || errno != EINVAL || !err || !strstr(err, "--user 'alice'") ||
-        !strstr(err, "not numeric")) {
+        !strstr(err, "no rootfs")) {
         report_fail(name, "rc=%d errno=%d err=%s", rc, errno,
                     err ? err : "(null)");
     } else {
         report_pass(name);
     }
     oci_runspec_free(&spec);
+}
+
+/* Helpers for the rootfs-driven symbolic cases. Each case builds a small
+ * scratch rootfs under /tmp with synthetic /etc/passwd and /etc/group
+ * fixtures, drives the resolver, then tears the rootfs down. The
+ * fixtures mirror the layout test-oci-user.c uses so the two test
+ * binaries agree on the resolver's interpretation.
+ */
+static int rs_write_file(const char *path, const char *body)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    size_t n = strlen(body);
+    if (write(fd, body, n) != (ssize_t) n) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static void rs_rmrf(const char *path)
+{
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", path);
+    (void) system(cmd);
+}
+
+static int rs_make_rootfs_with_passwd(char *out,
+                                      size_t cap,
+                                      const char *passwd_body,
+                                      const char *group_body)
+{
+    snprintf(out, cap, "/tmp/elfuse-rs-XXXXXX");
+    if (!mkdtemp(out))
+        return -1;
+    char etc[256];
+    snprintf(etc, sizeof(etc), "%s/etc", out);
+    if (mkdir(etc, 0755) < 0)
+        return -1;
+    char path[512];
+    if (passwd_body) {
+        snprintf(path, sizeof(path), "%s/etc/passwd", out);
+        if (rs_write_file(path, passwd_body) < 0)
+            return -1;
+    }
+    if (group_body) {
+        snprintf(path, sizeof(path), "%s/etc/group", out);
+        if (rs_write_file(path, group_body) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static const char *const RS_PASSWD_BODY =
+    "root:x:0:0:root:/root:/bin/sh\n"
+    "nginx:x:101:103:nginx:/var/lib/nginx:/sbin/nologin\n"
+    "alice:x:1000:1000:Alice:/home/alice:/bin/bash\n";
+
+static const char *const RS_GROUP_BODY =
+    "root:x:0:\n"
+    "adm:x:4:alice\n"
+    "nginx:x:103:\n";
+
+static void case_user_image_symbolic_with_rootfs(void)
+{
+    const char *name =
+        "user: image User 'nginx' resolved via rootfs -> uid=101, gid=103";
+    char rootfs[64];
+    if (rs_make_rootfs_with_passwd(rootfs, sizeof(rootfs), RS_PASSWD_BODY,
+                                   RS_GROUP_BODY) < 0) {
+        report_fail(name, "rootfs setup failed: errno=%d", errno);
+        return;
+    }
+    oci_image_runtime_t cfg = {
+        .cmd = STR_ARR("/bin/echo"),
+        .user = "nginx",
+    };
+    oci_runspec_flags_t flags = empty_flags();
+    flags.rootfs_for_nss = rootfs;
+
+    oci_runspec_t spec = {0};
+    const char *err = NULL;
+    int rc = oci_runspec_build(&cfg, &flags, HOST_BASIC, &spec, &err);
+    if (rc != 0 || !spec.has_creds || spec.uid != 101 || spec.gid != 103) {
+        report_fail(name, "rc=%d has=%d uid=%u gid=%u err=%s", rc,
+                    spec.has_creds, spec.uid, spec.gid, err ? err : "(nil)");
+    } else {
+        report_pass(name);
+    }
+    oci_runspec_free(&spec);
+    rs_rmrf(rootfs);
+}
+
+static void case_user_cli_symbolic_overrides_image_numeric(void)
+{
+    const char *name =
+        "user: --user 'alice:adm' overrides numeric image User "
+        "(uid=1000,gid=4)";
+    char rootfs[64];
+    if (rs_make_rootfs_with_passwd(rootfs, sizeof(rootfs), RS_PASSWD_BODY,
+                                   RS_GROUP_BODY) < 0) {
+        report_fail(name, "rootfs setup failed: errno=%d", errno);
+        return;
+    }
+    oci_image_runtime_t cfg = {
+        .cmd = STR_ARR("/bin/echo"),
+        .user = "9999",
+    };
+    oci_runspec_flags_t flags = empty_flags();
+    flags.user_override = "alice:adm";
+    flags.rootfs_for_nss = rootfs;
+
+    oci_runspec_t spec = {0};
+    const char *err = NULL;
+    int rc = oci_runspec_build(&cfg, &flags, HOST_BASIC, &spec, &err);
+    if (rc != 0 || !spec.has_creds || spec.uid != 1000 || spec.gid != 4) {
+        report_fail(name, "rc=%d has=%d uid=%u gid=%u err=%s", rc,
+                    spec.has_creds, spec.uid, spec.gid, err ? err : "(nil)");
+    } else {
+        report_pass(name);
+    }
+    oci_runspec_free(&spec);
+    rs_rmrf(rootfs);
+}
+
+static void case_user_missing_passwd_with_symbolic(void)
+{
+    const char *name =
+        "user: symbolic User but rootfs has no /etc/passwd -> EINVAL";
+    char rootfs[64];
+    /* No passwd / group files: just the bare /etc directory. */
+    if (rs_make_rootfs_with_passwd(rootfs, sizeof(rootfs), NULL, NULL) < 0) {
+        report_fail(name, "rootfs setup failed: errno=%d", errno);
+        return;
+    }
+    oci_image_runtime_t cfg = {
+        .cmd = STR_ARR("/bin/echo"),
+        .user = "nginx",
+    };
+    oci_runspec_flags_t flags = empty_flags();
+    flags.rootfs_for_nss = rootfs;
+
+    oci_runspec_t spec = {0};
+    const char *err = NULL;
+    errno = 0;
+    int rc = oci_runspec_build(&cfg, &flags, HOST_BASIC, &spec, &err);
+    if (rc != -1) {
+        report_fail(name, "rc=%d (want -1)", rc);
+    } else if (!err || !strstr(err, "'nginx'") || !strstr(err, "/etc/passwd")) {
+        report_fail(name, "err=%s (want 'nginx' + '/etc/passwd')",
+                    err ? err : "(nil)");
+    } else {
+        report_pass(name);
+    }
+    oci_runspec_free(&spec);
+    rs_rmrf(rootfs);
 }
 
 /* ── WorkingDir ────────────────────────────────────────────────────── */
@@ -855,8 +1023,11 @@ int main(void)
     case_user_image_uid_gid();
     case_user_cli_overrides_image();
     case_user_no_creds_inherits();
-    case_user_symbolic_image_rejected();
+    case_user_symbolic_no_rootfs_rejected();
     case_user_cli_non_numeric();
+    case_user_image_symbolic_with_rootfs();
+    case_user_cli_symbolic_overrides_image_numeric();
+    case_user_missing_passwd_with_symbolic();
 
     /* WorkingDir */
     case_workdir_image_used();

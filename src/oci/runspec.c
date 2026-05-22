@@ -21,6 +21,8 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include "user-lookup.h"
+
 /* Diagnostic scratch. Thread-local so concurrent oci_runspec_build calls
  * (one per --keep run dir, in a future multiplexed oci run) do not clobber
  * each other's err pointer. Buffer size is generous enough for the
@@ -216,50 +218,6 @@ static bool runtime_arr_is_set(char *const *arr)
     return arr != NULL && arr[0] != NULL;
 }
 
-/* Parse "UID" or "UID:GID". Each field must be non-empty and all-digits.
- * No leading +/- and no leading zeros restriction (Docker accepts "01"
- * as 1; the spec is not strict on canonicalisation). On success, when
- * the input is UID-only, *gid is set to *uid as a sensible default in
- * the absence of NSS resolution (matches the proc_set_ids triple-set
- * call shape the Phase 3 plan describes for commit 5).
- */
-static int parse_user(const char *s, uint32_t *uid, uint32_t *gid)
-{
-    if (!s || !*s)
-        return -1;
-    const char *colon = strchr(s, ':');
-    size_t uid_len = colon ? (size_t) (colon - s) : strlen(s);
-    if (uid_len == 0)
-        return -1;
-    uint64_t u = 0;
-    for (size_t i = 0; i < uid_len; i++) {
-        if (s[i] < '0' || s[i] > '9')
-            return -1;
-        u = u * 10 + (uint64_t) (s[i] - '0');
-        if (u > UINT32_MAX)
-            return -1;
-    }
-    *uid = (uint32_t) u;
-    if (!colon) {
-        *gid = (uint32_t) u;
-        return 0;
-    }
-    const char *g = colon + 1;
-    size_t gid_len = strlen(g);
-    if (gid_len == 0)
-        return -1;
-    uint64_t gv = 0;
-    for (size_t i = 0; i < gid_len; i++) {
-        if (g[i] < '0' || g[i] > '9')
-            return -1;
-        gv = gv * 10 + (uint64_t) (g[i] - '0');
-        if (gv > UINT32_MAX)
-            return -1;
-    }
-    *gid = (uint32_t) gv;
-    return 0;
-}
-
 /* WorkingDir must be absolute and free of ".." path components. Empty
  * segments (consecutive slashes, trailing slash) are tolerated; the
  * caller-side path materialization will normalize them.
@@ -282,9 +240,13 @@ static int validate_workdir(const char *s)
 }
 
 /* Resolve credentials from CLI --user override, then image User, then
- * host inheritance. The two non-host sources share the same numeric
- * parser but report different diagnostics so a user can tell whether
- * the bad value came from their CLI flag or from the pulled image.
+ * host inheritance. Both sources route through oci_user_lookup so the
+ * numeric / symbolic / mixed shapes are handled uniformly; the only
+ * difference between the two paths is the diagnostic prefix so a caller
+ * can tell whether the bad value came from their CLI flag or from the
+ * pulled image. Symbolic resolution requires flags->rootfs_for_nss; a
+ * NULL rootfs causes the helper to reject any symbolic token, preserving
+ * the "pure data" contract for callers that have not unpacked a rootfs.
  */
 static int resolve_user(const oci_image_runtime_t *cfg,
                         const oci_runspec_flags_t *flags,
@@ -292,22 +254,26 @@ static int resolve_user(const oci_image_runtime_t *cfg,
                         const char **err)
 {
     if (flags->user_override) {
-        if (parse_user(flags->user_override, &out->uid, &out->gid) < 0) {
-            set_err_fmt(err, "--user '%s' is not numeric",
-                        flags->user_override);
-            errno = EINVAL;
+        const char *lookup_err = NULL;
+        if (oci_user_lookup(flags->rootfs_for_nss, flags->user_override,
+                            &out->uid, &out->gid, &lookup_err) < 0) {
+            int saved = errno;
+            set_err_fmt(err, "--user '%s': %s", flags->user_override,
+                        lookup_err ? lookup_err : "lookup failed");
+            errno = saved ? saved : EINVAL;
             return -1;
         }
         out->has_creds = true;
         return 0;
     }
     if (cfg && cfg->user && *cfg->user) {
-        if (parse_user(cfg->user, &out->uid, &out->gid) < 0) {
-            set_err_fmt(err,
-                        "User '%s' is not numeric: NSS resolution not yet"
-                        " implemented (Phase 4)",
-                        cfg->user);
-            errno = EINVAL;
+        const char *lookup_err = NULL;
+        if (oci_user_lookup(flags->rootfs_for_nss, cfg->user, &out->uid,
+                            &out->gid, &lookup_err) < 0) {
+            int saved = errno;
+            set_err_fmt(err, "User '%s': %s", cfg->user,
+                        lookup_err ? lookup_err : "lookup failed");
+            errno = saved ? saved : EINVAL;
             return -1;
         }
         out->has_creds = true;

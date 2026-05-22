@@ -409,9 +409,16 @@ int oci_run(oci_store_t *store,
         goto out;
     }
 
-    /* 5. fold runtime + CLI overrides into argv/envp/cwd/uid. */
+    /* 5. fold runtime + CLI overrides into argv/envp/cwd/uid. Layer
+     * the unpacked clone-rootfs over the caller's flags so the runspec
+     * resolver can read /etc/passwd and /etc/group for symbolic User
+     * (Phase 4 F4.7). The caller-side flags stay const; only the local
+     * copy points the resolver at the rootfs.
+     */
+    oci_runspec_flags_t spec_flags = opts->spec;
+    spec_flags.rootfs_for_nss = run_dir;
     const char *rs_err = NULL;
-    if (oci_runspec_build(&cfg.config, &opts->spec, host_environ, &spec,
+    if (oci_runspec_build(&cfg.config, &spec_flags, host_environ, &spec,
                           &rs_err) < 0) {
         set_err_fmt(err, "runspec build failed: %s",
                     rs_err ? rs_err : strerror(errno));
@@ -530,7 +537,8 @@ static int print_run_usage(FILE *out)
         "  -e, --env KEY=VAL     Set or replace env var\n"
         "  -e, --env KEY         Import KEY from host environ\n"
         "  -w, --workdir DIR     Override image WorkingDir\n"
-        "  -u, --user UID[:GID]  Override image User (numeric only)\n"
+        "  -u, --user UID[:GID]  Override image User (numeric or "
+        "name[:group])\n"
         "  --keep                Keep the per-run rootfs after exit\n"
         "  --name NAME           Reserved: deterministic clone dir\n"
         "                        (currently ignored)\n"

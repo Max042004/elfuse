@@ -39,12 +39,16 @@
  * EINVAL; sysroot containment is enforced later by the path-resolve module
  * and the syscall layer.
  *
- * User accepts numeric "UID" or "UID:GID". When only UID is given, GID
- * defaults to the same value (matching Docker's "primary group falls
- * through to the user's id" convention when no NSS resolution is
- * available). Symbolic users are rejected with the deterministic Phase 4
- * pointer message documented in oci-roadmap.md Q4. CLI --user takes
- * precedence over the image User; both go through the same numeric parse.
+ * User accepts the seven shapes the OCI image-spec defines: empty (no
+ * override), "uid", "uid:gid", "name", "name:group", "uid:group", and
+ * "name:gid". Symbolic forms (anything other than the two pure-numeric
+ * shapes) require flags->rootfs_for_nss; the resolver reads
+ * <rootfs>/etc/passwd and <rootfs>/etc/group through oci_user_lookup
+ * (see src/oci/user-lookup.h). When rootfs_for_nss is NULL the resolver
+ * still accepts the pure-numeric forms; a symbolic token then returns
+ * EINVAL so unit tests can hold runspec to its "pure data" contract by
+ * passing NULL. CLI --user takes precedence over the image User; both
+ * shapes go through the same lookup.
  *
  * Error reporting: on failure, the function writes a pointer into *err
  * that names what went wrong. The pointer is valid until the next call
@@ -75,6 +79,11 @@ typedef struct {
     const char *user_override;
     int positional_argc;
     const char *const *positional_argv;
+    /* Directory the symbolic User resolver treats as "/" when reading
+     * /etc/passwd and /etc/group. NULL keeps the builder pure-data: any
+     * symbolic User token then returns EINVAL.
+     */
+    const char *rootfs_for_nss;
 } oci_runspec_flags_t;
 
 /* Resolved launch bundle. cwd is always set (defaults to "/"). argv and

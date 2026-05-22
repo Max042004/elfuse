@@ -90,6 +90,7 @@ SRCS := \
     oci/unpack.c \
     oci/rebuild-cache.c \
     oci/runspec.c \
+    oci/user-lookup.c \
     oci/path-resolve.c \
     oci/runtime-files.c \
     oci/run.c
@@ -294,11 +295,19 @@ $(BUILD_DIR)/test-oci-tar: $(BUILD_DIR)/test-oci-tar.o $(BUILD_DIR)/oci/tar.o | 
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
-## Build the OCI runspec unit test (native macOS, no HVF). Pure-data
-## merge of image-config runtime block + CLI overrides; the test feeds
-## oci_image_runtime_t literals directly through oci_runspec_build with
-## no filesystem or libcurl dependency.
-$(BUILD_DIR)/test-oci-runspec: $(BUILD_DIR)/test-oci-runspec.o $(BUILD_DIR)/oci/runspec.o | $(BUILD_DIR)
+## Build the OCI runspec unit test (native macOS, no HVF). Merges
+## image-config runtime block + CLI overrides; the rootfs-driven
+## symbolic-User cases write /etc/passwd and /etc/group fixtures under
+## /tmp, so the link island pulls in oci/user-lookup.o.
+$(BUILD_DIR)/test-oci-runspec: $(BUILD_DIR)/test-oci-runspec.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/user-lookup.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI User-field resolver unit test (native macOS, no HVF).
+## Pure C; the test builds scratch /tmp rootfses with synthetic
+## /etc/passwd / /etc/group and drives oci_user_lookup across the seven
+## OCI image-spec User shapes plus the policy edges.
+$(BUILD_DIR)/test-oci-user: $(BUILD_DIR)/test-oci-user.o $(BUILD_DIR)/oci/user-lookup.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
@@ -316,7 +325,7 @@ $(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD
 ## the test ships an in-file elfuse_launch stub that aborts when called,
 ## and every case installs a launch hook via oci_run_set_launch_for_testing
 ## before invoking oci_run, so the real VM bring-up never runs from a test.
-$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/runtime-files.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/user-lookup.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/runtime-files.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
 
