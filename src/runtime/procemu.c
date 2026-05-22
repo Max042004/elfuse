@@ -2047,6 +2047,65 @@ int proc_intercept_open(const guest_t *g,
             "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
     }
 
+    /* /proc/self/cgroup -> empty cgroup v2 layout. elfuse runs outside any
+     * cgroup hierarchy, so emit the canonical "no cgroup" form ("0::/").
+     * Container detectors (systemd-detect-virt, runc internal, podman) read
+     * this and interpret "0::/" as "host environment, not containerized".
+     * Returning a fake v1 hierarchy here would mislead those probes into
+     * thinking elfuse is itself a container manager.
+     */
+    if (!strcmp(path, "/proc/self/cgroup"))
+        return proc_emit_literal("0::/\n");
+
+    /* /proc/sys/kernel/{ostype,osrelease,hostname} mirror the fields of the
+     * cached uname struct so uname(2) and procfs agree. Some init scripts
+     * and language runtimes (Go runtime/sys/unix, Java's sun.misc.VM) read
+     * both and abort on mismatch.
+     */
+    if (!strcmp(path, "/proc/sys/kernel/ostype"))
+        return proc_emit_literal("Linux\n");
+    if (!strcmp(path, "/proc/sys/kernel/osrelease"))
+        return proc_emit_fmt("%s\n", sys_uname_cached()->release);
+    if (!strcmp(path, "/proc/sys/kernel/hostname"))
+        return proc_emit_fmt("%s\n", sys_uname_cached()->nodename);
+
+    /* /proc/self/comm -> the comm-name string + LF. ps, htop, and pstree
+     * read this when /proc/<pid>/stat parsing is inconvenient. Matches the
+     * second field of /proc/self/stat (basename of the loaded ELF).
+     */
+    if (!strcmp(path, "/proc/self/comm"))
+        return proc_emit_fmt("%s\n", proc_comm_name());
+
+    /* /proc/self/statm -> seven page-count fields:
+     *   size resident shared text lib data dt
+     * top, ps -o vsz/rss, and htop read this in place of the parser-hostile
+     * /proc/self/stat. Compute from g->regions[] using the same source as
+     * the vsize/rss columns of /proc/self/stat. shared/lib/dt stay zero
+     * (Linux docs note "dt" is unused since 2.6; shared and lib have weak
+     * meaning without a real page cache).
+     */
+    if (!strcmp(path, "/proc/self/statm")) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0)
+            page_size = 4096;
+        uint64_t total = 0, resident = 0, text = 0, data = 0;
+        for (int i = 0; i < g->nregions; i++) {
+            uint64_t pages = (g->regions[i].end - g->regions[i].start) /
+                             (uint64_t) page_size;
+            total += pages;
+            if (g->regions[i].prot != LINUX_PROT_NONE)
+                resident += pages;
+            if (g->regions[i].prot & LINUX_PROT_EXEC)
+                text += pages;
+            else if (g->regions[i].prot & LINUX_PROT_WRITE)
+                data += pages;
+        }
+        return proc_emit_fmt(
+            "%llu %llu 0 %llu 0 %llu 0\n", (unsigned long long) total,
+            (unsigned long long) resident, (unsigned long long) text,
+            (unsigned long long) data);
+    }
+
     /* OOM nodes share one stored adjustment.
      *   oom_score_adj: returns the raw adjustment in [-1000, 1000].
      *   oom_adj:       legacy view, scaled into [-17, 15] for compatibility.
@@ -2505,6 +2564,12 @@ int proc_intercept_stat(const char *path, struct stat *st)
         "/proc/filesystems",
         "/proc/sys/vm/mmap_min_addr",
         "/proc/sys/kernel/randomize_va_space",
+        "/proc/sys/kernel/ostype",
+        "/proc/sys/kernel/osrelease",
+        "/proc/sys/kernel/hostname",
+        "/proc/self/cgroup",
+        "/proc/self/comm",
+        "/proc/self/statm",
         "/proc/net/tcp",
         "/proc/net/tcp6",
         "/proc/net/udp",

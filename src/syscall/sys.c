@@ -178,6 +178,11 @@ int64_t sys_uname(guest_t *g, uint64_t buf_gva)
     return 0;
 }
 
+const linux_utsname_t *sys_uname_cached(void)
+{
+    return &cached_uname;
+}
+
 int64_t sys_getrandom(guest_t *g,
                       uint64_t buf_gva,
                       uint64_t buflen,
