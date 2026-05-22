@@ -176,6 +176,102 @@ static int load_blob(oci_blob_store_t *blobs,
     return 0;
 }
 
+/* Resolve the manifest blob pinned at digest_str. If the blob is an
+ * image index (the shape docker.io multi-arch tags such as alpine:3
+ * pin to by default), drill into the linux/arm64 leaf descriptor and
+ * re-load that blob; the leaf body is what oci_manifest_parse expects.
+ * The mirror of this classify-then-walk path lives in src/oci/inspect.c;
+ * keep the two in sync. On success returns 0 with *out_body holding the
+ * leaf-manifest bytes, *out_len its length, and *out_mf the parsed
+ * shape. The caller frees *out_body via free() and *out_mf via
+ * oci_manifest_free(); on failure both stay untouched and the helper
+ * cleans up its own intermediate state.
+ */
+static int resolve_image_manifest(oci_store_t *store,
+                                  const char *digest_str,
+                                  char **out_body,
+                                  size_t *out_len,
+                                  oci_manifest_t *out_mf,
+                                  const char **err)
+{
+    oci_digest_algo_t algo;
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (!oci_digest_parse(digest_str, &algo, hex)) {
+        set_err_static(err, "pinned manifest digest is malformed");
+        errno = EINVAL;
+        return -1;
+    }
+
+    char *body = NULL;
+    size_t len = 0;
+    if (load_blob(oci_store_blobs(store), algo, hex, &body, &len, err) < 0)
+        return -1;
+
+    /* Classify. Index and manifest are disjoint JSON shapes (one
+     * requires "manifests", the other requires "config" + "layers"),
+     * so a successful parse is unambiguous. Drilling happens only when
+     * the index parse wins; the leaf-pinned shape (the fixture-builder
+     * and tests/test-oci-compat.sh path) falls through directly to the
+     * manifest parser below.
+     */
+    oci_index_t idx = {0};
+    if (oci_index_parse(body, len, &idx, NULL) == 0) {
+        const oci_index_entry_t *picked = oci_index_pick_linux_arm64(&idx);
+        if (!picked) {
+            oci_index_free(&idx);
+            free(body);
+            set_err_static(err, "image index has no linux/arm64 entry");
+            errno = ENOENT;
+            return -1;
+        }
+        char *sub_body = NULL;
+        size_t sub_len = 0;
+        if (load_blob(oci_store_blobs(store), picked->desc.algo,
+                      picked->desc.hex, &sub_body, &sub_len, err) < 0) {
+            oci_index_free(&idx);
+            free(body);
+            return -1;
+        }
+        oci_index_free(&idx);
+        free(body);
+        body = sub_body;
+        len = sub_len;
+    }
+
+    oci_manifest_t mf = {0};
+    const char *mparse_err = NULL;
+    if (oci_manifest_parse(body, len, &mf, &mparse_err) < 0) {
+        set_err_fmt(err, "manifest parse failed: %s",
+                    mparse_err ? mparse_err : "(no message)");
+        free(body);
+        errno = EPROTO;
+        return -1;
+    }
+
+    *out_body = body;
+    *out_len = len;
+    *out_mf = mf;
+    return 0;
+}
+
+int oci_run_resolve_image_manifest_for_testing(oci_store_t *store,
+                                               const char *digest_str,
+                                               char **out_body,
+                                               size_t *out_len,
+                                               oci_manifest_t *out_mf,
+                                               const char **err)
+{
+    if (err)
+        *err = NULL;
+    if (!store || !digest_str || !out_body || !out_len || !out_mf) {
+        set_err_static(err, "resolve_image_manifest: NULL argument");
+        errno = EINVAL;
+        return -1;
+    }
+    return resolve_image_manifest(store, digest_str, out_body, out_len, out_mf,
+                                  err);
+}
+
 /* Concatenate two path components with one slash boundary. Caller frees
  * the result.
  */
@@ -370,7 +466,12 @@ int oci_run(oci_store_t *store,
         goto out;
     }
 
-    /* 4. read manifest blob, then config blob, then parse both. */
+    /* 4. read manifest blob, then config blob, then parse both. The
+     * manifest read goes through resolve_image_manifest, which
+     * transparently walks one image-index indirection when the pin
+     * lands on a multi-arch index (the docker.io default for tags like
+     * alpine:3).
+     */
     char *manifest_digest_str = NULL;
     const char *getref_err = NULL;
     if (oci_store_get_ref(store, ref, &manifest_digest_str, &getref_err) < 0) {
@@ -378,25 +479,12 @@ int oci_run(oci_store_t *store,
                     getref_err ? getref_err : strerror(errno));
         goto out;
     }
-    oci_digest_algo_t algo;
-    char hex[OCI_DIGEST_HEX_MAX + 1];
-    if (!oci_digest_parse(manifest_digest_str, &algo, hex)) {
-        free(manifest_digest_str);
-        set_err_static(err, "pinned manifest digest is malformed");
-        errno = EINVAL;
-        goto out;
-    }
-    free(manifest_digest_str);
     size_t manifest_len = 0;
-    if (load_blob(oci_store_blobs(store), algo, hex, &manifest_body,
-                  &manifest_len, err) < 0)
+    int rcm = resolve_image_manifest(store, manifest_digest_str, &manifest_body,
+                                     &manifest_len, &mf, err);
+    free(manifest_digest_str);
+    if (rcm < 0)
         goto out;
-    const char *mparse_err = NULL;
-    if (oci_manifest_parse(manifest_body, manifest_len, &mf, &mparse_err) < 0) {
-        set_err_fmt(err, "manifest parse failed: %s",
-                    mparse_err ? mparse_err : "(no message)");
-        goto out;
-    }
     size_t config_len = 0;
     if (load_blob(oci_store_blobs(store), mf.config.algo, mf.config.hex,
                   &config_body, &config_len, err) < 0)

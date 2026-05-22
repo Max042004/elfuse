@@ -37,6 +37,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "oci/blob-store.h"
+#include "oci/digest.h"
+#include "oci/manifest.h"
 #include "oci/ref.h"
 #include "oci/run.h"
 #include "oci/store.h"
@@ -183,6 +186,104 @@ static cli_result_t capture_oci_cli_run(int argc, char **argv)
     }
     close(fd);
     return r;
+}
+
+/* Drop bytes into the blob store at sha256:<hex>. Mirrors the slice 5a
+ * pull pipeline shape and the helper used by tests/test-oci-inspect.c.
+ * Writes the "sha256:<hex>" form into *out_digest_str (caller-provided
+ * buffer of at least OCI_DIGEST_HEX_MAX + 16 bytes).
+ */
+static bool put_blob_bytes(oci_blob_store_t *blobs,
+                           const char *body,
+                           size_t body_len,
+                           char *out_digest_str,
+                           size_t out_cap)
+{
+    char hex[OCI_DIGEST_HEX_MAX + 1];
+    if (oci_digest_bytes(OCI_DIGEST_SHA256, body, body_len, hex) == 0)
+        return false;
+    snprintf(out_digest_str, out_cap, "sha256:%s", hex);
+    if (oci_blob_store_put_bytes(blobs, OCI_DIGEST_SHA256, hex, body,
+                                 body_len) < 0)
+        return false;
+    return true;
+}
+
+static char *vformat(size_t *out_len, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static char *vformat(size_t *out_len, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return NULL;
+    char *r = malloc((size_t) n + 1);
+    if (!r)
+        return NULL;
+    va_start(ap, fmt);
+    vsnprintf(r, (size_t) n + 1, fmt, ap);
+    va_end(ap);
+    if (out_len)
+        *out_len = (size_t) n;
+    return r;
+}
+
+/* Synthesize a minimal but parseable leaf manifest body. The config and
+ * layer descriptors point at synthetic digests that the test pre-loads
+ * into the store; the manifest classifier only validates JSON shape, so
+ * the descriptors do not need to correspond to real OCI artifacts.
+ */
+static char *build_leaf_manifest(size_t *out_len,
+                                 const char *config_digest,
+                                 size_t config_size,
+                                 const char *layer_digest,
+                                 size_t layer_size)
+{
+    return vformat(
+        out_len,
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"config\":{"
+        "\"mediaType\":\"application/vnd.oci.image.config.v1+json\","
+        "\"digest\":\"%s\",\"size\":%zu},"
+        "\"layers\":["
+        "{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"digest\":\"%s\",\"size\":%zu}]}",
+        config_digest, config_size, layer_digest, layer_size);
+}
+
+/* Synthesize a three-platform index where linux/arm64/v8 points at
+ * arm64_digest. The amd64 and s390x entries reference digests that the
+ * test never stores; the helper under test must short-circuit to the
+ * arm64 leaf before touching the others.
+ */
+static char *build_multi_arch_index(size_t *out_len,
+                                    const char *arm64_digest,
+                                    size_t arm64_size)
+{
+    return vformat(
+        out_len,
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+        "\"manifests\":["
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"sha256:"
+        "1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"size\":1024,"
+        "\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"%s\",\"size\":%zu,"
+        "\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\","
+        "\"variant\":\"v8\"}},"
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"sha256:"
+        "3333333333333333333333333333333333333333333333333333333333333333\","
+        "\"size\":1024,"
+        "\"platform\":{\"architecture\":\"s390x\",\"os\":\"linux\"}}]}",
+        arm64_digest, arm64_size);
 }
 
 /* ── CLI parser cases ─────────────────────────────────────────────── */
@@ -367,6 +468,228 @@ static void case_run_no_pin(const char *scratch)
     oci_store_close(store);
 }
 
+/* ── Manifest resolution: leaf-pinned (no index indirection) ──────── */
+
+static void case_resolve_leaf_manifest(const char *scratch)
+{
+    const char *name =
+        "resolve: ref pinned at leaf manifest is parsed directly";
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/resolve-leaf", scratch);
+    oci_store_t *store = oci_store_open(root);
+    if (!store) {
+        report_fail(name, "store open failed: %s", strerror(errno));
+        return;
+    }
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    static const char CONFIG[] = "{\"placeholder-config\":true}";
+    static const char LAYER[] = "synthetic-layer-bytes";
+    char config_digest[OCI_DIGEST_HEX_MAX + 16];
+    char layer_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!put_blob_bytes(blobs, CONFIG, sizeof(CONFIG) - 1, config_digest,
+                        sizeof(config_digest)) ||
+        !put_blob_bytes(blobs, LAYER, sizeof(LAYER) - 1, layer_digest,
+                        sizeof(layer_digest))) {
+        report_fail(name, "config/layer blob put failed");
+        oci_store_close(store);
+        return;
+    }
+
+    size_t mlen = 0;
+    char *manifest_body = build_leaf_manifest(
+        &mlen, config_digest, sizeof(CONFIG) - 1, layer_digest,
+        sizeof(LAYER) - 1);
+    char manifest_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!manifest_body || !put_blob_bytes(blobs, manifest_body, mlen,
+                                          manifest_digest,
+                                          sizeof(manifest_digest))) {
+        report_fail(name, "manifest blob put failed");
+        free(manifest_body);
+        oci_store_close(store);
+        return;
+    }
+
+    char *out_body = NULL;
+    size_t out_len = 0;
+    oci_manifest_t mf = {0};
+    const char *err = NULL;
+    int rc = oci_run_resolve_image_manifest_for_testing(
+        store, manifest_digest, &out_body, &out_len, &mf, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+    } else if (!mf.config.digest_str ||
+               strcmp(mf.config.digest_str, config_digest) != 0) {
+        report_fail(name, "config digest mismatch: got %s want %s",
+                    mf.config.digest_str ? mf.config.digest_str : "(null)",
+                    config_digest);
+    } else if (mf.nlayers != 1) {
+        report_fail(name, "nlayers=%zu (want 1)", mf.nlayers);
+    } else {
+        report_pass(name);
+    }
+
+    oci_manifest_free(&mf);
+    free(out_body);
+    free(manifest_body);
+    oci_store_close(store);
+}
+
+/* ── Manifest resolution: index-walk (docker.io multi-arch shape) ─── */
+
+static void case_resolve_index_walk_to_arm64(const char *scratch)
+{
+    const char *name =
+        "resolve: ref pinned at image index drills linux/arm64 leaf";
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/resolve-index", scratch);
+    oci_store_t *store = oci_store_open(root);
+    if (!store) {
+        report_fail(name, "store open failed: %s", strerror(errno));
+        return;
+    }
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    static const char CONFIG[] = "{\"placeholder-config\":true}";
+    static const char LAYER[] = "synthetic-layer-bytes";
+    char config_digest[OCI_DIGEST_HEX_MAX + 16];
+    char layer_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!put_blob_bytes(blobs, CONFIG, sizeof(CONFIG) - 1, config_digest,
+                        sizeof(config_digest)) ||
+        !put_blob_bytes(blobs, LAYER, sizeof(LAYER) - 1, layer_digest,
+                        sizeof(layer_digest))) {
+        report_fail(name, "config/layer blob put failed");
+        oci_store_close(store);
+        return;
+    }
+
+    size_t mlen = 0;
+    char *manifest_body = build_leaf_manifest(
+        &mlen, config_digest, sizeof(CONFIG) - 1, layer_digest,
+        sizeof(LAYER) - 1);
+    char manifest_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!manifest_body || !put_blob_bytes(blobs, manifest_body, mlen,
+                                          manifest_digest,
+                                          sizeof(manifest_digest))) {
+        report_fail(name, "manifest blob put failed");
+        free(manifest_body);
+        oci_store_close(store);
+        return;
+    }
+
+    size_t idx_len = 0;
+    char *index_body =
+        build_multi_arch_index(&idx_len, manifest_digest, mlen);
+    char index_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!index_body || !put_blob_bytes(blobs, index_body, idx_len, index_digest,
+                                       sizeof(index_digest))) {
+        report_fail(name, "index blob put failed");
+        free(index_body);
+        free(manifest_body);
+        oci_store_close(store);
+        return;
+    }
+
+    char *out_body = NULL;
+    size_t out_len = 0;
+    oci_manifest_t mf = {0};
+    const char *err = NULL;
+    int rc = oci_run_resolve_image_manifest_for_testing(
+        store, index_digest, &out_body, &out_len, &mf, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s (index-walk should have succeeded)",
+                    rc, err ? err : "(none)");
+    } else if (out_len != mlen) {
+        report_fail(name, "out_len=%zu (want leaf-manifest len %zu)", out_len,
+                    mlen);
+    } else if (!mf.config.digest_str ||
+               strcmp(mf.config.digest_str, config_digest) != 0) {
+        report_fail(name,
+                    "config digest mismatch (drilled into wrong blob?): got "
+                    "%s want %s",
+                    mf.config.digest_str ? mf.config.digest_str : "(null)",
+                    config_digest);
+    } else if (mf.nlayers != 1) {
+        report_fail(name, "nlayers=%zu (want 1)", mf.nlayers);
+    } else {
+        report_pass(name);
+    }
+
+    oci_manifest_free(&mf);
+    free(out_body);
+    free(index_body);
+    free(manifest_body);
+    oci_store_close(store);
+}
+
+/* ── Manifest resolution: index without linux/arm64 reports ENOENT ── */
+
+static void case_resolve_index_no_arm64(const char *scratch)
+{
+    const char *name =
+        "resolve: image index lacking linux/arm64 fails with ENOENT";
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/resolve-noarm64", scratch);
+    oci_store_t *store = oci_store_open(root);
+    if (!store) {
+        report_fail(name, "store open failed: %s", strerror(errno));
+        return;
+    }
+    oci_blob_store_t *blobs = oci_store_blobs(store);
+
+    /* Two-entry index, both amd64. The helper must reject without
+     * touching a sub-manifest blob (none are stored).
+     */
+    static const char INDEX[] =
+        "{\"schemaVersion\":2,"
+        "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+        "\"manifests\":["
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"sha256:"
+        "1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"size\":1024,"
+        "\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},"
+        "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\","
+        "\"digest\":\"sha256:"
+        "2222222222222222222222222222222222222222222222222222222222222222\","
+        "\"size\":1024,"
+        "\"platform\":{\"architecture\":\"amd64\",\"os\":\"windows\"}}]}";
+    char index_digest[OCI_DIGEST_HEX_MAX + 16];
+    if (!put_blob_bytes(blobs, INDEX, sizeof(INDEX) - 1, index_digest,
+                        sizeof(index_digest))) {
+        report_fail(name, "index blob put failed");
+        oci_store_close(store);
+        return;
+    }
+
+    char *out_body = NULL;
+    size_t out_len = 0;
+    oci_manifest_t mf = {0};
+    const char *err = NULL;
+    errno = 0;
+    int rc = oci_run_resolve_image_manifest_for_testing(
+        store, index_digest, &out_body, &out_len, &mf, &err);
+    int saved_errno = errno;
+    if (rc == 0) {
+        report_fail(name, "rc=0 (helper accepted an arm64-less index)");
+        oci_manifest_free(&mf);
+        free(out_body);
+    } else if (saved_errno != ENOENT) {
+        report_fail(name, "errno=%d (want ENOENT=%d) err=%s", saved_errno,
+                    ENOENT, err ? err : "(none)");
+    } else if (!err || !strstr(err, "linux/arm64")) {
+        report_fail(name, "err missing linux/arm64 mention: %s",
+                    err ? err : "(none)");
+    } else {
+        report_pass(name);
+    }
+
+    oci_store_close(store);
+}
+
 int main(void)
 {
     char *scratch = make_scratch_root();
@@ -382,6 +705,9 @@ int main(void)
     case_cli_missing_env_value();
     case_run_case_insensitive_volume(scratch);
     case_run_no_pin(scratch);
+    case_resolve_leaf_manifest(scratch);
+    case_resolve_index_walk_to_arm64(scratch);
+    case_resolve_index_no_arm64(scratch);
 
     wipe_dir(scratch);
     free(scratch);

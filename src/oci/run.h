@@ -39,9 +39,11 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "core/launch.h"
 
+#include "manifest.h"
 #include "ref.h"
 #include "runspec.h"
 #include "store.h"
@@ -95,3 +97,18 @@ int oci_run(oci_store_t *store,
  */
 typedef int (*oci_run_launch_fn_t)(const launch_args_t *args);
 void oci_run_set_launch_for_testing(oci_run_launch_fn_t fn);
+
+/* Test hook: drive the manifest-resolution step (load blob, classify
+ * index vs leaf, drill linux/arm64 on index, parse) in isolation. The
+ * production caller is oci_run; this hook exists so unit tests can
+ * verify the multi-arch index-walk without spinning up an APFS
+ * sysroot volume. Output ownership matches the production internal
+ * helper: caller frees *out_body and *out_mf via free() and
+ * oci_manifest_free() respectively. Production code must use oci_run.
+ */
+int oci_run_resolve_image_manifest_for_testing(oci_store_t *store,
+                                               const char *digest_str,
+                                               char **out_body,
+                                               size_t *out_len,
+                                               oci_manifest_t *out_mf,
+                                               const char **err);
