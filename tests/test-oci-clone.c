@@ -173,6 +173,170 @@ out_src: {
 }
 }
 
+static void test_clone_new_file_isolated(void)
+{
+    /* F4.1 DoD positive direction: a brand-new file written inside the
+     * clone must not surface in the immutable source. The existing
+     * test_clone_cow covers mutate-in-place; this case isolates the
+     * "touch /hello" wording from issue #31 Phase 4 acceptance 1 so a
+     * future regression in clonefile or in the run-dir layout cannot
+     * pass without one of the two checks failing.
+     */
+    char src[] = "/tmp/elfuse-clone-new-src-XXXXXX";
+    if (!mkdtemp(src)) {
+        report_fail("clone new-file isolation", "mkdtemp src failed: errno=%d",
+                    errno);
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/preexisting", src);
+    if (write_file(path, "kept\n") < 0) {
+        report_fail("clone new-file isolation", "write preexisting failed");
+        goto out_src;
+    }
+
+    char vol[] = "/tmp/elfuse-clone-new-vol-XXXXXX";
+    if (!mkdtemp(vol)) {
+        report_fail("clone new-file isolation", "mkdtemp vol failed");
+        goto out_src;
+    }
+
+    char *run = NULL;
+    const char *err = NULL;
+    int rc = oci_clone_rootfs(src, vol, &run, &err);
+    if (rc < 0 && errno == ENOTSUP) {
+        report_skip("clone new-file isolation",
+                    "clonefile ENOTSUP on this volume");
+        goto out_vol;
+    }
+    if (rc != 0 || !run) {
+        report_fail("clone new-file isolation", "rc=%d err=%s", rc,
+                    err ? err : "(nil)");
+        goto out_vol;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello", run);
+    if (write_file(path, "fresh\n") < 0) {
+        report_fail("clone new-file isolation",
+                    "write hello in clone failed: errno=%d", errno);
+        goto out_run;
+    }
+    if (!file_has(path, "fresh\n")) {
+        report_fail("clone new-file isolation", "clone hello readback wrong");
+        goto out_run;
+    }
+
+    snprintf(path, sizeof(path), "%s/hello", src);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        report_fail("clone new-file isolation",
+                    "source dir now has hello (clone leaked)");
+        goto out_run;
+    }
+    if (errno != ENOENT) {
+        report_fail("clone new-file isolation",
+                    "source hello stat unexpected errno=%d", errno);
+        goto out_run;
+    }
+    report_pass("clone new-file does not leak into source (F4.1 DoD)");
+
+out_run:
+    snprintf(path, sizeof(path), "%s/hello", run);
+    unlink(path);
+    oci_clone_rootfs_remove(run, NULL);
+    free(run);
+out_vol: {
+    char runs_dir[1024];
+    snprintf(runs_dir, sizeof(runs_dir), "%s/runs", vol);
+    rmdir(runs_dir);
+    rmdir(vol);
+}
+out_src: {
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/preexisting", src);
+    unlink(p);
+    rmdir(src);
+}
+}
+
+static void test_clone_unlink_preserves_src(void)
+{
+    /* F4.1 DoD negative direction: an unlink inside the clone must not
+     * propagate to the source. Together with test_clone_cow's mutate
+     * check and test_clone_new_file_isolated's create check this pins
+     * the three operations a real guest "touch /hello && rm /etc/foo"
+     * exercise hits during a Phase 4 oci run.
+     */
+    char src[] = "/tmp/elfuse-clone-unlink-src-XXXXXX";
+    if (!mkdtemp(src)) {
+        report_fail("clone unlink isolation", "mkdtemp src failed: errno=%d",
+                    errno);
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/persist", src);
+    if (write_file(path, "stays\n") < 0) {
+        report_fail("clone unlink isolation", "write persist failed");
+        goto out_src;
+    }
+
+    char vol[] = "/tmp/elfuse-clone-unlink-vol-XXXXXX";
+    if (!mkdtemp(vol)) {
+        report_fail("clone unlink isolation", "mkdtemp vol failed");
+        goto out_src;
+    }
+
+    char *run = NULL;
+    const char *err = NULL;
+    int rc = oci_clone_rootfs(src, vol, &run, &err);
+    if (rc < 0 && errno == ENOTSUP) {
+        report_skip("clone unlink isolation",
+                    "clonefile ENOTSUP on this volume");
+        goto out_vol;
+    }
+    if (rc != 0 || !run) {
+        report_fail("clone unlink isolation", "rc=%d err=%s", rc,
+                    err ? err : "(nil)");
+        goto out_vol;
+    }
+
+    snprintf(path, sizeof(path), "%s/persist", run);
+    if (unlink(path) < 0) {
+        report_fail("clone unlink isolation",
+                    "unlink in clone failed: errno=%d", errno);
+        goto out_run;
+    }
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        report_fail("clone unlink isolation", "clone persist survived unlink");
+        goto out_run;
+    }
+
+    snprintf(path, sizeof(path), "%s/persist", src);
+    if (!file_has(path, "stays\n")) {
+        report_fail("clone unlink isolation",
+                    "source persist missing or wrong after clone unlink");
+        goto out_run;
+    }
+    report_pass("clone unlink leaves source intact (F4.1 DoD)");
+
+out_run:
+    oci_clone_rootfs_remove(run, NULL);
+    free(run);
+out_vol: {
+    char runs_dir[1024];
+    snprintf(runs_dir, sizeof(runs_dir), "%s/runs", vol);
+    rmdir(runs_dir);
+    rmdir(vol);
+}
+out_src: {
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/persist", src);
+    unlink(p);
+    rmdir(src);
+}
+}
+
 static void test_remove_empty(void)
 {
     /* Removing a non-existent path is a no-op (errno=ENOENT short-
@@ -204,6 +368,8 @@ int main(void)
 {
     printf("oci_clone_rootfs\n");
     test_clone_cow();
+    test_clone_new_file_isolated();
+    test_clone_unlink_preserves_src();
     test_remove_empty();
     test_gc_stub();
     printf("\nResults: %d/%d passed\n", passed, total);
