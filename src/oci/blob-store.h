@@ -27,6 +27,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "digest.h"
 
@@ -79,6 +80,51 @@ oci_blob_writer_t *oci_blob_writer_begin(oci_blob_store_t *s,
 oci_blob_writer_t *oci_blob_writer_begin_named(oci_blob_store_t *s,
                                                oci_digest_algo_t algo,
                                                const char *expected_hex);
+
+/* Open a writer that resumes from an existing tmp/blob-<hex prefix 16>-*
+ * partial when one is present. Scans tmp/ for files whose name starts with
+ * the digest prefix; selects the largest matching file; reopens it O_RDWR,
+ * re-hashes the bytes that are already on disk into the digester, and
+ * positions the fd at end-of-file so the next write appends. The selected
+ * partial keeps its name; siblings with the same prefix are unlinked.
+ *
+ * Falls back to oci_blob_writer_begin_named (fresh mkstemp staging file,
+ * offset 0) when any of these holds:
+ *   - tmp/ has no matching partial
+ *   - partial size >= expected_size (corrupt or stale; would defeat the
+ *     descriptor size cap during the resumed transfer)
+ *   - partial size is zero
+ *   - reopen / re-hash fails for any reason
+ *
+ * On success returns a writer and, when out_resume_offset is non-NULL,
+ * writes the partial byte count there (0 on the fallback paths). Returns
+ * NULL only on the hard-error conditions that oci_blob_writer_begin_named
+ * also returns NULL for (EINVAL on bad arguments, ENOMEM on calloc, etc.).
+ *
+ * expected_size must be the descriptor's declared blob size in bytes. The
+ * store does not know what the caller will subsequently issue as a Range
+ * request; the parameter is here so the store can pre-reject partials that
+ * are at or past the declared size (which would tip the streaming overflow
+ * gate downstream into a "blob exceeded declared size" failure rather than
+ * a clean restart).
+ */
+oci_blob_writer_t *oci_blob_writer_resume_named(oci_blob_store_t *s,
+                                                oci_digest_algo_t algo,
+                                                const char *expected_hex,
+                                                int64_t expected_size,
+                                                int64_t *out_resume_offset);
+
+/* Delete tmp/ partials whose mtime is older than ttl_secs seconds ago.
+ * Matches any file in tmp/ whose name starts with "blob-"; non-matching
+ * names and subdirectories are skipped. Errors during the scan are
+ * silent: a missing tmp/ directory, a permission denial, or a per-file
+ * unlink failure leaves the rest of the sweep running.
+ *
+ * The store retains exclusive ownership of tmp/, so an aggressive prefix
+ * filter would not catch any third-party content. ttl_secs is the caller's
+ * choice; the fetcher invokes this once per batch with seven days.
+ */
+void oci_blob_store_sweep_partials(oci_blob_store_t *s, long ttl_secs);
 
 /* Append data to the staging file and the running digest. Returns true on
  * success or false on a short write / I/O error with errno preserved. On

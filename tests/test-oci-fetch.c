@@ -26,12 +26,14 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -115,10 +117,10 @@ static void h_anonymous_manifest(oci_mock_server_t *s, oci_mock_io_t *io,
     handler_anonymous_manifest_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->manifest_path) == 0) {
         oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, ctx->docker_digest,
-                       NULL, ctx->body, ctx->body_len);
+                       NULL, NULL, ctx->body, ctx->body_len);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL, "nope", 4);
 }
 
 typedef struct {
@@ -138,7 +140,7 @@ static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_moc
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->expected_token);
-        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL,
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL, NULL,
                        body, (size_t) n);
         return;
     }
@@ -147,7 +149,7 @@ static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_moc
         snprintf(want_auth, sizeof(want_auth), "Bearer %s", ctx->expected_token);
         if (strcmp(req->authorization, want_auth) == 0) {
             oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
-                           NULL, ctx->manifest_body, ctx->manifest_body_len);
+                           NULL, NULL, ctx->manifest_body, ctx->manifest_body_len);
             return;
         }
         char challenge[512];
@@ -156,10 +158,10 @@ static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_moc
                  "scope=\"repository:private/secret:pull\"",
                  ctx->base_url);
         oci_mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
-                       NULL, NULL, "{}", 2);
+                       NULL, NULL, NULL, "{}", 2);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL, "nope", 4);
 }
 
 typedef struct {
@@ -174,12 +176,12 @@ static void h_blob(oci_mock_server_t *s, oci_mock_io_t *io, const oci_mock_reque
 {
     handler_blob_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->blob_path) != 0) {
-        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL, "nope", 4);
         return;
     }
     int status = ctx->status ? ctx->status : 200;
     if (status != 200) {
-        oci_mock_send_full(io, status, "Error", "text/plain", NULL, NULL, NULL, "err", 3);
+        oci_mock_send_full(io, status, "Error", "text/plain", NULL, NULL, NULL, NULL, "err", 3);
         return;
     }
     if (ctx->oversize) {
@@ -188,12 +190,12 @@ static void h_blob(oci_mock_server_t *s, oci_mock_io_t *io, const oci_mock_reque
         memcpy(buf, ctx->body, ctx->body_len);
         memset(buf + ctx->body_len, 'X', 5);
         oci_mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
-                       NULL, buf, pad_len);
+                       NULL, NULL, buf, pad_len);
         free(buf);
         return;
     }
     oci_mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
-                   NULL, ctx->body, ctx->body_len);
+                   NULL, NULL, ctx->body, ctx->body_len);
 }
 
 typedef struct {
@@ -209,16 +211,16 @@ static void h_basic_auth(oci_mock_server_t *s, oci_mock_io_t *io,
 {
     handler_basic_auth_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->manifest_path) != 0) {
-        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL, "nope", 4);
         return;
     }
     if (strcmp(req->authorization, ctx->expected_authorization) != 0) {
         oci_mock_send_full(io, 401, "Unauthorized", "application/json",
-                       "Basic realm=\"reg\"", NULL, NULL, "{}", 2);
+                       "Basic realm=\"reg\"", NULL, NULL, NULL, "{}", 2);
         return;
     }
     oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
-                   NULL, ctx->body, ctx->body_len);
+                   NULL, NULL, ctx->body, ctx->body_len);
 }
 
 typedef struct {
@@ -238,14 +240,14 @@ static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
     if (strncmp(req->path, "/token", 6) == 0) {
         if (strcmp(req->authorization, ctx->expected_basic) != 0) {
             oci_mock_send_full(io, 401, "Unauthorized", "application/json", NULL,
-                           NULL, NULL, "{}", 2);
+                           NULL, NULL, NULL, "{}", 2);
             return;
         }
         char body[256];
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->expected_token);
-        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL,
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL, NULL,
                        body, (size_t) n);
         return;
     }
@@ -255,7 +257,7 @@ static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
                  ctx->expected_token);
         if (strcmp(req->authorization, want_bearer) == 0) {
             oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
-                           NULL, ctx->manifest_body, ctx->manifest_body_len);
+                           NULL, NULL, ctx->manifest_body, ctx->manifest_body_len);
             return;
         }
         char challenge[512];
@@ -264,10 +266,10 @@ static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
                  "scope=\"repository:private/secret:pull\"",
                  ctx->base_url);
         oci_mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
-                       NULL, NULL, "{}", 2);
+                       NULL, NULL, NULL, "{}", 2);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL, "nope", 4);
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
@@ -985,12 +987,19 @@ typedef struct {
     int call_count;          /* updated atomically by handler */
 } batch_blob_t;
 
+typedef enum {
+    BATCH_RANGE_HONOUR = 0,  /* 206 Partial Content with Content-Range */
+    BATCH_RANGE_IGNORE,      /* return 200 + full body even when Range present */
+    BATCH_RANGE_416,         /* return 416 when Range is present */
+} batch_range_mode_t;
+
 typedef struct {
     batch_blob_t *blobs;
     size_t n_blobs;
     char base_url[80];
     int token_call_count;    /* updated atomically by handler */
     const char *token_value;
+    batch_range_mode_t range_mode;
 } batch_ctx_t;
 
 static batch_blob_t *batch_find_by_path(batch_ctx_t *ctx, const char *path)
@@ -1012,20 +1021,20 @@ static void h_batch(oci_mock_server_t *s, oci_mock_io_t *io,
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->token_value);
-        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL,
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL, NULL,
                            body, (size_t) n);
         return;
     }
     batch_blob_t *b = batch_find_by_path(ctx, req->path);
     if (!b) {
-        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL,
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL,
                            "nope", 4);
         return;
     }
     int n = __sync_add_and_fetch(&b->call_count, 1);
     if (b->forced_status) {
         oci_mock_send_full(io, b->forced_status, "Error", "text/plain",
-                           NULL, NULL, NULL, "err", 3);
+                           NULL, NULL, NULL, NULL, "err", 3);
         return;
     }
     if (b->return_401_first_n > 0 && n <= b->return_401_first_n) {
@@ -1034,11 +1043,32 @@ static void h_batch(oci_mock_server_t *s, oci_mock_io_t *io,
                  "Bearer realm=\"%s/token\",service=\"reg\"",
                  ctx->base_url);
         oci_mock_send_full(io, 401, "Unauthorized", "application/json",
-                           challenge, NULL, NULL, "{}", 2);
+                           challenge, NULL, NULL, NULL, "{}", 2);
         return;
     }
+    if (req->has_range && ctx->range_mode == BATCH_RANGE_416) {
+        oci_mock_send_full(io, 416, "Range Not Satisfiable", "text/plain",
+                           NULL, NULL, NULL, NULL, "out", 3);
+        return;
+    }
+    if (req->has_range && ctx->range_mode == BATCH_RANGE_HONOUR &&
+        req->range_start >= 0 && (size_t) req->range_start < b->body_len) {
+        size_t start = (size_t) req->range_start;
+        size_t end = b->body_len - 1;
+        size_t len = b->body_len - start;
+        char cr[64];
+        snprintf(cr, sizeof(cr), "bytes %zu-%zu/%zu", start, end, b->body_len);
+        oci_mock_send_full(io, 206, "Partial Content",
+                           "application/octet-stream",
+                           NULL, NULL, NULL, cr, b->body + start, len);
+        return;
+    }
+    /* BATCH_RANGE_IGNORE and BATCH_RANGE_HONOUR with no Range request both
+     * reach here. Send a full 200 so the fetcher's restart path can absorb
+     * the body when the partial was already on disk.
+     */
     oci_mock_send_full(io, 200, "OK", "application/octet-stream",
-                       NULL, NULL, NULL, b->body, b->body_len);
+                       NULL, NULL, NULL, NULL, b->body, b->body_len);
 }
 
 static void batch_blob_init(batch_blob_t *b, const char *repo, int seed)
@@ -1404,6 +1434,305 @@ cleanup:
     oci_blob_store_close(store);
 }
 
+/* ── C5.2 Range-resume + sweep cases ─────────────────────────────── */
+
+/* Plant a partial blob staging file under store_root/tmp/. The filename
+ * follows the digest-prefix pattern that oci_blob_writer_resume_named
+ * scans for: blob-<first 16 hex chars>-<test-supplied suffix>. Returns 0
+ * on success or -1 on failure.
+ */
+static int make_partial_file(const char *store_root, const char *hex,
+                             const char *suffix, const void *bytes,
+                             size_t len)
+{
+    char path[1024];
+    char prefix[17];
+    memcpy(prefix, hex, 16);
+    prefix[16] = '\0';
+    snprintf(path, sizeof(path), "%s/tmp/blob-%s-%s", store_root, prefix,
+             suffix);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    ssize_t got = write(fd, bytes, len);
+    close(fd);
+    return (got == (ssize_t) len) ? 0 : -1;
+}
+
+/* Push mtime backward by `days` days so oci_blob_store_sweep_partials's
+ * seven-day TTL classifies the file as stale. Touches atime too because
+ * utimes does both with the same buffer.
+ */
+static void set_mtime_days_ago(const char *path, int days)
+{
+    struct timeval tv[2];
+    tv[0].tv_sec = time(NULL) - (time_t) days * 86400;
+    tv[0].tv_usec = 0;
+    tv[1] = tv[0];
+    (void) utimes(path, tv);
+}
+
+static int run_batch_one(const char *base_url, const char *ca_path,
+                         const char *store_root, batch_ctx_t *ctx,
+                         batch_blob_t *blob, const char **out_err)
+{
+    oci_blob_store_t *store = oci_blob_store_open(store_root);
+    oci_fetcher_options_t opts = {
+        .base_url_override = base_url,
+        .ca_file = ca_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&opts);
+    oci_ref_t ref = {.registry = "test.local", .repository = "resume"};
+    oci_descriptor_t d;
+    batch_fill_descriptor(&d, blob);
+    const oci_descriptor_t *dp[1] = {&d};
+    (void) ctx;
+    int rc = oci_fetch_blob_batch(f, &ref, dp, 1, store, NULL, NULL, out_err);
+    oci_fetcher_free(f);
+    oci_blob_store_close(store);
+    return rc;
+}
+
+static void test_batch_resume_completes_from_partial(oci_mock_server_t *server,
+                                                    const char *base_url,
+                                                    const char *ca_path,
+                                                    const char *scratch_root)
+{
+    const char *name = "batch: Range resume completes from partial";
+    batch_blob_t b;
+    batch_blob_init(&b, "resume", 300);
+    batch_ctx_t ctx = {
+        .blobs = &b, .n_blobs = 1,
+        .range_mode = BATCH_RANGE_HONOUR,
+    };
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-resume-honour", scratch_root);
+    (void) mkdir(root, 0755);
+    /* Pre-create the layout so make_partial_file's tmp/ path exists. */
+    oci_blob_store_t *seed = oci_blob_store_open(root);
+    oci_blob_store_close(seed);
+
+    /* Plant the first three bytes of the body; the resume must fetch the
+     * remaining 19 bytes (body_len = strlen("blob-300-content-bytes") == 22).
+     */
+    if (make_partial_file(root, b.hex, "aa", b.body, 3) < 0) {
+        report_fail(name, "make_partial_file failed: %s", strerror(errno));
+        return;
+    }
+
+    const char *err = NULL;
+    int rc = run_batch_one(base_url, ca_path, root, &ctx, &b, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        return;
+    }
+    if (!oci_blob_store_has(oci_blob_store_open(root), OCI_DIGEST_SHA256,
+                            b.hex)) {
+        /* leaked store handle is fine in failure path; cleanup below wipes. */
+        report_fail(name, "blob missing after resume");
+        return;
+    }
+    if (b.call_count != 1) {
+        report_fail(name, "call_count=%d (want 1)", b.call_count);
+        return;
+    }
+    if (oci_mock_request_count(server) < 1 ||
+        !server->log[0].has_range ||
+        server->log[0].range_start != 3) {
+        report_fail(name,
+                    "request log: count=%d has_range=%d range_start=%ld",
+                    oci_mock_request_count(server),
+                    server->log[0].has_range ? 1 : 0,
+                    server->log[0].range_start);
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_batch_resume_server_ignores_range(oci_mock_server_t *server,
+                                                   const char *base_url,
+                                                   const char *ca_path,
+                                                   const char *scratch_root)
+{
+    const char *name = "batch: server ignores Range falls back to full fetch";
+    batch_blob_t b;
+    batch_blob_init(&b, "resume", 301);
+    batch_ctx_t ctx = {
+        .blobs = &b, .n_blobs = 1,
+        .range_mode = BATCH_RANGE_IGNORE,
+    };
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-resume-ignore", scratch_root);
+    (void) mkdir(root, 0755);
+    oci_blob_store_t *seed = oci_blob_store_open(root);
+    oci_blob_store_close(seed);
+
+    if (make_partial_file(root, b.hex, "bb", b.body, 5) < 0) {
+        report_fail(name, "make_partial_file failed: %s", strerror(errno));
+        return;
+    }
+
+    const char *err = NULL;
+    int rc = run_batch_one(base_url, ca_path, root, &ctx, &b, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        return;
+    }
+    /* Two HTTP transfers: the Range request that the server ignores, then
+     * the restart-from-zero full fetch.
+     */
+    if (b.call_count != 2) {
+        report_fail(name, "call_count=%d (want 2)", b.call_count);
+        return;
+    }
+    int rcount = oci_mock_request_count(server);
+    if (rcount < 2 ||
+        !server->log[0].has_range ||
+        server->log[1].has_range) {
+        report_fail(name,
+                    "request log: count=%d req0.has_range=%d req1.has_range=%d",
+                    rcount,
+                    server->log[0].has_range ? 1 : 0,
+                    rcount > 1 ? (server->log[1].has_range ? 1 : 0) : -1);
+        return;
+    }
+    oci_blob_store_t *check = oci_blob_store_open(root);
+    bool present = oci_blob_store_has(check, OCI_DIGEST_SHA256, b.hex);
+    oci_blob_store_close(check);
+    if (!present) {
+        report_fail(name, "blob missing after restart");
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_batch_resume_server_416_restarts(oci_mock_server_t *server,
+                                                  const char *base_url,
+                                                  const char *ca_path,
+                                                  const char *scratch_root)
+{
+    const char *name = "batch: server 416 forces restart fresh";
+    batch_blob_t b;
+    batch_blob_init(&b, "resume", 302);
+    batch_ctx_t ctx = {
+        .blobs = &b, .n_blobs = 1,
+        .range_mode = BATCH_RANGE_416,
+    };
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-resume-416", scratch_root);
+    (void) mkdir(root, 0755);
+    oci_blob_store_t *seed = oci_blob_store_open(root);
+    oci_blob_store_close(seed);
+
+    if (make_partial_file(root, b.hex, "cc", b.body, 4) < 0) {
+        report_fail(name, "make_partial_file failed: %s", strerror(errno));
+        return;
+    }
+
+    const char *err = NULL;
+    int rc = run_batch_one(base_url, ca_path, root, &ctx, &b, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        return;
+    }
+    if (b.call_count != 2) {
+        report_fail(name, "call_count=%d (want 2)", b.call_count);
+        return;
+    }
+    int rcount = oci_mock_request_count(server);
+    if (rcount < 2 ||
+        !server->log[0].has_range ||
+        server->log[1].has_range) {
+        report_fail(name,
+                    "request log: count=%d req0.has_range=%d req1.has_range=%d",
+                    rcount,
+                    server->log[0].has_range ? 1 : 0,
+                    rcount > 1 ? (server->log[1].has_range ? 1 : 0) : -1);
+        return;
+    }
+    oci_blob_store_t *check = oci_blob_store_open(root);
+    bool present = oci_blob_store_has(check, OCI_DIGEST_SHA256, b.hex);
+    oci_blob_store_close(check);
+    if (!present) {
+        report_fail(name, "blob missing after 416 restart");
+        return;
+    }
+    report_pass(name);
+}
+
+static void test_batch_sweep_stale_partial(oci_mock_server_t *server,
+                                           const char *base_url,
+                                           const char *ca_path,
+                                           const char *scratch_root)
+{
+    const char *name = "batch: stale tmp partial swept on batch entry";
+    /* The blob being pulled is fresh: no resume planned for it. The stale
+     * partial belongs to a different digest and exists only to be swept.
+     */
+    batch_blob_t b;
+    batch_blob_init(&b, "resume", 303);
+    batch_ctx_t ctx = {
+        .blobs = &b, .n_blobs = 1,
+        .range_mode = BATCH_RANGE_HONOUR,
+    };
+    oci_mock_set_handler(server, h_batch, &ctx);
+
+    char root[512];
+    snprintf(root, sizeof(root), "%s/batch-sweep", scratch_root);
+    (void) mkdir(root, 0755);
+    oci_blob_store_t *seed = oci_blob_store_open(root);
+    oci_blob_store_close(seed);
+
+    /* Plant a stale partial under an unrelated digest prefix and backdate
+     * it by eight days so the seven-day TTL sweep fires.
+     */
+    static const char STALE_HEX[] =
+        "cafef00d000000000000000000000000000000000000000000000000deadc0de";
+    char stale_path[1024];
+    snprintf(stale_path, sizeof(stale_path), "%s/tmp/blob-cafef00d00000000-old",
+             root);
+    if (make_partial_file(root, STALE_HEX, "old", "junk", 4) < 0) {
+        report_fail(name, "make_partial_file failed: %s", strerror(errno));
+        return;
+    }
+    set_mtime_days_ago(stale_path, 8);
+
+    const char *err = NULL;
+    int rc = run_batch_one(base_url, ca_path, root, &ctx, &b, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        return;
+    }
+    struct stat st;
+    if (stat(stale_path, &st) == 0) {
+        report_fail(name, "stale partial survived sweep");
+        return;
+    }
+    if (b.call_count != 1) {
+        report_fail(name, "call_count=%d (want 1)", b.call_count);
+        return;
+    }
+    if (oci_mock_request_count(server) < 1 ||
+        server->log[0].has_range) {
+        report_fail(name, "unexpected Range request on fresh blob");
+        return;
+    }
+    oci_blob_store_t *check = oci_blob_store_open(root);
+    bool present = oci_blob_store_has(check, OCI_DIGEST_SHA256, b.hex);
+    oci_blob_store_close(check);
+    if (!present) {
+        report_fail(name, "blob missing after sweep + fetch");
+        return;
+    }
+    report_pass(name);
+}
+
 /* ── Online smoke (opt-in) ───────────────────────────────────────── */
 
 static void test_online_dockerhub(void)
@@ -1570,6 +1899,21 @@ int main(void)
                                             server.ca_pem_path, scratch);
     test_batch_concurrency_cap_respected(&server, base_url, server.ca_pem_path,
                                          scratch);
+
+    /* Plan 5 C5.2 Range-resume + sweep cases. Each plants its own staged
+     * partial under store_root/tmp/ and toggles the handler's range_mode
+     * via batch_ctx_t so a single h_batch covers honour / ignore / 416
+     * responses to the Range header. The sweep case backdates an
+     * unrelated partial's mtime via utimes to drive the TTL gate.
+     */
+    test_batch_resume_completes_from_partial(&server, base_url,
+                                             server.ca_pem_path, scratch);
+    test_batch_resume_server_ignores_range(&server, base_url,
+                                           server.ca_pem_path, scratch);
+    test_batch_resume_server_416_restarts(&server, base_url,
+                                          server.ca_pem_path, scratch);
+    test_batch_sweep_stale_partial(&server, base_url, server.ca_pem_path,
+                                   scratch);
 
     free(base_url);
     oci_mock_server_stop(&server);

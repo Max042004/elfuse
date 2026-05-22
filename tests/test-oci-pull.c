@@ -283,7 +283,7 @@ static void router_handler(oci_mock_server_t *s, oci_mock_io_t *io,
             strcmp(req->if_none_match, r->etag) == 0) {
             oci_mock_send_full(io, 304, "Not Modified", r->content_type, NULL,
                                r->has_docker_digest ? r->docker_digest : NULL,
-                               r->etag, NULL, 0);
+                               r->etag, NULL, NULL, 0);
             return;
         }
         const void *body = r->body;
@@ -296,10 +296,10 @@ static void router_handler(oci_mock_server_t *s, oci_mock_io_t *io,
                            r->status == 200 ? "OK" : "Error",
                            r->content_type, NULL,
                            r->has_docker_digest ? r->docker_digest : NULL,
-                           r->etag[0] ? r->etag : NULL, body, body_len);
+                           r->etag[0] ? r->etag : NULL, NULL, body, body_len);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL,
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, NULL,
                        "nope", 4);
 }
 

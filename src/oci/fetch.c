@@ -970,18 +970,48 @@ int oci_fetch_manifest(oci_fetcher_t *f,
 
 typedef struct {
     oci_blob_writer_t *w;
+    /* The easy handle this stream feeds. Needed so the body callback can
+     * peek CURLINFO_RESPONSE_CODE on the first chunk and notice when a
+     * server ignored the Range header (200 instead of 206) before any
+     * bytes get committed to the writer.
+     */
+    CURL *easy;
     int64_t bytes_seen;
     int64_t bytes_expected;
+    /* Bytes already present on disk in the writer's partial. Zero on a
+     * fresh fetch. Drives the body-callback's status peek.
+     */
+    int64_t resume_offset;
     bool overflow;
     bool write_failed;
+    /* Set when the body callback observes a non-206 status while the
+     * request carried a Range header. Triggers BH_NEEDS_RESTART in the
+     * score path; the writer's polluted digester state is discarded
+     * along with the partial when the restart re-arms a fresh writer.
+     */
+    bool range_rejected;
 } blob_stream_ctx_t;
 
 static size_t blob_stream_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 {
     blob_stream_ctx_t *ctx = userdata;
     size_t n = size * nmemb;
-    if (ctx->overflow || ctx->write_failed)
+    if (ctx->overflow || ctx->write_failed || ctx->range_rejected)
         return 0;
+    /* First chunk on a resumed transfer: if the server replied with
+     * anything other than 206 Partial Content, the Range header was
+     * ignored or rejected. Surface the restart signal here rather than
+     * letting the size cap trip on the full-body retransmission.
+     */
+    if (ctx->resume_offset > 0 && ctx->bytes_seen == ctx->resume_offset &&
+        ctx->easy) {
+        long status = 0;
+        curl_easy_getinfo(ctx->easy, CURLINFO_RESPONSE_CODE, &status);
+        if (status != 206) {
+            ctx->range_rejected = true;
+            return 0;
+        }
+    }
     int64_t projected = ctx->bytes_seen + (int64_t) n;
     if (projected > ctx->bytes_expected) {
         ctx->overflow = true;
@@ -1001,10 +1031,11 @@ static size_t blob_stream_cb(char *ptr, size_t size, size_t nmemb, void *userdat
  * zero-initialised slot, and safe to call multiple times.
  */
 typedef enum {
-    BH_ACTIVE,        /* enqueueable: not yet completed this round */
-    BH_NEEDS_RETRY,   /* first round hit 401 + Bearer challenge */
-    BH_DONE_OK,       /* transfer completed; writer holds verified bytes */
-    BH_FAILED,        /* transport / status / size error; err_msg populated */
+    BH_ACTIVE,         /* enqueueable: not yet completed this round */
+    BH_NEEDS_RETRY,    /* first round hit 401 + Bearer challenge */
+    BH_NEEDS_RESTART,  /* server ignored Range or replied 416; refetch fresh */
+    BH_DONE_OK,        /* transfer completed; writer holds verified bytes */
+    BH_FAILED,         /* transport / status / size error; err_msg populated */
 } batch_state_t;
 
 typedef struct {
@@ -1020,6 +1051,12 @@ typedef struct {
     CURLcode last_curl_rc;
     batch_state_t state;
     bool added;
+    /* Bytes already present on disk from a prior interrupted fetch. Zero on
+     * a fresh start; positive when oci_blob_writer_resume_named picked up a
+     * partial. Drives the per-handle Range header and the score-side detection
+     * of a server that ignored the Range request.
+     */
+    int64_t resume_offset;
     const char *err_msg;
 } batch_handle_t;
 
@@ -1070,10 +1107,17 @@ static void batch_configure_easy(oci_fetcher_t *f, const effective_opts_t *eff,
                                  batch_handle_t *h, bool capture_challenge)
 {
     h->bctx.w = h->w;
-    h->bctx.bytes_seen = 0;
+    h->bctx.easy = h->easy;
+    /* Seed bytes_seen with the partial bytes the writer already absorbed so
+     * the streaming overflow gate measures total-blob progress against
+     * desc->size, not just the bytes the server returned on this leg.
+     */
+    h->bctx.bytes_seen = h->resume_offset;
     h->bctx.bytes_expected = h->desc->size;
+    h->bctx.resume_offset = h->resume_offset;
     h->bctx.overflow = false;
     h->bctx.write_failed = false;
+    h->bctx.range_rejected = false;
     h->hctx.challenge_out = capture_challenge ? &h->challenge : NULL;
 
     apply_security_opts(h->easy, eff);
@@ -1085,6 +1129,11 @@ static void batch_configure_easy(oci_fetcher_t *f, const effective_opts_t *eff,
     curl_easy_setopt(h->easy, CURLOPT_WRITEDATA, &h->bctx);
     curl_easy_setopt(h->easy, CURLOPT_HEADERFUNCTION, header_cb);
     curl_easy_setopt(h->easy, CURLOPT_HEADERDATA, &h->hctx);
+    if (h->resume_offset > 0) {
+        char range[64];
+        snprintf(range, sizeof(range), "%lld-", (long long) h->resume_offset);
+        curl_easy_setopt(h->easy, CURLOPT_RANGE, range);
+    }
     h->hdrs = build_request_headers(f, NULL, NULL);
     if (h->hdrs)
         curl_easy_setopt(h->easy, CURLOPT_HTTPHEADER, h->hdrs);
@@ -1094,7 +1143,8 @@ static int batch_prepare_handle(oci_fetcher_t *f, const effective_opts_t *eff,
                                 const oci_ref_t *ref, batch_handle_t *h,
                                 oci_blob_store_t *store, const char **err_msg)
 {
-    h->w = oci_blob_writer_begin_named(store, h->desc->algo, h->desc->hex);
+    h->w = oci_blob_writer_resume_named(store, h->desc->algo, h->desc->hex,
+                                        h->desc->size, &h->resume_offset);
     if (!h->w) {
         if (err_msg)
             *err_msg = "failed to start blob writer";
@@ -1123,14 +1173,18 @@ static int batch_prepare_handle(oci_fetcher_t *f, const effective_opts_t *eff,
     return 0;
 }
 
-/* Re-arm a handle for the post-refresh retry round. The original writer is
- * aborted (its staging file gets unlinked) and a fresh one starts from
- * byte zero; the easy handle is reset and re-wired with the now-current
- * bearer token. The challenge capture slot is disabled so the second-round
- * 401-handling branch falls straight through to FAILED.
+/* Re-arm a handle for a fresh transfer attempt: token-refresh retry after a
+ * 401 + Bearer challenge, or restart-from-zero after a server ignored the
+ * Range header (200 instead of 206) or replied 416. The original writer is
+ * aborted (its staging file gets unlinked) and a brand-new one starts at
+ * byte zero, with resume_offset reset so batch_configure_easy emits no
+ * Range header on the next attempt. The easy handle is reset and re-wired
+ * with the current bearer token. Challenge capture is disabled so any
+ * second-round 401 falls straight through to FAILED, and a second-round
+ * 200-after-Range cannot reoccur because resume_offset is now zero.
  */
-static int batch_reset_for_retry(oci_fetcher_t *f, const effective_opts_t *eff,
-                                 batch_handle_t *h, oci_blob_store_t *store)
+static int batch_reset_handle_fresh(oci_fetcher_t *f, const effective_opts_t *eff,
+                                    batch_handle_t *h, oci_blob_store_t *store)
 {
     oci_blob_writer_abort(h->w);
     h->w = NULL;
@@ -1149,6 +1203,7 @@ static int batch_reset_for_retry(oci_fetcher_t *f, const effective_opts_t *eff,
     h->w = oci_blob_writer_begin_named(store, h->desc->algo, h->desc->hex);
     if (!h->w)
         return -1;
+    h->resume_offset = 0;
     curl_easy_reset(h->easy);
     h->state = BH_ACTIVE;
     h->added = false;
@@ -1169,6 +1224,16 @@ static void batch_score_done(batch_handle_t *h, CURLcode crc, long status,
 {
     h->http_status = status;
     h->last_curl_rc = crc;
+    /* The body callback flagged a non-206 response to a Range request.
+     * Surface the restart intent before any size / digest / curl-error
+     * diagnostics: the discarded bytes would otherwise look like an
+     * overflow, and a 416 with a small error body would look like a
+     * payload write failure.
+     */
+    if (h->bctx.range_rejected) {
+        h->state = BH_NEEDS_RESTART;
+        return;
+    }
     if (crc != CURLE_OK) {
         if (h->bctx.overflow) {
             h->err_msg = "blob exceeded declared size";
@@ -1185,6 +1250,15 @@ static void batch_score_done(batch_handle_t *h, CURLcode crc, long status,
     }
     if (status == 401 && h->challenge.realm && round == 0) {
         h->state = BH_NEEDS_RETRY;
+        return;
+    }
+    /* A 416 with an empty body never reached blob_stream_cb, so the
+     * range_rejected flag above did not fire. Catch that path here.
+     * status == 200 with resume_offset > 0 also belongs to this restart
+     * arm, though in practice the body callback catches it first.
+     */
+    if (h->resume_offset > 0 && (status == 200 || status == 416)) {
+        h->state = BH_NEEDS_RESTART;
         return;
     }
     if (status < 200 || status >= 300) {
@@ -1229,6 +1303,15 @@ int oci_fetch_blob_batch(oci_fetcher_t *f,
         effective_free(&eff);
         return -1;
     }
+
+    /* Drop stale tmp partials that no surviving batch can resume from. A
+     * week is long enough to let an interrupted multi-day pull finish on
+     * the next attempt while still keeping the staging area bounded for
+     * caches that see frequent unique blobs. The blob-store guards the
+     * tmp/ namespace, so the wide blob-* prefix cannot touch unrelated
+     * files.
+     */
+    oci_blob_store_sweep_partials(store, 7L * 86400);
 
     int rc = -1;
     int max_concurrent = batch_max_concurrent();
@@ -1362,49 +1445,81 @@ drained:
             continue;
 
         bool any_retry = false;
-        for (size_t i = 0; i < nh; i++)
-            if (handles[i].state == BH_NEEDS_RETRY) {
+        bool any_restart = false;
+        for (size_t i = 0; i < nh; i++) {
+            if (handles[i].state == BH_NEEDS_RETRY)
                 any_retry = true;
-                break;
-            }
-        if (!any_retry || any_failed)
+            else if (handles[i].state == BH_NEEDS_RESTART)
+                any_restart = true;
+        }
+        if (!any_retry && !any_restart)
             break;
-
-        /* Single token refresh per batch. Steal one retry handle's challenge
-         * onto f->challenge so fetch_token sees the realm/service/scope, then
-         * re-arm every NEEDS_RETRY handle with the new bearer.
-         */
-        for (size_t i = 0; i < nh; i++) {
-            if (handles[i].state == BH_NEEDS_RETRY) {
-                bearer_challenge_free(&f->challenge);
-                f->challenge = handles[i].challenge;
-                memset(&handles[i].challenge, 0,
-                       sizeof(handles[i].challenge));
-                break;
-            }
-        }
-        if (fetch_token(f, &eff, err_msg) < 0) {
-            for (size_t i = 0; i < nh; i++) {
-                if (handles[i].state == BH_NEEDS_RETRY) {
-                    handles[i].state = BH_FAILED;
-                    handles[i].err_msg = "token refresh failed";
-                }
-            }
-            any_failed = true;
-            break;
-        }
-        round++;
-        for (size_t i = 0; i < nh; i++) {
-            if (handles[i].state == BH_NEEDS_RETRY) {
-                if (batch_reset_for_retry(f, &eff, &handles[i], store) < 0) {
-                    handles[i].state = BH_FAILED;
-                    handles[i].err_msg = "failed to reset writer for retry";
-                    any_failed = true;
-                }
-            }
-        }
         if (any_failed)
             break;
+
+        if (any_retry) {
+            /* Single token refresh per batch. Steal one retry handle's
+             * challenge onto f->challenge so fetch_token sees the
+             * realm/service/scope, then re-arm every NEEDS_RETRY handle
+             * with the new bearer.
+             */
+            for (size_t i = 0; i < nh; i++) {
+                if (handles[i].state == BH_NEEDS_RETRY) {
+                    bearer_challenge_free(&f->challenge);
+                    f->challenge = handles[i].challenge;
+                    memset(&handles[i].challenge, 0,
+                           sizeof(handles[i].challenge));
+                    break;
+                }
+            }
+            if (fetch_token(f, &eff, err_msg) < 0) {
+                for (size_t i = 0; i < nh; i++) {
+                    if (handles[i].state == BH_NEEDS_RETRY) {
+                        handles[i].state = BH_FAILED;
+                        handles[i].err_msg = "token refresh failed";
+                    }
+                }
+                any_failed = true;
+                break;
+            }
+            round++;
+            for (size_t i = 0; i < nh; i++) {
+                if (handles[i].state == BH_NEEDS_RETRY) {
+                    if (batch_reset_handle_fresh(f, &eff, &handles[i],
+                                                 store) < 0) {
+                        handles[i].state = BH_FAILED;
+                        handles[i].err_msg =
+                            "failed to reset writer for retry";
+                        any_failed = true;
+                    }
+                }
+            }
+            if (any_failed)
+                break;
+        }
+
+        if (any_restart) {
+            /* Range-resume retry: no token refresh, just a fresh writer
+             * with resume_offset cleared so the next attempt fetches the
+             * full blob without a Range header. The reset itself zeroes
+             * resume_offset, so a second 200-after-Range / 416 cannot
+             * pick the restart branch again -- the handle either
+             * succeeds or falls into BH_FAILED on the next score.
+             */
+            for (size_t i = 0; i < nh; i++) {
+                if (handles[i].state == BH_NEEDS_RESTART) {
+                    if (batch_reset_handle_fresh(f, &eff, &handles[i],
+                                                 store) < 0) {
+                        handles[i].state = BH_FAILED;
+                        handles[i].err_msg =
+                            "failed to reset writer for restart";
+                        any_failed = true;
+                    }
+                }
+            }
+            if (any_failed)
+                break;
+        }
     }
 
     for (size_t i = 0; i < nh; i++) {
@@ -1413,7 +1528,8 @@ drained:
             if (err_msg && !*err_msg && handles[i].err_msg)
                 *err_msg = handles[i].err_msg;
         } else if (handles[i].state == BH_ACTIVE ||
-                   handles[i].state == BH_NEEDS_RETRY) {
+                   handles[i].state == BH_NEEDS_RETRY ||
+                   handles[i].state == BH_NEEDS_RESTART) {
             /* Should be unreachable: the loop only exits when nothing is
              * still queued. Defensive: treat as failure rather than
              * silently dropping the slot.

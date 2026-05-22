@@ -140,16 +140,20 @@ ssize_t oci_mock_io_read(oci_mock_io_t *io, void *buf, size_t cap);
 void    oci_mock_io_write(oci_mock_io_t *io, const void *buf, size_t n);
 
 /* Compose and send a complete HTTP/1.1 response. status_text defaults to "OK"
- * when NULL. content_type / www_authenticate / docker_digest / etag are added
- * to the header block only when non-NULL. body may be NULL when body_len is
- * 0. The etag value is emitted verbatim (callers pass the registry-style
- * strong quoted form, including the quotes).
+ * when NULL. content_type / www_authenticate / docker_digest / etag /
+ * content_range are added to the header block only when non-NULL. body may
+ * be NULL when body_len is 0. The etag value is emitted verbatim (callers
+ * pass the registry-style strong quoted form, including the quotes).
+ * content_range is the literal value for a Content-Range header (e.g.
+ * "bytes 3-7/8") that handlers attach to a 206 Partial Content response
+ * when they honour a Range request.
  */
 void oci_mock_send_full(oci_mock_io_t *io, int status, const char *status_text,
                         const char *content_type,
                         const char *www_authenticate,
                         const char *docker_digest,
                         const char *etag,
+                        const char *content_range,
                         const void *body,
                         size_t body_len);
 

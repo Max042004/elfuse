@@ -14,10 +14,13 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "oci/blob-store.h"
@@ -352,6 +355,161 @@ int main(void)
         else
             report_fail("has() returns false for unknown digest", NULL);
     }
+
+    /* Resume + sweep: the curl_multi pull path relies on these two store
+     * APIs to survive an interrupted blob fetch. Drive both directly
+     * without the fetcher in the loop so a regression in the store gets
+     * caught by this suite instead of the higher-level test-oci-fetch.
+     */
+    printf("oci_blob_writer_resume_named\n");
+    {
+        /* Plant a partial that holds the first three bytes of "abcdef" under
+         * the SHA-256-of-"abcdef" digest. resume_named must locate it,
+         * re-hash the prefix into its digester, position the fd at end, and
+         * report the resume offset. A subsequent write of the remaining
+         * bytes plus commit must produce a final blob whose hex matches the
+         * full-content digest.
+         */
+        static const char FULL[] = "abcdef";
+        static const size_t FULL_LEN = 6;
+        char hex[OCI_DIGEST_HEX_MAX + 1];
+        if (oci_digest_bytes(OCI_DIGEST_SHA256, FULL, FULL_LEN, hex) == 0) {
+            report_fail("resume happy path", "digest precompute failed");
+            goto resume_done;
+        }
+        char prefix[17];
+        memcpy(prefix, hex, 16);
+        prefix[16] = '\0';
+        char partial[768];
+        snprintf(partial, sizeof(partial), "%s/tmp/blob-%s-aaaaaa",
+                 store_root, prefix);
+        int fd = open(partial, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            report_fail("resume happy path", strerror(errno));
+            goto resume_done;
+        }
+        if (write(fd, FULL, 3) != 3) {
+            close(fd);
+            report_fail("resume happy path", "short write seeding partial");
+            goto resume_done;
+        }
+        close(fd);
+
+        int64_t off = -1;
+        oci_blob_writer_t *w = oci_blob_writer_resume_named(
+            s, OCI_DIGEST_SHA256, hex, (int64_t) FULL_LEN, &off);
+        if (!w || off != 3) {
+            if (w)
+                oci_blob_writer_abort(w);
+            report_fail("resume happy path", "writer null or offset != 3");
+            goto resume_done;
+        }
+        if (!oci_blob_writer_write(w, FULL + 3, FULL_LEN - 3)) {
+            oci_blob_writer_abort(w);
+            report_fail("resume happy path", "write tail failed");
+            goto resume_done;
+        }
+        if (oci_blob_writer_commit(w) < 0) {
+            report_fail("resume happy path", strerror(errno));
+            goto resume_done;
+        }
+        if (!oci_blob_store_has(s, OCI_DIGEST_SHA256, hex)) {
+            report_fail("resume happy path", "commit missing");
+            goto resume_done;
+        }
+        report_pass("resume reopens partial, re-hashes, commits");
+    }
+resume_done:
+
+    {
+        /* No partial -> resume_named must transparently fall back to a
+         * fresh writer with offset zero. The committed blob is identical
+         * to the begin_named code path.
+         */
+        static const char BODY[] = "zzzz";
+        char hex[OCI_DIGEST_HEX_MAX + 1];
+        if (oci_digest_bytes(OCI_DIGEST_SHA256, BODY, 4, hex) == 0) {
+            report_fail("resume falls back to fresh writer",
+                        "digest precompute failed");
+            goto fresh_done;
+        }
+        int64_t off = -1;
+        oci_blob_writer_t *w = oci_blob_writer_resume_named(
+            s, OCI_DIGEST_SHA256, hex, 4, &off);
+        if (!w || off != 0) {
+            if (w)
+                oci_blob_writer_abort(w);
+            report_fail("resume falls back to fresh writer",
+                        "writer null or offset != 0");
+            goto fresh_done;
+        }
+        if (!oci_blob_writer_write(w, BODY, 4) ||
+            oci_blob_writer_commit(w) < 0) {
+            report_fail("resume falls back to fresh writer",
+                        "write/commit failed");
+            goto fresh_done;
+        }
+        if (!oci_blob_store_has(s, OCI_DIGEST_SHA256, hex))
+            report_fail("resume falls back to fresh writer", "commit missing");
+        else
+            report_pass("resume falls back to fresh writer");
+    }
+fresh_done:
+
+    printf("oci_blob_store_sweep_partials\n");
+    {
+        /* Drop two partials in tmp/. Backdate the first by eight days so
+         * sweep with a seven-day TTL unlinks it; leave the second fresh
+         * so it survives. The directory entry count after the sweep is
+         * the load-bearing assertion: nothing else writes to tmp/ during
+         * this case.
+         */
+        char tmp_dir[768];
+        snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", store_root);
+
+        char stale[1024];
+        char fresh[1024];
+        snprintf(stale, sizeof(stale), "%s/blob-deadbeef00000000-stale",
+                 tmp_dir);
+        snprintf(fresh, sizeof(fresh), "%s/blob-deadbeef00000000-fresh",
+                 tmp_dir);
+        int fd_a = open(stale, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd_b = open(fresh, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_a < 0 || fd_b < 0) {
+            if (fd_a >= 0) close(fd_a);
+            if (fd_b >= 0) close(fd_b);
+            report_fail("sweep TTL", "fixture open failed");
+            goto sweep_done;
+        }
+        (void) write(fd_a, "x", 1);
+        (void) write(fd_b, "x", 1);
+        close(fd_a);
+        close(fd_b);
+
+        struct timeval tv[2];
+        tv[0].tv_sec = time(NULL) - 8L * 86400;
+        tv[0].tv_usec = 0;
+        tv[1] = tv[0];
+        if (utimes(stale, tv) < 0) {
+            report_fail("sweep TTL", "utimes failed");
+            goto sweep_done;
+        }
+
+        oci_blob_store_sweep_partials(s, 7L * 86400);
+
+        struct stat st;
+        bool stale_gone = stat(stale, &st) < 0 && errno == ENOENT;
+        bool fresh_present = stat(fresh, &st) == 0 && S_ISREG(st.st_mode);
+        if (!stale_gone)
+            report_fail("sweep TTL", "stale partial survived");
+        else if (!fresh_present)
+            report_fail("sweep TTL", "fresh partial swept");
+        else
+            report_pass("sweep TTL unlinks aged partials only");
+
+        (void) unlink(fresh);
+    }
+sweep_done:
 
 cleanup:
     oci_blob_store_close(s);

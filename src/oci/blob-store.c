@@ -13,6 +13,7 @@
 
 #include "blob-store.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "digest.h"
@@ -291,6 +293,202 @@ oci_blob_writer_t *oci_blob_writer_begin_named(oci_blob_store_t *s,
         return NULL;
     }
     return writer_begin_with_template(s, algo, expected_hex, tmpl);
+}
+
+/* Build the per-store tmp/ path into out. Returns true on success, false on
+ * overflow. The caller is responsible for sizing out (STORE_PATH_MAX fits).
+ */
+static bool tmp_dir_path(const oci_blob_store_t *s, char *out, size_t cap)
+{
+    int n = snprintf(out, cap, "%s/tmp", s->root);
+    return n > 0 && (size_t) n < cap;
+}
+
+/* Pull the leading hex16 digest prefix used for tmp filenames. expected_hex
+ * is validated by the caller (oci_digest_hex_valid).
+ */
+static void named_prefix_for(const char *expected_hex, char *out)
+{
+    size_t hl = strlen(expected_hex);
+    size_t use = hl < OCI_BLOB_NAMED_HEX_PREFIX ? hl : OCI_BLOB_NAMED_HEX_PREFIX;
+    memcpy(out, expected_hex, use);
+    out[use] = '\0';
+}
+
+/* Open an existing partial as a writer. Re-hashes the bytes already on disk
+ * and positions the fd at end-of-file. Returns the writer on success or
+ * NULL on any I/O failure; the caller decides whether to fall back to a
+ * fresh writer. The partial file at path is NOT unlinked on failure --
+ * caller policy.
+ */
+static oci_blob_writer_t *open_partial_as_writer(oci_blob_store_t *s,
+                                                 oci_digest_algo_t algo,
+                                                 const char *expected_hex,
+                                                 const char *path,
+                                                 int64_t partial_size)
+{
+    oci_blob_writer_t *w = calloc(1, sizeof(*w));
+    if (!w)
+        return NULL;
+    w->store = s;
+    w->algo = algo;
+    memcpy(w->expected_hex, expected_hex, oci_digest_hex_len(algo) + 1);
+    size_t plen = strlen(path);
+    if (plen + 1 > sizeof(w->tmp_path)) {
+        free(w);
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(w->tmp_path, path, plen + 1);
+    w->fd = open(path, O_RDWR);
+    if (w->fd < 0) {
+        free(w);
+        return NULL;
+    }
+    (void) fcntl(w->fd, F_SETFD, FD_CLOEXEC);
+    w->digester = oci_digester_new(algo);
+    if (!w->digester) {
+        int saved = errno ? errno : ENOMEM;
+        (void) close(w->fd);
+        free(w);
+        errno = saved;
+        return NULL;
+    }
+    if (lseek(w->fd, 0, SEEK_SET) < 0)
+        goto fail_io;
+    int64_t consumed = 0;
+    char buf[64 * 1024];
+    while (consumed < partial_size) {
+        ssize_t got = read(w->fd, buf, sizeof(buf));
+        if (got == 0)
+            break;
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            goto fail_io;
+        }
+        oci_digester_update(w->digester, buf, (size_t) got);
+        consumed += got;
+    }
+    if (consumed != partial_size)
+        goto fail_io;
+    if (lseek(w->fd, 0, SEEK_END) < 0)
+        goto fail_io;
+    return w;
+
+fail_io: {
+    int saved = errno ? errno : EIO;
+    oci_digester_free(w->digester);
+    (void) close(w->fd);
+    free(w);
+    errno = saved;
+    return NULL;
+}
+}
+
+oci_blob_writer_t *oci_blob_writer_resume_named(oci_blob_store_t *s,
+                                                oci_digest_algo_t algo,
+                                                const char *expected_hex,
+                                                int64_t expected_size,
+                                                int64_t *out_resume_offset)
+{
+    if (out_resume_offset)
+        *out_resume_offset = 0;
+    if (!s || !oci_digest_hex_valid(algo, expected_hex)) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    char tmp_dir[STORE_PATH_MAX];
+    if (!tmp_dir_path(s, tmp_dir, sizeof(tmp_dir)))
+        return oci_blob_writer_begin_named(s, algo, expected_hex);
+
+    char prefix[OCI_BLOB_NAMED_HEX_PREFIX + 1];
+    named_prefix_for(expected_hex, prefix);
+    char glob[8 + OCI_BLOB_NAMED_HEX_PREFIX];
+    int gn = snprintf(glob, sizeof(glob), "blob-%s-", prefix);
+    if (gn <= 0 || (size_t) gn >= sizeof(glob))
+        return oci_blob_writer_begin_named(s, algo, expected_hex);
+    size_t glen = (size_t) gn;
+
+    DIR *d = opendir(tmp_dir);
+    if (!d)
+        return oci_blob_writer_begin_named(s, algo, expected_hex);
+
+    char best_path[STORE_PATH_MAX] = {0};
+    int64_t best_size = -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, glob, glen) != 0)
+            continue;
+        char cand[STORE_PATH_MAX];
+        int cn = snprintf(cand, sizeof(cand), "%s/%s", tmp_dir, de->d_name);
+        if (cn <= 0 || (size_t) cn >= sizeof(cand))
+            continue;
+        struct stat st;
+        if (stat(cand, &st) < 0 || !S_ISREG(st.st_mode))
+            continue;
+        int64_t sz = (int64_t) st.st_size;
+        /* Keep the largest partial; unlink everything else. A partial that is
+         * already at or past the declared size is corrupt or stale -- the
+         * caller cannot send a useful Range from it -- so drop it here and
+         * fall through to the fresh-writer path on no surviving partial.
+         */
+        if (sz <= 0 || sz >= expected_size) {
+            (void) unlink(cand);
+            continue;
+        }
+        if (sz > best_size) {
+            if (best_path[0])
+                (void) unlink(best_path);
+            memcpy(best_path, cand, (size_t) cn + 1);
+            best_size = sz;
+        } else {
+            (void) unlink(cand);
+        }
+    }
+    closedir(d);
+
+    if (best_size <= 0 || !best_path[0])
+        return oci_blob_writer_begin_named(s, algo, expected_hex);
+
+    oci_blob_writer_t *w = open_partial_as_writer(s, algo, expected_hex,
+                                                  best_path, best_size);
+    if (!w) {
+        (void) unlink(best_path);
+        return oci_blob_writer_begin_named(s, algo, expected_hex);
+    }
+    if (out_resume_offset)
+        *out_resume_offset = best_size;
+    return w;
+}
+
+void oci_blob_store_sweep_partials(oci_blob_store_t *s, long ttl_secs)
+{
+    if (!s)
+        return;
+    char tmp_dir[STORE_PATH_MAX];
+    if (!tmp_dir_path(s, tmp_dir, sizeof(tmp_dir)))
+        return;
+    DIR *d = opendir(tmp_dir);
+    if (!d)
+        return;
+    time_t now = time(NULL);
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "blob-", 5) != 0)
+            continue;
+        char path[STORE_PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s", tmp_dir, de->d_name);
+        if (n <= 0 || (size_t) n >= sizeof(path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) < 0 || !S_ISREG(st.st_mode))
+            continue;
+        if ((long) (now - st.st_mtime) >= ttl_secs)
+            (void) unlink(path);
+    }
+    closedir(d);
 }
 
 bool oci_blob_writer_write(oci_blob_writer_t *w, const void *buf, size_t len)
