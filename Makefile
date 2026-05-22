@@ -78,6 +78,7 @@ SRCS := \
     oci/inspect.c \
     oci/dedup-metrics.c \
     oci/status.c \
+    oci/policy.c \
     oci/tar.c \
     oci/decompress.c \
     oci/layer-meta.c \
@@ -274,6 +275,14 @@ $(BUILD_DIR)/test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache.o $(BUI
 ## ratios, store totals). Same dependency set as test-oci-store plus
 ## oci/status.o.
 $(BUILD_DIR)/test-oci-status: $(BUILD_DIR)/test-oci-status.o $(BUILD_DIR)/oci/status.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI policy.json schema and loader unit test (native macOS, no HVF).
+## Pure C; links against the policy translation unit plus cJSON for the JSON
+## parser. Drives oci_policy_load against per-test scratch HOME / XDG / override
+## trees under /tmp.
+$(BUILD_DIR)/test-oci-policy: $(BUILD_DIR)/test-oci-policy.o $(BUILD_DIR)/oci/policy.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

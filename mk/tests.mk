@@ -10,6 +10,7 @@
         test-oci-fetch test-oci-fetch-online test-oci-store test-oci-pull \
         test-oci-inspect test-oci-dedup-metrics test-oci-rebuild-cache \
         test-oci-status \
+        test-oci-policy \
         test-oci-tar test-oci-decompress test-oci-meta \
         test-oci-origin \
         test-oci-layer-apply test-oci-volume test-oci-clone \
@@ -63,6 +64,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-rebuild-cache
 	@printf "\n$(BLUE)━━━ OCI store-wide status unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-status
+	@printf "\n$(BLUE)━━━ OCI policy.json loader unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-policy
 	@printf "\n$(BLUE)━━━ OCI tar reader unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-tar
 	@printf "\n$(BLUE)━━━ OCI decompression dispatch unit tests ━━━$(RESET)\n"
@@ -145,6 +148,13 @@ test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache
 ## hand-populated via stage_image + oci_origin_write fixture helpers.
 test-oci-status: $(BUILD_DIR)/test-oci-status
 	@$(BUILD_DIR)/test-oci-status
+
+## Run the OCI policy.json schema and loader unit tests (native, no HVF,
+## no network). Phase 1 Plan 6 C6.1: validates oci_policy_load against
+## scratch HOME / XDG / override trees, the load-order chain, and the
+## per-host effective view returned by oci_policy_lookup.
+test-oci-policy: $(BUILD_DIR)/test-oci-policy
+	@$(BUILD_DIR)/test-oci-policy
 
 ## Run the OCI tar reader unit tests (native, no HVF, no network)
 test-oci-tar: $(BUILD_DIR)/test-oci-tar
