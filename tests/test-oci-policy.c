@@ -27,6 +27,14 @@
  *  15. auth_file_bad_mode          (oci_policy_load_auth C6.2)
  *  16. auth_file_missing_username  (oci_policy_load_auth C6.2)
  *  17. auth_file_malformed_json    (oci_policy_load_auth C6.2)
+ *  18. overlay_field_level_merge          (C6.3 registries.d)
+ *  19. overlay_adds_new_host              (C6.3 registries.d)
+ *  20. overlay_overrides_base_field       (C6.3 registries.d)
+ *  21. overlay_dir_missing_silent         (C6.3 registries.d)
+ *  22. overlay_malformed_json_hard_error  (C6.3 registries.d)
+ *  23. overlay_ignores_non_json_files     (C6.3 registries.d)
+ *  24. overlay_sigstore_public_key_surfaced (C6.3 registries.d)
+ *  25. overlay_multiple_hosts             (C6.3 registries.d)
  */
 
 #include <errno.h>
@@ -867,6 +875,347 @@ done:
     fx_teardown(&fx);
 }
 
+/* ---------- C6.3 registries.d overlay cases ---------- */
+
+/* Compose <fx->scratch>/<base_rel_dir>/registries.d/<filename> and write body
+ * (mode 0600). The overlay scanner expects the directory to sit next to the
+ * base policy file; this helper hides the path-arithmetic from each case.
+ * Returns the heap path to the overlay file (caller frees) or NULL on
+ * failure with errno preserved.
+ */
+static char *write_overlay_file(const fx_t *fx, const char *base_rel_dir,
+                                const char *filename, const char *body)
+{
+    /* The fixture's policy.json lives at fx->scratch/<base_rel_dir>/policy.json
+     * so the overlay tree is fx->scratch/<base_rel_dir>/registries.d/.
+     */
+    char rel[512];
+    int n = snprintf(rel, sizeof(rel), "%s/registries.d/%s",
+                     base_rel_dir, filename);
+    if (n < 0 || n >= (int) sizeof(rel)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    char *path = path_join(fx->scratch, rel);
+    if (!path)
+        return NULL;
+    if (write_file(path, body) < 0) {
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+/* Sugar: write fx->scratch/<rel_dir>/policy.json + set ELFUSE_POLICY_FILE.
+ * Returns the heap path the caller frees (mostly so the case can refer to it
+ * later for assertions; it can otherwise be ignored).
+ */
+static char *write_base_policy(const fx_t *fx, const char *rel_dir,
+                               const char *body)
+{
+    char rel[512];
+    int n = snprintf(rel, sizeof(rel), "%s/policy.json", rel_dir);
+    if (n < 0 || n >= (int) sizeof(rel)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    char *path = path_join(fx->scratch, rel);
+    if (!path)
+        return NULL;
+    if (write_file(path, body) < 0) {
+        free(path);
+        return NULL;
+    }
+    setenv("ELFUSE_POLICY_FILE", path, 1);
+    return path;
+}
+
+static void case_overlay_field_level_merge(void)
+{
+    const char *name = "overlay_field_level_merge";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *ca_path = NULL;
+    char *base = NULL;
+    char *overlay = NULL;
+    ca_path = touch_ca_file(&fx, "ca/ghcr.pem");
+    if (!ca_path) { report_fail(name, "ca fixture OOM"); goto done; }
+    char base_body[1024];
+    snprintf(base_body, sizeof(base_body),
+             "{\"registries\":{\"ghcr.io\":{\"ca_bundle\":\"%s\"}}}", ca_path);
+    base = write_base_policy(&fx, "etc", base_body);
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    char overlay_body[256];
+    snprintf(overlay_body, sizeof(overlay_body),
+             "{\"auth_file\":\"%s/auth/ghcr.json\"}", fx.scratch);
+    overlay = write_overlay_file(&fx, "etc", "ghcr.io.json", overlay_body);
+    if (!overlay) { report_fail(name, "overlay write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "ghcr.io", &eff);
+    if (!eff.ca_bundle || strcmp(eff.ca_bundle, ca_path) != 0) {
+        report_fail(name, "base ca_bundle lost after overlay merge: %s",
+                    eff.ca_bundle ? eff.ca_bundle : "(null)");
+        goto done;
+    }
+    if (!eff.auth_file || !strstr(eff.auth_file, "/auth/ghcr.json")) {
+        report_fail(name, "overlay auth_file not surfaced: %s",
+                    eff.auth_file ? eff.auth_file : "(null)");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(ca_path);
+    free(base);
+    free(overlay);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_adds_new_host(void)
+{
+    const char *name = "overlay_adds_new_host";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    char *overlay = NULL;
+    base = write_base_policy(&fx, "etc", "{\"default\":{\"insecure\":false}}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    overlay = write_overlay_file(&fx, "etc", "new.example.json",
+                                 "{\"insecure\":true}");
+    if (!overlay) { report_fail(name, "overlay write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "new.example", &eff);
+    if (!eff.insecure) {
+        report_fail(name, "overlay-introduced host insecure not surfaced");
+        goto done;
+    }
+    /* Unknown host still falls back to default block (insecure=false). */
+    oci_policy_lookup(p, "other.example", &eff);
+    if (eff.insecure) {
+        report_fail(name, "default block leaked overlay insecure to unknown host");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(base);
+    free(overlay);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_overrides_base_field(void)
+{
+    const char *name = "overlay_overrides_base_field";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    char *overlay = NULL;
+    base = write_base_policy(&fx, "etc",
+                             "{\"registries\":{\"ghcr.io\":{\"insecure\":false}}}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    overlay = write_overlay_file(&fx, "etc", "ghcr.io.json",
+                                 "{\"insecure\":true}");
+    if (!overlay) { report_fail(name, "overlay write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "ghcr.io", &eff);
+    if (!eff.insecure) {
+        report_fail(name, "overlay did not override base insecure=false");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(base);
+    free(overlay);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_dir_missing_silent(void)
+{
+    const char *name = "overlay_dir_missing_silent";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    base = write_base_policy(&fx, "etc",
+                             "{\"registries\":{\"ghcr.io\":{\"insecure\":true}}}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    /* No registries.d/ next to it. */
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    if (strcmp(oci_policy_source(p), base) != 0) {
+        report_fail(name, "expected source=%s, got %s", base, oci_policy_source(p));
+        goto done;
+    }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "ghcr.io", &eff);
+    if (!eff.insecure) { report_fail(name, "base entry lost"); goto done; }
+    report_pass(name);
+done:
+    free(base);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_malformed_json_hard_error(void)
+{
+    const char *name = "overlay_malformed_json_hard_error";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    char *overlay = NULL;
+    base = write_base_policy(&fx, "etc", "{}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    overlay = write_overlay_file(&fx, "etc", "bad.example.json",
+                                 "{this is not json");
+    if (!overlay) { report_fail(name, "overlay write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc == 0) { report_fail(name, "expected failure on malformed overlay"); goto done; }
+    if (!err || !strstr(err, "overlay") || !strstr(err, "JSON")) {
+        report_fail(name, "diagnostic missing 'overlay'/'JSON': %s",
+                    err ? err : "(none)");
+        goto done;
+    }
+    if (!strstr(err, overlay)) {
+        report_fail(name, "diagnostic missing overlay path '%s': %s",
+                    overlay, err);
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(base);
+    free(overlay);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_ignores_non_json_files(void)
+{
+    const char *name = "overlay_ignores_non_json_files";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    char *readme = NULL;
+    char *host = NULL;
+    base = write_base_policy(&fx, "etc", "{}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    /* README.md must NOT be parsed -- if the scanner picked it up the load
+     * would hard-error on a non-object root.
+     */
+    readme = write_overlay_file(&fx, "etc", "README.md",
+                                "this is documentation, not policy\n");
+    host = write_overlay_file(&fx, "etc", "ghcr.io.json",
+                              "{\"insecure\":true}");
+    if (!readme || !host) { report_fail(name, "fixture write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "ghcr.io", &eff);
+    if (!eff.insecure) {
+        report_fail(name, "ghcr.io overlay not honored");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(base);
+    free(readme);
+    free(host);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_sigstore_public_key_surfaced(void)
+{
+    const char *name = "overlay_sigstore_public_key_surfaced";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    char *overlay = NULL;
+    base = write_base_policy(&fx, "etc", "{}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    char overlay_body[512];
+    snprintf(overlay_body, sizeof(overlay_body),
+             "{\"sigstore\":{\"publicKey\":\"%s/keys/quay.pem\"}}", fx.scratch);
+    overlay = write_overlay_file(&fx, "etc", "quay.io.json", overlay_body);
+    if (!overlay) { report_fail(name, "overlay write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "quay.io", &eff);
+    if (!eff.sigstore_public_key ||
+        !strstr(eff.sigstore_public_key, "/keys/quay.pem")) {
+        report_fail(name, "overlay sigstore.publicKey not surfaced: %s",
+                    eff.sigstore_public_key ? eff.sigstore_public_key : "(null)");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(base);
+    free(overlay);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
+static void case_overlay_multiple_hosts(void)
+{
+    const char *name = "overlay_multiple_hosts";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    oci_policy_t *p = NULL;
+    const char *err = NULL;
+    char *base = NULL;
+    char *a = NULL;
+    char *b = NULL;
+    base = write_base_policy(&fx, "etc", "{}");
+    if (!base) { report_fail(name, "base write: %s", strerror(errno)); goto done; }
+    a = write_overlay_file(&fx, "etc", "a.example.json",
+                           "{\"insecure\":true}");
+    b = write_overlay_file(&fx, "etc", "b.example.json",
+                           "{\"insecure\":false}");
+    if (!a || !b) { report_fail(name, "overlay write: %s", strerror(errno)); goto done; }
+
+    int rc = oci_policy_load(&p, &err);
+    if (rc != 0) { report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)"); goto done; }
+    oci_policy_effective_t eff;
+    oci_policy_lookup(p, "a.example", &eff);
+    if (!eff.insecure) { report_fail(name, "a.example overlay missing"); goto done; }
+    oci_policy_lookup(p, "b.example", &eff);
+    if (eff.insecure) { report_fail(name, "b.example overlay missing"); goto done; }
+    report_pass(name);
+done:
+    free(base);
+    free(a);
+    free(b);
+    oci_policy_free(p);
+    fx_teardown(&fx);
+}
+
 int main(void)
 {
     printf("== test-oci-policy ==\n");
@@ -887,6 +1236,14 @@ int main(void)
     case_auth_file_bad_mode();
     case_auth_file_missing_username();
     case_auth_file_malformed_json();
+    case_overlay_field_level_merge();
+    case_overlay_adds_new_host();
+    case_overlay_overrides_base_field();
+    case_overlay_dir_missing_silent();
+    case_overlay_malformed_json_hard_error();
+    case_overlay_ignores_non_json_files();
+    case_overlay_sigstore_public_key_surfaced();
+    case_overlay_multiple_hosts();
     printf("\n%d/%d passed\n", g_passed, g_total);
     return g_passed == g_total ? 0 : 1;
 }
