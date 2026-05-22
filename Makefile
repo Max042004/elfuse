@@ -91,6 +91,7 @@ SRCS := \
     oci/rebuild-cache.c \
     oci/runspec.c \
     oci/path-resolve.c \
+    oci/runtime-files.c \
     oci/run.c
 
 SRCS := $(addprefix src/,$(SRCS))
@@ -315,9 +316,17 @@ $(BUILD_DIR)/test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve.o $(BUILD
 ## the test ships an in-file elfuse_launch stub that aborts when called,
 ## and every case installs a launch hook via oci_run_set_launch_for_testing
 ## before invoking oci_run, so the real VM bring-up never runs from a test.
-$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-run: $(BUILD_DIR)/test-oci-run.o $(BUILD_DIR)/oci/run.o $(BUILD_DIR)/oci/runspec.o $(BUILD_DIR)/oci/path-resolve.o $(BUILD_DIR)/oci/runtime-files.o $(BUILD_DIR)/oci/unpack.o $(BUILD_DIR)/oci/volume.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/clone-rootfs.o $(BUILD_DIR)/oci/layer-apply.o $(BUILD_DIR)/oci/layer-meta.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/decompress.o $(BUILD_DIR)/oci/tar.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(BUILD_DIR)/core/sysroot.o $(BUILD_DIR)/debug/log.o $(CJSON_OBJ) $(ZSTD_OBJS) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lz
+
+## Build the OCI runtime-files injection unit test (native macOS, no HVF).
+## Pure C; the test drives oci_runtime_files_inject against scratch
+## /tmp/elfuse-rf-* run directories and verifies the synthesised
+## /etc/{resolv.conf,hosts,hostname} content.
+$(BUILD_DIR)/test-oci-runtime-files: $(BUILD_DIR)/test-oci-runtime-files.o $(BUILD_DIR)/oci/runtime-files.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 ## Build the OCI fixture builder (Phase 3 compat tests). Standalone tool
 ## that synthesises a complete OCI store from uncompressed-tar layers

@@ -52,6 +52,7 @@
 #include "digest.h"
 #include "manifest.h"
 #include "path-resolve.h"
+#include "runtime-files.h"
 #include "unpack.h"
 #include "volume.h"
 
@@ -353,6 +354,19 @@ int oci_run(oci_store_t *store,
     if (oci_clone_rootfs(image_dir, volume_root, &run_dir, &clone_err) < 0) {
         set_err_fmt(err, "clone-rootfs failed: %s",
                     clone_err ? clone_err : strerror(errno));
+        goto out;
+    }
+
+    /* 3.5. inject host-truth /etc/{resolv.conf,hosts,hostname} so
+     * guest libc lookups (getaddrinfo, gethostname, /etc/hosts walks)
+     * match the macOS host instead of the image's containerd
+     * defaults. Failure tears the clone-rootfs back down through the
+     * existing cleanup epilogue.
+     */
+    const char *rfi_err = NULL;
+    if (oci_runtime_files_inject(run_dir, &rfi_err) < 0) {
+        set_err_fmt(err, "runtime-files inject failed: %s",
+                    rfi_err ? rfi_err : strerror(errno));
         goto out;
     }
 

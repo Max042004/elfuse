@@ -15,6 +15,7 @@
         test-oci-origin \
         test-oci-layer-apply test-oci-volume test-oci-clone \
         test-oci-unpack test-oci-runspec test-oci-path-resolve \
+        test-oci-runtime-files \
         test-oci-run test-oci-compat oci-fixture-builder \
         test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
@@ -86,6 +87,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-oci-runspec
 	@printf "\n$(BLUE)━━━ OCI path-resolve unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-path-resolve
+	@printf "\n$(BLUE)━━━ OCI runtime-files injection unit tests ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-oci-runtime-files
 	@printf "\n$(BLUE)━━━ OCI run orchestrator unit tests ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-oci-run
 	@printf "\n$(BLUE)━━━ OCI compat shell smoke ━━━$(RESET)\n"
@@ -208,6 +211,14 @@ test-oci-runspec: $(BUILD_DIR)/test-oci-runspec
 ## EACCES on noexec, ENOENT diagnostics with searched-dirs list.
 test-oci-path-resolve: $(BUILD_DIR)/test-oci-path-resolve
 	@$(BUILD_DIR)/test-oci-path-resolve
+
+## Run the OCI runtime-files injection unit tests (native, no HVF, no network).
+## Phase 4 F4.2 / F4.3: validates oci_runtime_files_inject against scratch
+## run directories, covering fresh-/etc creation, symlink overwrite,
+## regular-file overwrite, and the synthesised /etc/{resolv.conf,
+## hosts, hostname} content.
+test-oci-runtime-files: $(BUILD_DIR)/test-oci-runtime-files
+	@$(BUILD_DIR)/test-oci-runtime-files
 
 ## Run the OCI run orchestrator unit tests (native, no HVF, no network).
 ## Covers oci_cli_run argument parsing plus oci_run early-failure
