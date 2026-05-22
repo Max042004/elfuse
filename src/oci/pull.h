@@ -45,6 +45,23 @@ typedef struct {
      * pull -q.
      */
     bool quiet;
+    /* Opt-in tag revalidation. When the pinned manifest digest and its blob
+     * are both already in the store, the top-level manifest GET carries
+     * If-None-Match: "<pinned-digest>"; on 304 Not Modified the pull
+     * short-circuits without re-fetching layer blobs and leaves the pin in
+     * place. Without this flag the default pull re-runs every step (never
+     * trusts the pin), which keeps stale-tag detection responsive but pays
+     * the network cost.
+     *
+     * The flag is a no-op for digest-only refs (no tag to revalidate
+     * against), and silently falls through to a normal pull when no pin
+     * exists yet or the pinned manifest blob has been pruned from the
+     * store. Servers may ignore If-None-Match and respond 200 with a new
+     * digest; the pull then runs the full pipeline against the new
+     * manifest. The previous manifest blob stays in the store until prune
+     * collects it.
+     */
+    bool refresh;
 } oci_pull_options_t;
 
 /* Run the pull pipeline. Returns 0 on success, -1 on failure with errno

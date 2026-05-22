@@ -63,6 +63,10 @@ static int print_usage(FILE *out)
         "  -u, --user USER[:PASS]  HTTP Basic auth for private registries\n"
         "  --insecure-ca PEM     Trust PEM as the registry CA bundle\n"
         "  --insecure            Skip TLS verify (loopback registries only)\n"
+        "  --refresh             Revalidate the pinned tag via "
+        "If-None-Match:\n"
+        "                        on 304 reuse the cached manifest and only\n"
+        "                        re-fetch missing layer blobs\n"
         "  -q, --quiet           Suppress per-blob progress output\n"
         "\n"
         "Inspect options:\n"
@@ -259,6 +263,7 @@ typedef struct {
     const char *ca_file;
     bool allow_insecure;
     bool quiet;
+    bool refresh;
     const char *ref_str;
     char *user_pass_buf; /* heap; freed by caller */
 } pull_args_t;
@@ -303,6 +308,8 @@ static int parse_pull_args(int argc, char **argv, pull_args_t *out)
             return 1;
         } else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) {
             out->quiet = true;
+        } else if (!strcmp(a, "--refresh")) {
+            out->refresh = true;
         } else if (!strcmp(a, "--insecure")) {
             out->allow_insecure = true;
         } else if (!strcmp(a, "--store")) {
@@ -416,7 +423,10 @@ static int cmd_pull(int argc, char **argv)
         free(canon);
     }
 
-    oci_pull_options_t popts = {.quiet = args.quiet};
+    oci_pull_options_t popts = {
+        .quiet = args.quiet,
+        .refresh = args.refresh,
+    };
     err = NULL;
     int rc = oci_pull(fetcher, store, &ref, &popts, &err);
     if (rc < 0) {

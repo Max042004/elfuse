@@ -43,6 +43,12 @@ typedef struct {
     char path[1024];
     char authorization[1024];
     char accept[1024];
+    /* If-None-Match request header value captured verbatim (including any
+     * surrounding quotes). Empty string when the client did not send one.
+     * Mock handlers use this to decide between 200 (with body) and 304
+     * (empty body, ETag echoed).
+     */
+    char if_none_match[256];
 } oci_mock_request_t;
 
 #define OCI_MOCK_LOG_MAX 16
@@ -102,13 +108,16 @@ ssize_t oci_mock_io_read(oci_mock_io_t *io, void *buf, size_t cap);
 void    oci_mock_io_write(oci_mock_io_t *io, const void *buf, size_t n);
 
 /* Compose and send a complete HTTP/1.1 response. status_text defaults to "OK"
- * when NULL. content_type / www_authenticate / docker_digest are added to the
- * header block only when non-NULL. body may be NULL when body_len is 0.
+ * when NULL. content_type / www_authenticate / docker_digest / etag are added
+ * to the header block only when non-NULL. body may be NULL when body_len is
+ * 0. The etag value is emitted verbatim (callers pass the registry-style
+ * strong quoted form, including the quotes).
  */
 void oci_mock_send_full(oci_mock_io_t *io, int status, const char *status_text,
                         const char *content_type,
                         const char *www_authenticate,
                         const char *docker_digest,
+                        const char *etag,
                         const void *body,
                         size_t body_len);
 

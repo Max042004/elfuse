@@ -112,6 +112,15 @@ static void parse_request(const char *raw, oci_mock_request_t *out)
                 vlen = sizeof(out->accept) - 1;
             memcpy(out->accept, v, vlen);
             out->accept[vlen] = '\0';
+        } else if (llen > 13 && !strncasecmp(line, "If-None-Match:", 14)) {
+            const char *v = line + 14;
+            while (*v == ' ')
+                v++;
+            size_t vlen = (size_t) (eol - v);
+            if (vlen >= sizeof(out->if_none_match))
+                vlen = sizeof(out->if_none_match) - 1;
+            memcpy(out->if_none_match, v, vlen);
+            out->if_none_match[vlen] = '\0';
         }
         line = eol + 2;
     }
@@ -332,6 +341,7 @@ void oci_mock_send_full(oci_mock_io_t *io, int status, const char *status_text,
                         const char *content_type,
                         const char *www_authenticate,
                         const char *docker_digest,
+                        const char *etag,
                         const void *body,
                         size_t body_len)
 {
@@ -349,6 +359,9 @@ void oci_mock_send_full(oci_mock_io_t *io, int status, const char *status_text,
     if (docker_digest)
         n += snprintf(header + n, sizeof(header) - (size_t) n,
                       "Docker-Content-Digest: %s\r\n", docker_digest);
+    if (etag)
+        n += snprintf(header + n, sizeof(header) - (size_t) n,
+                      "ETag: %s\r\n", etag);
     n += snprintf(header + n, sizeof(header) - (size_t) n, "\r\n");
     oci_mock_io_write(io, header, (size_t) n);
     if (body_len > 0)

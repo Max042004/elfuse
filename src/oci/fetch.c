@@ -188,9 +188,11 @@ void oci_fetch_response_free(oci_fetch_response_t *r)
     free(r->body);
     free(r->content_type);
     free(r->docker_content_digest);
+    free(r->etag);
     r->body = NULL;
     r->content_type = NULL;
     r->docker_content_digest = NULL;
+    r->etag = NULL;
     r->body_len = 0;
     r->http_status = 0;
 }
@@ -503,6 +505,7 @@ static int parse_bearer_challenge(const char *value, bearer_challenge_t *out)
 typedef struct {
     char *content_type;
     char *docker_content_digest;
+    char *etag;
     bearer_challenge_t *challenge_out;
 } headers_ctx_t;
 
@@ -539,6 +542,13 @@ static size_t header_cb(char *buffer, size_t size, size_t nitems, void *userdata
         ctx->docker_content_digest = strdup(v);
         return total;
     }
+    v = match_header(line, "ETag");
+    if (v) {
+        v = trim_inplace(v);
+        free(ctx->etag);
+        ctx->etag = strdup(v);
+        return total;
+    }
     if (ctx->challenge_out) {
         v = match_header(line, "Www-Authenticate");
         if (v) {
@@ -550,7 +560,8 @@ static size_t header_cb(char *buffer, size_t size, size_t nitems, void *userdata
 }
 
 static struct curl_slist *build_request_headers(const oci_fetcher_t *f,
-                                                const char *const *accept_types)
+                                                const char *const *accept_types,
+                                                const char *if_none_match)
 {
     struct curl_slist *hdrs = NULL;
     if (accept_types) {
@@ -565,6 +576,15 @@ static struct curl_slist *build_request_headers(const oci_fetcher_t *f,
         char *hdr = malloc(n);
         if (hdr) {
             snprintf(hdr, n, "Authorization: Bearer %s", f->bearer_token);
+            hdrs = curl_slist_append(hdrs, hdr);
+            free(hdr);
+        }
+    }
+    if (if_none_match) {
+        size_t n = strlen(if_none_match) + sizeof("If-None-Match: ");
+        char *hdr = malloc(n);
+        if (hdr) {
+            snprintf(hdr, n, "If-None-Match: %s", if_none_match);
             hdrs = curl_slist_append(hdrs, hdr);
             free(hdr);
         }
@@ -687,6 +707,7 @@ static int fetch_token(oci_fetcher_t *f, const char **err_msg)
 static int perform_manifest_get(oci_fetcher_t *f,
                                 const char *url,
                                 const char *const *accept_types,
+                                const char *if_none_match,
                                 oci_fetch_response_t *out,
                                 bearer_challenge_t *challenge_out,
                                 const char **err_msg)
@@ -706,7 +727,8 @@ static int perform_manifest_get(oci_fetcher_t *f,
     curl_easy_setopt(f->easy, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(f->easy, CURLOPT_HEADERFUNCTION, header_cb);
     curl_easy_setopt(f->easy, CURLOPT_HEADERDATA, &hctx);
-    struct curl_slist *hdrs = build_request_headers(f, accept_types);
+    struct curl_slist *hdrs =
+        build_request_headers(f, accept_types, if_none_match);
     if (hdrs)
         curl_easy_setopt(f->easy, CURLOPT_HTTPHEADER, hdrs);
 
@@ -721,6 +743,7 @@ static int perform_manifest_get(oci_fetcher_t *f,
         free(body.buf);
         free(hctx.content_type);
         free(hctx.docker_content_digest);
+        free(hctx.etag);
         if (err_msg)
             *err_msg = curl_easy_strerror(rc);
         errno = EIO;
@@ -730,6 +753,7 @@ static int perform_manifest_get(oci_fetcher_t *f,
         free(body.buf);
         free(hctx.content_type);
         free(hctx.docker_content_digest);
+        free(hctx.etag);
         if (err_msg)
             *err_msg = "response body exceeded max size";
         errno = EFBIG;
@@ -739,6 +763,7 @@ static int perform_manifest_get(oci_fetcher_t *f,
     out->body_len = body.len;
     out->content_type = hctx.content_type;
     out->docker_content_digest = hctx.docker_content_digest;
+    out->etag = hctx.etag;
     return 0;
 }
 
@@ -746,6 +771,7 @@ int oci_fetch_manifest(oci_fetcher_t *f,
                        const oci_ref_t *ref,
                        const char *digest_or_tag,
                        const char *const *accept_types,
+                       const char *if_none_match,
                        oci_fetch_response_t *out,
                        const char **err_msg)
 {
@@ -778,7 +804,7 @@ int oci_fetch_manifest(oci_fetcher_t *f,
     }
 
     bearer_challenge_t challenge = {0};
-    int rc = perform_manifest_get(f, url, accept_types, out,
+    int rc = perform_manifest_get(f, url, accept_types, if_none_match, out,
                                   f->bearer_token ? NULL : &challenge,
                                   err_msg);
     if (rc < 0) {
@@ -797,7 +823,8 @@ int oci_fetch_manifest(oci_fetcher_t *f,
             free(url);
             return -1;
         }
-        rc = perform_manifest_get(f, url, accept_types, out, NULL, err_msg);
+        rc = perform_manifest_get(f, url, accept_types, if_none_match, out,
+                                  NULL, err_msg);
         if (rc < 0) {
             free(url);
             return -1;
@@ -808,6 +835,13 @@ int oci_fetch_manifest(oci_fetcher_t *f,
 
     free(url);
 
+    /* 304 Not Modified is a success path for conditional revalidation: the
+     * caller asked the registry whether the pinned digest still matches and
+     * the answer is yes. The body is intentionally empty; the etag (when the
+     * server emitted one) stays attached for caller diagnostics.
+     */
+    if (out->http_status == 304)
+        return 0;
     if (out->http_status < 200 || out->http_status >= 300) {
         if (err_msg)
             *err_msg = "manifest fetch returned non-2xx status";
@@ -865,7 +899,7 @@ static int perform_blob_get(oci_fetcher_t *f,
     curl_easy_setopt(f->easy, CURLOPT_WRITEDATA, bctx);
     curl_easy_setopt(f->easy, CURLOPT_HEADERFUNCTION, header_cb);
     curl_easy_setopt(f->easy, CURLOPT_HEADERDATA, &hctx);
-    struct curl_slist *hdrs = build_request_headers(f, NULL);
+    struct curl_slist *hdrs = build_request_headers(f, NULL, NULL);
     if (hdrs)
         curl_easy_setopt(f->easy, CURLOPT_HTTPHEADER, hdrs);
 

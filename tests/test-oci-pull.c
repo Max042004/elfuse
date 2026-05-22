@@ -95,13 +95,6 @@ typedef struct {
     char index_hex[OCI_DIGEST_HEX_MAX + 1];
 } image_t;
 
-static char *xstrdup_with_len(const char *s, size_t *out_len)
-{
-    char *r = strdup(s);
-    *out_len = strlen(s);
-    return r;
-}
-
 static char *vformat(size_t *out_len, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
@@ -128,15 +121,18 @@ static void hash_bytes(const void *buf, size_t len, char *out_hex)
     oci_digest_bytes(OCI_DIGEST_SHA256, buf, len, out_hex);
 }
 
-static int build_image(image_t *img)
+static int build_image(image_t *img, const char *variant)
 {
     memset(img, 0, sizeof(*img));
 
-    img->layer_bodies[0] = xstrdup_with_len("LAYER-ONE-bytes",
-                                            &img->layer_lens[0]);
-    img->layer_bodies[1] = xstrdup_with_len("LAYER-TWO-bytes-larger-payload",
-                                            &img->layer_lens[1]);
-    img->layer_bodies[2] = xstrdup_with_len("L3", &img->layer_lens[2]);
+    if (!variant)
+        variant = "";
+    img->layer_bodies[0] = vformat(&img->layer_lens[0], "LAYER-ONE-bytes%s",
+                                   variant);
+    img->layer_bodies[1] = vformat(&img->layer_lens[1],
+                                   "LAYER-TWO-bytes-larger-payload%s",
+                                   variant);
+    img->layer_bodies[2] = vformat(&img->layer_lens[2], "L3%s", variant);
     img->nlayers = 3;
     for (size_t i = 0; i < img->nlayers; i++)
         hash_bytes(img->layer_bodies[i], img->layer_lens[i], img->layer_hex[i]);
@@ -212,6 +208,13 @@ typedef struct {
     const void *body;
     size_t body_len;
     bool has_docker_digest;
+    /* Optional registered ETag for the route. When non-empty the mock emits
+     * it on 200 responses. When the inbound request's If-None-Match header
+     * matches this value verbatim the mock instead returns 304 with no body
+     * but the same ETag header, mirroring how a real OCI registry
+     * revalidates a tag.
+     */
+    char etag[80];
 } route_t;
 
 #define ROUTES_MAX 16
@@ -248,6 +251,23 @@ static void router_add(router_ctx_t *ctx, const char *path, int status,
     }
 }
 
+/* Register an ETag the mock will echo on the route matching `path`. When the
+ * inbound request also carries that exact If-None-Match value the route
+ * responds 304 instead of 200, which lets tests assert that --refresh wires
+ * up the conditional header end-to-end.
+ */
+static void router_set_etag(router_ctx_t *ctx, const char *path,
+                            const char *etag)
+{
+    for (size_t i = 0; i < ctx->nroutes; i++) {
+        if (strcmp(ctx->routes[i].path, path) == 0) {
+            snprintf(ctx->routes[i].etag, sizeof(ctx->routes[i].etag), "%s",
+                     etag);
+            return;
+        }
+    }
+}
+
 static void router_handler(oci_mock_server_t *s, oci_mock_io_t *io,
                            const oci_mock_request_t *req)
 {
@@ -256,6 +276,13 @@ static void router_handler(oci_mock_server_t *s, oci_mock_io_t *io,
         const route_t *r = &ctx->routes[i];
         if (strcmp(req->path, r->path) != 0)
             continue;
+        if (r->etag[0] != '\0' &&
+            strcmp(req->if_none_match, r->etag) == 0) {
+            oci_mock_send_full(io, 304, "Not Modified", r->content_type, NULL,
+                               r->has_docker_digest ? r->docker_digest : NULL,
+                               r->etag, NULL, 0);
+            return;
+        }
         const void *body = r->body;
         size_t body_len = r->body_len;
         if (i == 0 && ctx->override_body) {
@@ -266,10 +293,10 @@ static void router_handler(oci_mock_server_t *s, oci_mock_io_t *io,
                            r->status == 200 ? "OK" : "Error",
                            r->content_type, NULL,
                            r->has_docker_digest ? r->docker_digest : NULL,
-                           body, body_len);
+                           r->etag[0] ? r->etag : NULL, body, body_len);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL,
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL,
                        "nope", 4);
 }
 
@@ -707,6 +734,369 @@ static void test_pull_index_no_arm64(fixture_t *fx)
     oci_store_close(store);
 }
 
+/* ── refresh: shared route population for a direct (no-index) manifest ─ */
+
+static void populate_routes_direct(router_ctx_t *ctx, const image_t *img,
+                                   const char *manifest_dc_digest)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/v2/library/alpine/manifests/3.20");
+    router_add(ctx, path, 200,
+               "application/vnd.oci.image.manifest.v1+json",
+               manifest_dc_digest, img->manifest_json, img->manifest_len);
+
+    snprintf(path, sizeof(path), "/v2/library/alpine/blobs/sha256:%s",
+             img->config_hex);
+    router_add(ctx, path, 200, "application/octet-stream", NULL,
+               img->config_json, img->config_len);
+
+    for (size_t i = 0; i < img->nlayers; i++) {
+        snprintf(path, sizeof(path), "/v2/library/alpine/blobs/sha256:%s",
+                 img->layer_hex[i]);
+        router_add(ctx, path, 200, "application/octet-stream", NULL,
+                   img->layer_bodies[i], img->layer_lens[i]);
+    }
+}
+
+static void test_pull_refresh_unchanged(fixture_t *fx)
+{
+    const char *name = "pull: --refresh 304 short-circuits blob refetch";
+    image_t *img = fx->img;
+    router_ctx_t ctx = {0};
+    char dc[80];
+    snprintf(dc, sizeof(dc), "sha256:%s", img->manifest_hex);
+    populate_routes_direct(&ctx, img, dc);
+    char etag[80];
+    snprintf(etag, sizeof(etag), "\"sha256:%s\"", img->manifest_hex);
+    router_set_etag(&ctx, "/v2/library/alpine/manifests/3.20", etag);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-refresh-304", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    if (!store) {
+        report_fail(name, "store open");
+        return;
+    }
+    oci_fetcher_options_t fopts = {
+        .base_url_override = fx->base_url,
+        .ca_file = fx->ca_pem_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    oci_ref_t ref = {0};
+    const char *err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &err);
+    oci_pull_options_t popts = {.quiet = true};
+
+    err = NULL;
+    if (oci_pull(f, store, &ref, &popts, &err) != 0) {
+        report_fail(name, "first pull rc != 0: %s", err ? err : "(none)");
+        goto cleanup;
+    }
+
+    /* Second pull with --refresh: server returns 304, pull short-circuits. */
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+    popts.refresh = true;
+    err = NULL;
+    if (oci_pull(f, store, &ref, &popts, &err) != 0) {
+        report_fail(name, "refresh pull rc != 0: %s", err ? err : "(none)");
+        goto cleanup;
+    }
+    int refresh_count = oci_mock_request_count(fx->server);
+    if (refresh_count != 1) {
+        report_fail(name,
+                    "refresh pull made %d requests, expected 1 "
+                    "(manifest revalidate only)",
+                    refresh_count);
+        goto cleanup;
+    }
+    char *pin = NULL;
+    if (oci_store_get_ref(store, &ref, &pin, &err) < 0) {
+        report_fail(name, "pin missing after refresh: %s",
+                    err ? err : "?");
+        goto cleanup;
+    }
+    char want[80];
+    snprintf(want, sizeof(want), "sha256:%s", img->manifest_hex);
+    if (strcmp(pin, want) != 0) {
+        report_fail(name, "pin=%s want=%s", pin, want);
+        free(pin);
+        goto cleanup;
+    }
+    free(pin);
+    report_pass(name);
+
+cleanup:
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+}
+
+static void test_pull_refresh_changed(fixture_t *fx)
+{
+    const char *name =
+        "pull: --refresh 200 with new digest re-pulls and keeps old blob";
+    image_t *img = fx->img;
+    image_t img2;
+    if (build_image(&img2, "-v2") < 0) {
+        report_fail(name, "build_image variant failed");
+        return;
+    }
+
+    /* First pull serves the original image. */
+    router_ctx_t ctx1 = {0};
+    char dc1[80];
+    snprintf(dc1, sizeof(dc1), "sha256:%s", img->manifest_hex);
+    populate_routes_direct(&ctx1, img, dc1);
+    oci_mock_set_handler(fx->server, router_handler, &ctx1);
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-refresh-200", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    oci_fetcher_options_t fopts = {
+        .base_url_override = fx->base_url,
+        .ca_file = fx->ca_pem_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    oci_ref_t ref = {0};
+    const char *err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &err);
+    oci_pull_options_t popts = {.quiet = true};
+
+    err = NULL;
+    if (oci_pull(f, store, &ref, &popts, &err) != 0) {
+        report_fail(name, "first pull rc != 0: %s", err ? err : "(none)");
+        goto cleanup;
+    }
+
+    /* Second pull: same tag, --refresh, but the registry has flipped to img2.
+     * The mock declares ETag for img2.manifest_hex; the inbound
+     * If-None-Match carries img1.manifest_hex so the server falls through to
+     * 200 with the new body. The full pull pipeline must run again.
+     */
+    router_ctx_t ctx2 = {0};
+    char dc2[80];
+    snprintf(dc2, sizeof(dc2), "sha256:%s", img2.manifest_hex);
+    populate_routes_direct(&ctx2, &img2, dc2);
+    char etag2[80];
+    snprintf(etag2, sizeof(etag2), "\"sha256:%s\"", img2.manifest_hex);
+    router_set_etag(&ctx2, "/v2/library/alpine/manifests/3.20", etag2);
+    oci_mock_set_handler(fx->server, router_handler, &ctx2);
+    popts.refresh = true;
+    err = NULL;
+    if (oci_pull(f, store, &ref, &popts, &err) != 0) {
+        report_fail(name, "refresh pull rc != 0: %s", err ? err : "(none)");
+        goto cleanup;
+    }
+
+    if (!blob_present(store, img2.manifest_hex)) {
+        report_fail(name, "new manifest blob missing");
+        goto cleanup;
+    }
+    if (!blob_present(store, img2.config_hex)) {
+        report_fail(name, "new config blob missing");
+        goto cleanup;
+    }
+    for (size_t i = 0; i < img2.nlayers; i++) {
+        if (!blob_present(store, img2.layer_hex[i])) {
+            report_fail(name, "new layer %zu missing", i);
+            goto cleanup;
+        }
+    }
+    /* Old manifest blob must still be on disk; prune is the one that cleans
+     * up old manifests, not refresh.
+     */
+    if (!blob_present(store, img->manifest_hex)) {
+        report_fail(name, "old manifest blob was unlinked by refresh");
+        goto cleanup;
+    }
+    char *pin = NULL;
+    if (oci_store_get_ref(store, &ref, &pin, &err) < 0) {
+        report_fail(name, "pin missing after refresh: %s",
+                    err ? err : "?");
+        goto cleanup;
+    }
+    char want[80];
+    snprintf(want, sizeof(want), "sha256:%s", img2.manifest_hex);
+    if (strcmp(pin, want) != 0) {
+        report_fail(name, "pin=%s want=%s", pin, want);
+        free(pin);
+        goto cleanup;
+    }
+    free(pin);
+    report_pass(name);
+
+cleanup:
+    free_image(&img2);
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+}
+
+static void test_pull_refresh_no_pin_falls_through(fixture_t *fx)
+{
+    const char *name =
+        "pull: --refresh on empty store falls through to normal pull";
+    image_t *img = fx->img;
+    router_ctx_t ctx = {0};
+    char dc[80];
+    snprintf(dc, sizeof(dc), "sha256:%s", img->manifest_hex);
+    populate_routes_direct(&ctx, img, dc);
+    /* An ETag is registered but the inbound request must NOT carry
+     * If-None-Match (no pin yet). The route then serves 200 with body. */
+    char etag[80];
+    snprintf(etag, sizeof(etag), "\"sha256:%s\"", img->manifest_hex);
+    router_set_etag(&ctx, "/v2/library/alpine/manifests/3.20", etag);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-refresh-nopin", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    oci_fetcher_options_t fopts = {
+        .base_url_override = fx->base_url,
+        .ca_file = fx->ca_pem_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    oci_ref_t ref = {0};
+    const char *err = NULL;
+    oci_ref_parse("alpine:3.20", &ref, &err);
+    oci_pull_options_t popts = {.quiet = true, .refresh = true};
+
+    err = NULL;
+    if (oci_pull(f, store, &ref, &popts, &err) != 0) {
+        report_fail(name, "rc != 0: %s", err ? err : "(none)");
+        goto cleanup;
+    }
+    /* No index in this fixture, so all_blobs_present (which also checks the
+     * index hex) is the wrong assertion; just verify the bytes the direct
+     * route actually serves are persisted. */
+    if (!blob_present(store, img->manifest_hex) ||
+        !blob_present(store, img->config_hex)) {
+        report_fail(name, "manifest or config missing");
+        goto cleanup;
+    }
+    for (size_t i = 0; i < img->nlayers; i++) {
+        if (!blob_present(store, img->layer_hex[i])) {
+            report_fail(name, "layer %zu missing", i);
+            goto cleanup;
+        }
+    }
+    /* The mock's request log captures every request. The first (top-level
+     * manifest) one must not have If-None-Match because no pin existed. */
+    pthread_mutex_lock(&fx->server->lock);
+    bool inm_seen = false;
+    for (int i = 0; i < fx->server->n_requests; i++) {
+        if (fx->server->log[i].if_none_match[0] != '\0') {
+            inm_seen = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fx->server->lock);
+    if (inm_seen) {
+        report_fail(name,
+                    "If-None-Match sent on cold store (no pin to revalidate)");
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+}
+
+static void test_pull_refresh_digest_only_noop(fixture_t *fx)
+{
+    const char *name = "pull: --refresh on digest-only ref is a noop";
+    image_t *img = fx->img;
+    router_ctx_t ctx = {0};
+    char path[256];
+    snprintf(path, sizeof(path), "/v2/library/alpine/manifests/sha256:%s",
+             img->manifest_hex);
+    router_add(&ctx, path, 200,
+               "application/vnd.oci.image.manifest.v1+json", NULL,
+               img->manifest_json, img->manifest_len);
+    snprintf(path, sizeof(path), "/v2/library/alpine/blobs/sha256:%s",
+             img->config_hex);
+    router_add(&ctx, path, 200, "application/octet-stream", NULL,
+               img->config_json, img->config_len);
+    for (size_t i = 0; i < img->nlayers; i++) {
+        snprintf(path, sizeof(path), "/v2/library/alpine/blobs/sha256:%s",
+                 img->layer_hex[i]);
+        router_add(&ctx, path, 200, "application/octet-stream", NULL,
+                   img->layer_bodies[i], img->layer_lens[i]);
+    }
+    /* Even if an ETag is registered on the digest manifest path, --refresh
+     * must not opt into a conditional GET for a digest-only ref (no tag to
+     * revalidate against). */
+    char etag[80];
+    snprintf(etag, sizeof(etag), "\"sha256:%s\"", img->manifest_hex);
+    snprintf(path, sizeof(path), "/v2/library/alpine/manifests/sha256:%s",
+             img->manifest_hex);
+    router_set_etag(&ctx, path, etag);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-refresh-digest", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    oci_fetcher_options_t fopts = {
+        .base_url_override = fx->base_url,
+        .ca_file = fx->ca_pem_path,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+
+    char ref_str[256];
+    snprintf(ref_str, sizeof(ref_str), "alpine@sha256:%s", img->manifest_hex);
+    oci_ref_t ref = {0};
+    const char *err = NULL;
+    oci_ref_parse(ref_str, &ref, &err);
+    oci_pull_options_t popts = {.quiet = true, .refresh = true};
+
+    err = NULL;
+    if (oci_pull(f, store, &ref, &popts, &err) != 0) {
+        report_fail(name, "rc != 0: %s", err ? err : "(none)");
+        goto cleanup;
+    }
+    if (!blob_present(store, img->manifest_hex)) {
+        report_fail(name, "manifest blob missing");
+        goto cleanup;
+    }
+    /* Pin must NOT have been written for a digest-only ref. */
+    char *pin = NULL;
+    errno = 0;
+    if (oci_store_get_ref(store, &ref, &pin, &err) == 0) {
+        report_fail(name, "unexpected pin written");
+        free(pin);
+        goto cleanup;
+    }
+    if (errno != EINVAL) {
+        report_fail(name, "expected EINVAL on get_ref, got errno=%d", errno);
+        goto cleanup;
+    }
+    /* No If-None-Match must have been sent because digest-only refs are
+     * content-addressed and cannot drift. */
+    pthread_mutex_lock(&fx->server->lock);
+    bool inm_seen = false;
+    for (int i = 0; i < fx->server->n_requests; i++) {
+        if (fx->server->log[i].if_none_match[0] != '\0') {
+            inm_seen = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fx->server->lock);
+    if (inm_seen) {
+        report_fail(name,
+                    "If-None-Match was sent for a digest-only ref");
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+}
+
 /* ── main ────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -736,7 +1126,7 @@ int main(void)
     char *base_url = oci_mock_make_base_url(server.port);
 
     image_t img;
-    if (build_image(&img) < 0) {
+    if (build_image(&img, NULL) < 0) {
         fprintf(stderr, "build_image failed\n");
         oci_mock_server_stop(&server);
         free(base_url);
@@ -760,6 +1150,10 @@ int main(void)
     test_pull_repull_caches(&fx);
     test_pull_docker_digest_mismatch(&fx);
     test_pull_index_no_arm64(&fx);
+    test_pull_refresh_unchanged(&fx);
+    test_pull_refresh_changed(&fx);
+    test_pull_refresh_no_pin_falls_through(&fx);
+    test_pull_refresh_digest_only_noop(&fx);
 
     free_image(&img);
     free(base_url);

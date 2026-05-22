@@ -71,6 +71,17 @@ case "${out}" in
         ;;
 esac
 
+# `oci pull --help` advertises the --refresh flag added in C4.2.
+pull_help=$("${ELFUSE}" oci pull --help 2>&1)
+case "${pull_help}" in
+    *"--refresh"*)
+        ok "pull-smoke: --help advertises --refresh"
+        ;;
+    *)
+        bad "pull-smoke: --refresh usage" "${pull_help}"
+        ;;
+esac
+
 # Missing IMAGE returns rc=2.
 "${ELFUSE}" oci run --keep >/dev/null 2>&1
 rc=$?

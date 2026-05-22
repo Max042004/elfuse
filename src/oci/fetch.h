@@ -100,6 +100,11 @@ typedef struct {
      * NULL if the server omitted it. Useful for tag-to-digest pinning.
      */
     char *docker_content_digest;
+    /* ETag header verbatim, including any surrounding quotes or weak prefix
+     * (e.g. "sha256:abc..." or W/"..."). NULL if the server omitted it.
+     * Captured so conditional-GET callers can echo it back without parsing.
+     */
+    char *etag;
     long http_status;
 } oci_fetch_response_t;
 
@@ -108,22 +113,30 @@ void oci_fetch_response_free(oci_fetch_response_t *r);
 
 /* Fetch a manifest, image index, or image config blob by reference.
  *
- *   ref           registry/repository, plus optional default tag/digest
- *   digest_or_tag the actual GET selector ("sha256:..." or a tag string).
- *                 NULL means: use ref->digest if set, otherwise ref->tag.
- *   accept_types  NULL-terminated list of media types to advertise in the
- *                 Accept header. Pass NULL to suppress the Accept header.
+ *   ref            registry/repository, plus optional default tag/digest
+ *   digest_or_tag  the actual GET selector ("sha256:..." or a tag string).
+ *                  NULL means: use ref->digest if set, otherwise ref->tag.
+ *   accept_types   NULL-terminated list of media types to advertise in the
+ *                  Accept header. Pass NULL to suppress the Accept header.
+ *   if_none_match  optional If-None-Match value sent verbatim. Pass the
+ *                  registry-style strong quoted form ("sha256:...") to ask
+ *                  the registry for 304 Not Modified when the upstream
+ *                  manifest still hashes to the pinned digest. NULL skips
+ *                  the conditional header entirely.
  *
  * On success returns 0 and fills *out (caller frees via
- * oci_fetch_response_free). On HTTP error (non-2xx) returns -1 with
- * out->http_status populated and errno=EPROTO; the body may still be present
- * for diagnostics. On transport / auth failure returns -1 with errno
- * preserved and *err_msg (when non-NULL) pointing at a static description.
+ * oci_fetch_response_free). A 304 response is success: out->http_status is
+ * 304, out->body is NULL, out->body_len is 0, and out->etag may still be
+ * populated. On HTTP error (other non-2xx) returns -1 with out->http_status
+ * populated and errno=EPROTO; the body may still be present for
+ * diagnostics. On transport / auth failure returns -1 with errno preserved
+ * and *err_msg (when non-NULL) pointing at a static description.
  */
 int oci_fetch_manifest(oci_fetcher_t *f,
                        const oci_ref_t *ref,
                        const char *digest_or_tag,
                        const char *const *accept_types,
+                       const char *if_none_match,
                        oci_fetch_response_t *out,
                        const char **err_msg);
 

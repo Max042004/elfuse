@@ -112,10 +112,10 @@ static void h_anonymous_manifest(oci_mock_server_t *s, oci_mock_io_t *io,
     handler_anonymous_manifest_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->manifest_path) == 0) {
         oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, ctx->docker_digest,
-                       ctx->body, ctx->body_len);
+                       NULL, ctx->body, ctx->body_len);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
 }
 
 typedef struct {
@@ -135,8 +135,8 @@ static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_moc
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->expected_token);
-        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, body,
-                       (size_t) n);
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL,
+                       body, (size_t) n);
         return;
     }
     if (strcmp(req->path, ctx->manifest_path) == 0) {
@@ -144,7 +144,7 @@ static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_moc
         snprintf(want_auth, sizeof(want_auth), "Bearer %s", ctx->expected_token);
         if (strcmp(req->authorization, want_auth) == 0) {
             oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
-                           ctx->manifest_body, ctx->manifest_body_len);
+                           NULL, ctx->manifest_body, ctx->manifest_body_len);
             return;
         }
         char challenge[512];
@@ -153,10 +153,10 @@ static void h_bearer_flow(oci_mock_server_t *s, oci_mock_io_t *io, const oci_moc
                  "scope=\"repository:private/secret:pull\"",
                  ctx->base_url);
         oci_mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
-                       NULL, "{}", 2);
+                       NULL, NULL, "{}", 2);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
 }
 
 typedef struct {
@@ -171,12 +171,12 @@ static void h_blob(oci_mock_server_t *s, oci_mock_io_t *io, const oci_mock_reque
 {
     handler_blob_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->blob_path) != 0) {
-        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
         return;
     }
     int status = ctx->status ? ctx->status : 200;
     if (status != 200) {
-        oci_mock_send_full(io, status, "Error", "text/plain", NULL, NULL, "err", 3);
+        oci_mock_send_full(io, status, "Error", "text/plain", NULL, NULL, NULL, "err", 3);
         return;
     }
     if (ctx->oversize) {
@@ -185,12 +185,12 @@ static void h_blob(oci_mock_server_t *s, oci_mock_io_t *io, const oci_mock_reque
         memcpy(buf, ctx->body, ctx->body_len);
         memset(buf + ctx->body_len, 'X', 5);
         oci_mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
-                       buf, pad_len);
+                       NULL, buf, pad_len);
         free(buf);
         return;
     }
     oci_mock_send_full(io, 200, "OK", "application/octet-stream", NULL, NULL,
-                   ctx->body, ctx->body_len);
+                   NULL, ctx->body, ctx->body_len);
 }
 
 typedef struct {
@@ -206,16 +206,16 @@ static void h_basic_auth(oci_mock_server_t *s, oci_mock_io_t *io,
 {
     handler_basic_auth_t *ctx = s->ctx;
     if (strcmp(req->path, ctx->manifest_path) != 0) {
-        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+        oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
         return;
     }
     if (strcmp(req->authorization, ctx->expected_authorization) != 0) {
         oci_mock_send_full(io, 401, "Unauthorized", "application/json",
-                       "Basic realm=\"reg\"", NULL, "{}", 2);
+                       "Basic realm=\"reg\"", NULL, NULL, "{}", 2);
         return;
     }
     oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
-                   ctx->body, ctx->body_len);
+                   NULL, ctx->body, ctx->body_len);
 }
 
 typedef struct {
@@ -235,15 +235,15 @@ static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
     if (strncmp(req->path, "/token", 6) == 0) {
         if (strcmp(req->authorization, ctx->expected_basic) != 0) {
             oci_mock_send_full(io, 401, "Unauthorized", "application/json", NULL,
-                           NULL, "{}", 2);
+                           NULL, NULL, "{}", 2);
             return;
         }
         char body[256];
         int n = snprintf(body, sizeof(body),
                          "{\"token\":\"%s\",\"expires_in\":300}",
                          ctx->expected_token);
-        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, body,
-                       (size_t) n);
+        oci_mock_send_full(io, 200, "OK", "application/json", NULL, NULL, NULL,
+                       body, (size_t) n);
         return;
     }
     if (strcmp(req->path, ctx->manifest_path) == 0) {
@@ -252,7 +252,7 @@ static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
                  ctx->expected_token);
         if (strcmp(req->authorization, want_bearer) == 0) {
             oci_mock_send_full(io, 200, "OK", ctx->content_type, NULL, NULL,
-                           ctx->manifest_body, ctx->manifest_body_len);
+                           NULL, ctx->manifest_body, ctx->manifest_body_len);
             return;
         }
         char challenge[512];
@@ -261,10 +261,10 @@ static void h_basic_then_bearer(oci_mock_server_t *s, oci_mock_io_t *io,
                  "scope=\"repository:private/secret:pull\"",
                  ctx->base_url);
         oci_mock_send_full(io, 401, "Unauthorized", "application/json", challenge,
-                       NULL, "{}", 2);
+                       NULL, NULL, "{}", 2);
         return;
     }
-    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, "nope", 4);
+    oci_mock_send_full(io, 404, "Not Found", "text/plain", NULL, NULL, NULL, "nope", 4);
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
@@ -290,7 +290,7 @@ static void test_anonymous_manifest(oci_mock_server_t *server, oci_fetcher_t *f)
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("anonymous manifest GET", "rc=%d err=%s", rc,
                     err ? err : "(none)");
@@ -333,7 +333,7 @@ static void test_manifest_404(oci_mock_server_t *server, oci_fetcher_t *f)
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc == 0) {
         report_fail("manifest 404 surfaces as error", "rc=0");
     } else if (resp.http_status != 404) {
@@ -357,7 +357,7 @@ static void test_bearer_challenge(oci_mock_server_t *server, oci_fetcher_t *f,
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("bearer challenge fetches token and retries", "rc=%d err=%s",
                     rc, err ? err : "(none)");
@@ -392,7 +392,7 @@ static void test_token_reuse(oci_mock_server_t *server, oci_fetcher_t *f)
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("cached token reused on subsequent fetch", "rc=%d err=%s",
                     rc, err ? err : "(none)");
@@ -655,7 +655,7 @@ static void test_basic_auth_success(oci_mock_server_t *server, const char *base_
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("basic auth: server accepts credentials", "rc=%d err=%s",
                     rc, err ? err : "(none)");
@@ -710,7 +710,7 @@ static void test_basic_then_bearer(oci_mock_server_t *server, const char *base_u
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("basic auth carried into bearer token endpoint",
                     "rc=%d err=%s", rc, err ? err : "(none)");
@@ -775,7 +775,7 @@ static void test_insecure_loopback_allowed(oci_mock_server_t *server,
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("insecure: loopback host bypasses TLS verify",
                     "rc=%d err=%s", rc, err ? err : "(none)");
@@ -827,7 +827,7 @@ static void test_insecure_non_loopback_rejected(oci_mock_server_t *server,
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
     errno = 0;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     int saved_errno = errno;
     if (rc != -1) {
         report_fail("insecure: non-loopback host rejected", "rc=%d", rc);
@@ -874,7 +874,7 @@ static void test_ca_file_missing_rejected(oci_mock_server_t *server,
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc == 0) {
         report_fail("ca_file unset: TLS verify fails on self-signed mock",
                     "rc=0 (verify should have failed)");
@@ -947,7 +947,7 @@ static void test_ca_file_wrong_rejected(oci_mock_server_t *server,
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, NULL, NULL, &resp, &err);
     if (rc == 0) {
         report_fail("ca_file wrong: TLS verify fails",
                     "rc=0 (verify should have failed)");
@@ -987,7 +987,7 @@ static void test_online_dockerhub(void)
     };
     oci_fetch_response_t resp = {0};
     const char *err = NULL;
-    int rc = oci_fetch_manifest(f, &ref, NULL, accept, &resp, &err);
+    int rc = oci_fetch_manifest(f, &ref, NULL, accept, NULL, &resp, &err);
     if (rc != 0) {
         report_fail("online docker.io alpine:3.20", "rc=%d err=%s status=%ld",
                     rc, err ? err : "(none)", resp.http_status);

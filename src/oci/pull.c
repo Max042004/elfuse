@@ -14,12 +14,15 @@
 #include "pull.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "blob-store.h"
 #include "digest.h"
@@ -117,20 +120,34 @@ static int verify_manifest_digest(const oci_fetch_response_t *resp,
  * non-NULL), and write it into the local blob store. Returns 0 on success and
  * fills *out_digest_str with the canonical "sha256:<hex>" representation. The
  * caller frees *out_response via oci_fetch_response_free.
+ *
+ * if_none_match is forwarded as the conditional GET header; when set and the
+ * registry responds 304 Not Modified the helper returns 0, writes nothing to
+ * the store, leaves *out_digest_str empty, and sets *out_unchanged (when
+ * non-NULL). The caller seeds the digest string from the pin before calling.
  */
 static int fetch_and_persist_manifest(oci_fetcher_t *f,
                                       oci_store_t *store,
                                       const oci_ref_t *ref,
                                       const char *selector,
                                       const char *expected_digest_str,
+                                      const char *if_none_match,
                                       oci_fetch_response_t *out_resp,
                                       char *out_digest_str, size_t out_cap,
+                                      bool *out_unchanged,
                                       const char **err_msg)
 {
+    if (out_unchanged)
+        *out_unchanged = false;
     memset(out_resp, 0, sizeof(*out_resp));
-    if (oci_fetch_manifest(f, ref, selector, PULL_ACCEPT, out_resp, err_msg) <
-        0) {
+    if (oci_fetch_manifest(f, ref, selector, PULL_ACCEPT, if_none_match,
+                           out_resp, err_msg) < 0) {
         return -1;
+    }
+    if (out_resp->http_status == 304) {
+        if (out_unchanged)
+            *out_unchanged = true;
+        return 0;
     }
     if (out_resp->body_len == 0 || !out_resp->body) {
         if (err_msg)
@@ -156,6 +173,87 @@ static int fetch_and_persist_manifest(oci_fetcher_t *f,
             *err_msg = "failed to persist manifest body to local store";
         return -1;
     }
+    return 0;
+}
+
+/* Load a manifest blob already present in the local store into a heap buffer.
+ * Used by the refresh path after the registry confirms an unchanged digest:
+ * the manifest body must still be parsed (to drive the layer-cache sweep)
+ * but no network round trip is needed because the bytes are already on disk.
+ * Returns 0 on success with *out_buf newly malloc'd (caller frees) and
+ * *out_len set; -1 on IO failure with errno preserved.
+ */
+static int load_manifest_blob(oci_blob_store_t *blobs,
+                              oci_digest_algo_t algo, const char *hex,
+                              char **out_buf, size_t *out_len,
+                              const char **err_msg)
+{
+    char path[1024];
+    int n = oci_blob_store_path(blobs, algo, hex, path, sizeof(path));
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        if (err_msg)
+            *err_msg = "manifest blob path overflow";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (err_msg)
+            *err_msg = "failed to open cached manifest blob";
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int e = errno;
+        close(fd);
+        if (err_msg)
+            *err_msg = "failed to stat cached manifest blob";
+        errno = e;
+        return -1;
+    }
+    if (st.st_size <= 0 || (uintmax_t) st.st_size > (uintmax_t) SIZE_MAX - 1) {
+        close(fd);
+        if (err_msg)
+            *err_msg = "cached manifest blob has an unreasonable size";
+        errno = EFBIG;
+        return -1;
+    }
+    size_t want = (size_t) st.st_size;
+    char *buf = malloc(want + 1);
+    if (!buf) {
+        close(fd);
+        if (err_msg)
+            *err_msg = "out of memory loading cached manifest";
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t got = 0;
+    while (got < want) {
+        ssize_t r = read(fd, buf + got, want - got);
+        if (r < 0) {
+            int e = errno;
+            free(buf);
+            close(fd);
+            if (err_msg)
+                *err_msg = "read failed on cached manifest blob";
+            errno = e;
+            return -1;
+        }
+        if (r == 0)
+            break;
+        got += (size_t) r;
+    }
+    close(fd);
+    if (got != want) {
+        free(buf);
+        if (err_msg)
+            *err_msg = "cached manifest blob truncated mid-read";
+        errno = EIO;
+        return -1;
+    }
+    buf[want] = '\0';
+    *out_buf = buf;
+    *out_len = want;
     return 0;
 }
 
@@ -200,36 +298,112 @@ int oci_pull(oci_fetcher_t *fetcher,
     oci_index_t idx_doc = {0};
     oci_manifest_t manifest = {0};
     bool have_sub = false;
+    bool top_unchanged = false;
     char top_digest_str[OCI_DIGEST_HEX_MAX + 16];
     char sub_digest_str[OCI_DIGEST_HEX_MAX + 16];
     top_digest_str[0] = '\0';
     sub_digest_str[0] = '\0';
+    char *cached_top_body = NULL;
+    size_t cached_top_body_len = 0;
+    char *pin_digest_for_refresh = NULL;
+    char if_none_match_buf[OCI_DIGEST_HEX_MAX + 32];
+    const char *if_none_match = NULL;
+
+    /* 0. Refresh prologue. Only fires when --refresh is set, the ref carries
+     * a tag (digest-only refs are content-addressed and cannot drift), the
+     * pin exists, and the pinned manifest blob is still on disk. Otherwise
+     * the call falls through to the normal pull path.
+     */
+    if (opts && opts->refresh && ref->tag) {
+        const char *pin_err = NULL;
+        if (oci_store_get_ref(store, ref, &pin_digest_for_refresh,
+                              &pin_err) == 0 && pin_digest_for_refresh) {
+            oci_digest_algo_t pin_algo;
+            char pin_hex[OCI_DIGEST_HEX_MAX + 1];
+            if (oci_digest_parse(pin_digest_for_refresh, &pin_algo, pin_hex) &&
+                oci_blob_store_has(oci_store_blobs(store), pin_algo, pin_hex)) {
+                snprintf(if_none_match_buf, sizeof(if_none_match_buf),
+                         "\"%s\"", pin_digest_for_refresh);
+                if_none_match = if_none_match_buf;
+                /* Seed top_digest_str so the 304 path can echo the pin into
+                 * progress and the layer-cache sweep without re-deriving it
+                 * from a body that the registry just omitted.
+                 */
+                snprintf(top_digest_str, sizeof(top_digest_str), "%s",
+                         pin_digest_for_refresh);
+            }
+        }
+    }
 
     /* 1. Top-level fetch. Selector defaults to ref->digest, falling through
      * to ref->tag, inside oci_fetch_manifest. When the user pulled by digest,
      * expected_digest_str is the locked target; pulls by tag accept whatever
-     * the server resolves the tag to.
+     * the server resolves the tag to. if_none_match is set only by the
+     * refresh prologue above; a 304 response keeps the pin and re-uses the
+     * cached manifest body from the local store.
      */
     if (fetch_and_persist_manifest(fetcher, store, ref, NULL, ref->digest,
-                                   &top_resp, top_digest_str,
-                                   sizeof(top_digest_str), err_msg) < 0) {
+                                   if_none_match, &top_resp, top_digest_str,
+                                   sizeof(top_digest_str), &top_unchanged,
+                                   err_msg) < 0) {
         goto out;
     }
+
+    const char *manifest_body = NULL;
+    size_t manifest_body_len = 0;
     oci_media_type_t top_mt = OCI_MT_UNKNOWN;
-    if (parse_top_level(&top_resp, &top_mt, err_msg) < 0)
-        goto out;
-
-    progress_line(progress, "manifest", top_digest_str,
-                  (int64_t) top_resp.body_len, "downloaded",
-                  oci_media_type_name(top_mt));
-
-    const char *manifest_body = top_resp.body;
-    size_t manifest_body_len = top_resp.body_len;
     const char *pin_digest_str = top_digest_str;
+
+    if (top_unchanged) {
+        /* Registry confirmed the pinned digest still matches. Load the
+         * persisted manifest blob and run the rest of the pipeline against
+         * it so the layer-cache sweep can re-fetch any blob the user has
+         * pruned since the last pull.
+         */
+        oci_digest_algo_t cached_algo;
+        char cached_hex[OCI_DIGEST_HEX_MAX + 1];
+        if (!oci_digest_parse(top_digest_str, &cached_algo, cached_hex)) {
+            if (err_msg)
+                *err_msg = "pinned manifest digest is malformed";
+            errno = EINVAL;
+            goto out;
+        }
+        if (load_manifest_blob(oci_store_blobs(store), cached_algo, cached_hex,
+                               &cached_top_body, &cached_top_body_len,
+                               err_msg) < 0) {
+            goto out;
+        }
+        /* The persisted manifest blob has no Content-Type header. Try the
+         * image-index media type first, fall back to image-manifest. The
+         * parse step below is the actual gate; this only steers the index
+         * drill decision.
+         */
+        oci_index_t probe = {0};
+        if (oci_index_parse(cached_top_body, cached_top_body_len, &probe,
+                            NULL) == 0) {
+            top_mt = OCI_MT_INDEX_OCI;
+            oci_index_free(&probe);
+        } else {
+            top_mt = OCI_MT_MANIFEST_OCI;
+        }
+        manifest_body = cached_top_body;
+        manifest_body_len = cached_top_body_len;
+        progress_line(progress, "manifest", top_digest_str,
+                      (int64_t) cached_top_body_len, "unchanged",
+                      oci_media_type_name(top_mt));
+    } else {
+        if (parse_top_level(&top_resp, &top_mt, err_msg) < 0)
+            goto out;
+        progress_line(progress, "manifest", top_digest_str,
+                      (int64_t) top_resp.body_len, "downloaded",
+                      oci_media_type_name(top_mt));
+        manifest_body = top_resp.body;
+        manifest_body_len = top_resp.body_len;
+    }
 
     /* 2. If top-level was an image index, pick linux/arm64 and refetch. */
     if (oci_media_type_is_index(top_mt)) {
-        if (oci_index_parse(top_resp.body, top_resp.body_len, &idx_doc,
+        if (oci_index_parse(manifest_body, manifest_body_len, &idx_doc,
                             err_msg) < 0) {
             goto out;
         }
@@ -250,10 +424,18 @@ int oci_pull(oci_fetcher_t *fetcher,
             fflush(progress);
         }
 
+        /* Sub-manifest fetch never carries If-None-Match: the index drill
+         * targets a specific digest, so a conditional GET there has no
+         * semantic anchor (the local blob, if cached, is already the answer
+         * by content-address). When the sub-manifest blob is already in the
+         * store oci_fetch_manifest would still re-GET; the linear shape
+         * leaves that as future work because manifests are small.
+         */
         if (fetch_and_persist_manifest(fetcher, store, ref,
                                        entry->desc.digest_str,
-                                       entry->desc.digest_str, &sub_resp,
-                                       sub_digest_str, sizeof(sub_digest_str),
+                                       entry->desc.digest_str, NULL,
+                                       &sub_resp, sub_digest_str,
+                                       sizeof(sub_digest_str), NULL,
                                        err_msg) < 0) {
             goto out;
         }
@@ -313,14 +495,19 @@ int oci_pull(oci_fetcher_t *fetcher,
     }
 
     /* 6. Pin tag -> top-level digest. Digest-only refs are self-pinning and
-     * skip this step (oci_store_put_ref refuses them).
+     * skip this step (oci_store_put_ref refuses them). On 304 the pin is
+     * already at the right digest, so the put_ref call is skipped to avoid
+     * an unnecessary tmp + rename round trip.
      */
     if (ref->tag) {
-        if (oci_store_put_ref(store, ref, pin_digest_str, err_msg) < 0)
-            goto out;
+        if (!top_unchanged) {
+            if (oci_store_put_ref(store, ref, pin_digest_str, err_msg) < 0)
+                goto out;
+        }
         if (progress) {
-            fprintf(progress, "  pin       %s:%s -> %s\n", ref->repository,
-                    ref->tag, pin_digest_str);
+            fprintf(progress, "  pin       %s:%s -> %s%s\n", ref->repository,
+                    ref->tag, pin_digest_str,
+                    top_unchanged ? " (unchanged)" : "");
             fflush(progress);
         }
     }
@@ -339,6 +526,8 @@ out:
         if (have_sub)
             oci_fetch_response_free(&sub_resp);
         oci_fetch_response_free(&top_resp);
+        free(cached_top_body);
+        free(pin_digest_for_refresh);
         if (rc != 0)
             errno = saved_errno;
     }
