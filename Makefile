@@ -77,6 +77,7 @@ SRCS := \
     oci/pull.c \
     oci/inspect.c \
     oci/dedup-metrics.c \
+    oci/status.c \
     oci/tar.c \
     oci/decompress.c \
     oci/layer-meta.c \
@@ -263,6 +264,16 @@ $(BUILD_DIR)/test-oci-dedup-metrics: $(BUILD_DIR)/test-oci-dedup-metrics.o $(BUI
 ## absent (dry-run). Same dependency set as test-oci-store plus oci/rebuild-
 ## cache.o.
 $(BUILD_DIR)/test-oci-rebuild-cache: $(BUILD_DIR)/test-oci-rebuild-cache.o $(BUILD_DIR)/oci/rebuild-cache.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the OCI store-wide status unit test (native macOS, no HVF). Drives
+## oci_status_compute against scratch stores hand-populated via
+## stage_image / oci_origin_write fixture helpers and asserts the aggregated
+## struct fields (pin entries, unpacked entries, reachable + populated
+## ratios, store totals). Same dependency set as test-oci-store plus
+## oci/status.o.
+$(BUILD_DIR)/test-oci-status: $(BUILD_DIR)/test-oci-status.o $(BUILD_DIR)/oci/status.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

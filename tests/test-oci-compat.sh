@@ -408,6 +408,55 @@ else
         "layer=${layer_hex} stack=${stack_hex} still present"
 fi
 
+# ── C4.1 store-wide status smoke ─────────────────────────────────────
+
+# Default human render exposes the three sections so an operator running
+# `elfuse oci status` after prune still gets a coherent snapshot of the
+# remaining store state.
+status_out=$("${ELFUSE}" oci status --store "${STORE}" 2>&1)
+rc=$?
+case "${status_out}" in
+    *"PINS ("*"STORE TOTALS:"*"blobs:"*)
+        if [ "${rc}" = 0 ]; then
+            ok "status-smoke: human render shows PINS and STORE TOTALS"
+        else
+            bad "status-smoke: human rc" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "status-smoke: human render" "${status_out}"
+        ;;
+esac
+
+# Structured output for jq-style consumers. Substring matches keep the
+# check portable across jq / no-jq installs; the schema is enforced via
+# the test-oci-status unit suite.
+json_out=$("${ELFUSE}" oci status --store "${STORE}" --json 2>&1)
+rc=$?
+case "${json_out}" in
+    *'"schemaVersion":1'*'"pins":'*'"totals":'*'"blob_count":'*)
+        if [ "${rc}" = 0 ]; then
+            ok "status-smoke: --json schemaVersion 1 with pins/totals"
+        else
+            bad "status-smoke: --json rc" "rc=${rc} (want 0)"
+        fi
+        ;;
+    *)
+        bad "status-smoke: --json render" "${json_out}"
+        ;;
+esac
+
+# --no-disk-usage zeroes the size fields but counters still populate.
+nodu_out=$("${ELFUSE}" oci status --store "${STORE}" --json --no-disk-usage 2>&1)
+case "${nodu_out}" in
+    *'"blob_bytes":0'*'"disk_usage_skipped":true'*)
+        ok "status-smoke: --no-disk-usage zeroes byte totals"
+        ;;
+    *)
+        bad "status-smoke: --no-disk-usage" "${nodu_out}"
+        ;;
+esac
+
 # ── Heavy mode (full E2E launches) ───────────────────────────────────
 
 if [ -n "${OCI_COMPAT_TEST:-}" ]; then

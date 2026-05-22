@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "clone-rootfs.h"
 #include "fetch.h"
@@ -27,6 +28,7 @@
 #include "rebuild-cache.h"
 #include "ref.h"
 #include "run.h"
+#include "status.h"
 #include "store.h"
 #include "unpack.h"
 #include "volume.h"
@@ -50,6 +52,8 @@ static int print_usage(FILE *out)
         "store\n"
         "  rebuild-cache            Back-fill stack cache from unpacked "
         "sysroots\n"
+        "  status                   Report pins, unpacked sysroots, and cache "
+        "totals\n"
         "  list                     List images in the local store\n"
         "\n"
         "Pull options:\n"
@@ -105,6 +109,14 @@ static int print_usage(FILE *out)
         "  --volume DIR          Override the sysroot APFS volume mount point\n"
         "  --commit              Actually write stack snapshots "
         "(default: dry-run)\n"
+        "\n"
+        "Status options:\n"
+        "  --store DIR           Override the local store root\n"
+        "  --volume DIR          Include unpacked sysroots under DIR/images/\n"
+        "                        in the report\n"
+        "  --json                Emit machine-readable JSON (schemaVersion 1)\n"
+        "  --no-disk-usage       Skip recursive size sums (faster on large "
+        "stores)\n"
         "\n"
         "Refs follow the docker/containerd grammar:\n"
         "  alpine, alpine:3.20, user/repo, ghcr.io/owner/img:tag,\n"
@@ -1085,6 +1097,338 @@ static int cmd_rebuild_cache(int argc, char **argv)
     return 0;
 }
 
+/* Argument parser state for `oci status`. The flag set is intentionally
+ * small: store / volume mirrors prune / rebuild-cache, --json toggles the
+ * structured output, --no-disk-usage is the operator escape hatch for very
+ * large stores where the recursive size walk dominates wall time.
+ */
+typedef struct {
+    const char *store_root;
+    const char *volume_root;
+    bool json;
+    bool no_disk_usage;
+} status_args_t;
+
+static int parse_status_args(int argc, char **argv, status_args_t *out)
+{
+    int i = 1;
+    while (i < argc) {
+        const char *a = argv[i];
+        if (a[0] != '-')
+            break;
+        if (!strcmp(a, "--")) {
+            i++;
+            break;
+        }
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            return 1;
+        } else if (!strcmp(a, "--json")) {
+            out->json = true;
+        } else if (!strcmp(a, "--no-disk-usage")) {
+            out->no_disk_usage = true;
+        } else if (!strcmp(a, "--store")) {
+            if (++i >= argc) {
+                fputs("error: --store needs an argument\n", stderr);
+                return -1;
+            }
+            out->store_root = argv[i];
+        } else if (!strcmp(a, "--volume")) {
+            if (++i >= argc) {
+                fputs("error: --volume needs an argument\n", stderr);
+                return -1;
+            }
+            out->volume_root = argv[i];
+        } else {
+            fprintf(stderr, "error: unknown status option: %s\n", a);
+            return -1;
+        }
+        i++;
+    }
+    if (i != argc) {
+        fputs("error: status takes no positional arguments\n", stderr);
+        return -1;
+    }
+    return 0;
+}
+
+/* Render a byte count compactly. Values >= 1 MiB use "~X.Y MiB", smaller
+ * non-zero values render as raw bytes, zero stays "0 B". Mirrors the inspect
+ * renderer's shared_bytes formatter so the two surfaces look consistent.
+ */
+static void format_bytes(uint64_t bytes, char *out, size_t cap)
+{
+    if (bytes == 0) {
+        snprintf(out, cap, "0 B");
+        return;
+    }
+    if (bytes >= (uint64_t) 1024 * 1024) {
+        double mib = (double) bytes / (1024.0 * 1024.0);
+        snprintf(out, cap, "~%.1f MiB", mib);
+        return;
+    }
+    snprintf(out, cap, "%llu B", (unsigned long long) bytes);
+}
+
+/* Render epoch seconds as a fixed-width "YYYY-MM-DD HH:MM" string in local
+ * time. Out buffer must hold at least 17 bytes. Negative or zero epochs
+ * render as "(unknown)".
+ */
+static void format_mtime(int64_t epoch, char *out, size_t cap)
+{
+    if (epoch <= 0) {
+        snprintf(out, cap, "(unknown)");
+        return;
+    }
+    time_t t = (time_t) epoch;
+    struct tm lt;
+    if (!localtime_r(&t, &lt)) {
+        snprintf(out, cap, "(unknown)");
+        return;
+    }
+    strftime(out, cap, "%Y-%m-%d %H:%M", &lt);
+}
+
+/* Truncate a digest to "<algo>:<13-hex>..." so wide manifest digests still
+ * align in the table. Mirrors the short_digest helper in inspect.c without
+ * the dependency on that translation unit.
+ */
+static void short_digest(const char *full, char out[24])
+{
+    if (!full) {
+        snprintf(out, 24, "(null)");
+        return;
+    }
+    size_t len = strlen(full);
+    if (len <= 22) {
+        snprintf(out, 24, "%s", full);
+        return;
+    }
+    snprintf(out, 24, "%.19s...", full);
+}
+
+static const char *pin_status_label(oci_status_pin_code_t c)
+{
+    switch (c) {
+    case OCI_STATUS_PIN_OK: return "ok";
+    case OCI_STATUS_PIN_MISSING_MANIFEST: return "missing manifest";
+    case OCI_STATUS_PIN_CORRUPT_MANIFEST: return "corrupt manifest";
+    case OCI_STATUS_PIN_CORRUPT_CONFIG: return "corrupt config";
+    case OCI_STATUS_PIN_INDEX_NO_ARM64: return "no linux/arm64 entry";
+    }
+    return "unknown";
+}
+
+static const char *unpacked_status_label(oci_status_unpacked_code_t c)
+{
+    switch (c) {
+    case OCI_STATUS_UNPACKED_OK: return "ok";
+    case OCI_STATUS_UNPACKED_MISSING_ORIGIN: return "missing origin";
+    case OCI_STATUS_UNPACKED_CORRUPT_ORIGIN: return "corrupt origin";
+    }
+    return "unknown";
+}
+
+/* Emit one JSON-quoted token with backslash and double-quote escaping.
+ * Mirrors the print_quoted_token static in inspect.c without dragging the
+ * dependency; control chars pass through (operator-facing strings, never
+ * raw binary).
+ */
+static void emit_json_quoted(FILE *out, const char *s)
+{
+    fputc('"', out);
+    if (s) {
+        for (const char *p = s; *p; p++) {
+            if (*p == '"' || *p == '\\')
+                fputc('\\', out);
+            fputc(*p, out);
+        }
+    }
+    fputc('"', out);
+}
+
+static void render_status_human(FILE *out, const oci_status_t *st)
+{
+    /* Pins section. */
+    if (st->pin_count == 0) {
+        fprintf(out, "PINS (0): (none)\n\n");
+    } else {
+        fprintf(out, "PINS (%zu):\n", st->pin_count);
+        for (size_t i = 0; i < st->pin_count; i++) {
+            const oci_status_pin_entry_t *p = &st->pins[i];
+            char short_d[24];
+            short_digest(p->digest, short_d);
+            if (p->status != OCI_STATUS_PIN_OK) {
+                fprintf(out, "  %-40s  %-22s  (%s)\n",
+                        p->name ? p->name : "(unknown)", short_d,
+                        pin_status_label(p->status));
+                continue;
+            }
+            char mtime_s[20];
+            format_mtime(p->last_seen_mtime, mtime_s, sizeof(mtime_s));
+            fprintf(out, "  %-40s  %-22s  %2zu layers   %s\n",
+                    p->name ? p->name : "(unknown)", short_d, p->layer_count,
+                    mtime_s);
+        }
+        fputc('\n', out);
+    }
+
+    /* Unpacked sysroots section. */
+    if (st->unpacked_count == 0) {
+        fprintf(out, "UNPACKED SYSROOTS (0): (none)\n\n");
+    } else {
+        fprintf(out, "UNPACKED SYSROOTS (%zu):\n", st->unpacked_count);
+        for (size_t i = 0; i < st->unpacked_count; i++) {
+            const oci_status_unpacked_entry_t *u = &st->unpacked[i];
+            if (u->status != OCI_STATUS_UNPACKED_OK) {
+                fprintf(out, "  %s  (%s)\n", u->path ? u->path : "(unknown)",
+                        unpacked_status_label(u->status));
+                continue;
+            }
+            char short_d[24];
+            short_digest(u->manifest_digest, short_d);
+            char bytes_s[24];
+            if (st->disk_usage_skipped)
+                snprintf(bytes_s, sizeof(bytes_s), "(skipped)");
+            else
+                format_bytes(u->tree_bytes, bytes_s, sizeof(bytes_s));
+            fprintf(out, "  %s  %-22s  %s\n", u->path ? u->path : "(unknown)",
+                    short_d, bytes_s);
+        }
+        fputc('\n', out);
+    }
+
+    /* Store totals section. */
+    char blob_b[24], layer_b[24], stack_b[24], total_b[24];
+    if (st->disk_usage_skipped) {
+        snprintf(blob_b, sizeof(blob_b), "(skipped)");
+        snprintf(layer_b, sizeof(layer_b), "(skipped)");
+        snprintf(stack_b, sizeof(stack_b), "(skipped)");
+        snprintf(total_b, sizeof(total_b), "(skipped)");
+    } else {
+        format_bytes(st->blob_bytes_total, blob_b, sizeof(blob_b));
+        format_bytes(st->layer_cache_bytes_total, layer_b, sizeof(layer_b));
+        format_bytes(st->stack_cache_bytes_total, stack_b, sizeof(stack_b));
+        uint64_t total = st->blob_bytes_total + st->layer_cache_bytes_total +
+                         st->stack_cache_bytes_total;
+        format_bytes(total, total_b, sizeof(total_b));
+    }
+    fprintf(out, "STORE TOTALS:\n");
+    fprintf(out, "  blobs:        %zu   (%s)\n", st->blob_count, blob_b);
+    fprintf(out, "  layers raw:   %zu of %zu reachable cached   (%s)\n",
+            st->diff_ids_populated, st->diff_ids_reachable, layer_b);
+    fprintf(out, "  layers stack: %zu of %zu reachable cached   (%s)\n",
+            st->chain_ids_populated, st->chain_ids_reachable, stack_b);
+    fprintf(out, "  total:        %s\n", total_b);
+    if (st->disk_usage_skipped)
+        fprintf(out, "  (disk usage skipped)\n");
+}
+
+static void render_status_json(FILE *out, const oci_status_t *st)
+{
+    fprintf(out, "{\"schemaVersion\":1,\"pins\":[");
+    for (size_t i = 0; i < st->pin_count; i++) {
+        const oci_status_pin_entry_t *p = &st->pins[i];
+        if (i > 0)
+            fputc(',', out);
+        fprintf(out, "{\"name\":");
+        emit_json_quoted(out, p->name);
+        fprintf(out, ",\"digest\":");
+        emit_json_quoted(out, p->digest);
+        fprintf(out,
+                ",\"manifest_size\":%llu,\"config_size\":%llu,\"layer_count\":"
+                "%zu,\"last_seen_mtime\":%lld,\"status\":\"%s\"}",
+                (unsigned long long) p->manifest_size,
+                (unsigned long long) p->config_size, p->layer_count,
+                (long long) p->last_seen_mtime, pin_status_label(p->status));
+    }
+    fprintf(out, "],\"unpacked\":[");
+    for (size_t i = 0; i < st->unpacked_count; i++) {
+        const oci_status_unpacked_entry_t *u = &st->unpacked[i];
+        if (i > 0)
+            fputc(',', out);
+        fprintf(out, "{\"path\":");
+        emit_json_quoted(out, u->path);
+        fprintf(out, ",\"manifest_digest\":");
+        emit_json_quoted(out, u->manifest_digest);
+        fprintf(out,
+                ",\"layer_count\":%zu,\"tree_bytes\":%llu,\"status\":\"%s\"}",
+                u->layer_count, (unsigned long long) u->tree_bytes,
+                unpacked_status_label(u->status));
+    }
+    fprintf(out, "],\"totals\":{");
+    fprintf(out, "\"blob_count\":%zu,\"blob_bytes\":%llu,", st->blob_count,
+            (unsigned long long) st->blob_bytes_total);
+    fprintf(out, "\"layer_cache_count\":%zu,\"layer_cache_bytes\":%llu,",
+            st->layer_cache_count,
+            (unsigned long long) st->layer_cache_bytes_total);
+    fprintf(out, "\"stack_cache_count\":%zu,\"stack_cache_bytes\":%llu,",
+            st->stack_cache_count,
+            (unsigned long long) st->stack_cache_bytes_total);
+    fprintf(out, "\"diff_ids_reachable\":%zu,\"diff_ids_populated\":%zu,",
+            st->diff_ids_reachable, st->diff_ids_populated);
+    fprintf(out, "\"chain_ids_reachable\":%zu,\"chain_ids_populated\":%zu,",
+            st->chain_ids_reachable, st->chain_ids_populated);
+    fprintf(out, "\"disk_usage_skipped\":%s",
+            st->disk_usage_skipped ? "true" : "false");
+    fprintf(out, "}}\n");
+}
+
+static int cmd_status(int argc, char **argv)
+{
+    status_args_t args = {0};
+    int prc = parse_status_args(argc, argv, &args);
+    if (prc == 1)
+        return print_usage(stdout);
+    if (prc < 0)
+        return 2;
+
+    char *default_root = NULL;
+    const char *store_root = args.store_root;
+    if (!store_root) {
+        default_root = oci_store_default_root();
+        if (!default_root) {
+            fprintf(stderr,
+                    "error: could not determine default store root "
+                    "(HOME not set?)\n");
+            return 1;
+        }
+        store_root = default_root;
+    }
+
+    oci_store_t *store = oci_store_open(store_root);
+    if (!store) {
+        fprintf(stderr, "error: could not open store at %s: %s\n", store_root,
+                strerror(errno));
+        free(default_root);
+        return 1;
+    }
+
+    oci_status_options_t sopts = {
+        .volume_root = args.volume_root,
+        .skip_disk_usage = args.no_disk_usage,
+    };
+    oci_status_t st = {0};
+    const char *err = NULL;
+    if (oci_status_compute(store, &sopts, &st, &err) < 0) {
+        fprintf(stderr, "error: status failed: %s\n",
+                err ? err : strerror(errno));
+        oci_status_free(&st);
+        oci_store_close(store);
+        free(default_root);
+        return 1;
+    }
+
+    if (args.json)
+        render_status_json(stdout, &st);
+    else
+        render_status_human(stdout, &st);
+
+    oci_status_free(&st);
+    oci_store_close(store);
+    free(default_root);
+    return 0;
+}
+
 int oci_cli_main(int argc, char **argv)
 {
     if (argc < 2)
@@ -1107,6 +1451,8 @@ int oci_cli_main(int argc, char **argv)
         return cmd_prune(argc - 1, argv + 1);
     if (!strcmp(sub, "rebuild-cache"))
         return cmd_rebuild_cache(argc - 1, argv + 1);
+    if (!strcmp(sub, "status"))
+        return cmd_status(argc - 1, argv + 1);
     if (!strcmp(sub, "list") || !strcmp(sub, "ls"))
         return cmd_not_implemented("list");
 
