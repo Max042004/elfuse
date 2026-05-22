@@ -15,9 +15,12 @@
 #     environment to gate the hdiutil-attach + run path.
 #
 # Online mode (OCI_FETCH_ONLINE=1):
-#   - Pulls docker.io/library/alpine:3 from the real registry, runs
-#     elfuse oci run alpine:3 /bin/true, asserts exit 0. Not in
-#     `make check`.
+#   - Pulls docker.io/library/alpine:3 (a multi-arch tag pinning to an
+#     OCI image index) from the real registry into a scratch store,
+#     runs `elfuse oci run alpine:3 /bin/busybox echo elfuse-online-ok`,
+#     asserts rc=0 and the verbatim stdout line. Regression anchor for
+#     the oci_run index-walk fix. Not in `make check` (requires
+#     network access).
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
@@ -492,11 +495,49 @@ else
 fi
 
 # ── Online mode (gated) ──────────────────────────────────────────────
+#
+# When OCI_FETCH_ONLINE=1 is set, pull docker.io/library/alpine:3 (a
+# multi-arch image whose tag pins to an OCI image index by design) and
+# run it. This is the regression anchor for the index-walk bug in
+# oci_run: before the fix the run-side parser fed the index blob into
+# oci_manifest_parse and died with "manifest config descriptor
+# missing"; after the fix oci_run drills into the linux/arm64 leaf
+# manifest transparently. Uses an isolated scratch store under
+# ${SCRATCH} so the test cannot collide with the user's default
+# ${HOME}/Library/Application Support/elfuse/store/ . The default
+# sparsebundle volume is reused (the unpacked image content is
+# content-addressed, so re-running the test is idempotent on disk).
 
 if [ -n "${OCI_FETCH_ONLINE:-}" ]; then
-    skip "alpine:3 online pull + run" \
-         "OCI_FETCH_ONLINE=1 set but online harness lands with the" \
-         "heavy compat matrix in a follow-up patch"
+    ONLINE_STORE="${SCRATCH}/online-store"
+    mkdir -p "${ONLINE_STORE}"
+
+    pull_log="${SCRATCH}/online-pull.log"
+    if "${ELFUSE}" oci pull --store "${ONLINE_STORE}" alpine:3 \
+            >"${pull_log}" 2>&1; then
+        ok "online: oci pull alpine:3 succeeded"
+    else
+        bad "online: oci pull alpine:3" "$(tail -n 5 "${pull_log}")"
+    fi
+
+    # Multi-arch tags pin to the image index digest. After the
+    # index-walk fix in src/oci/run.c, oci_run resolves the leaf
+    # manifest before unpack instead of failing at parse. The
+    # canonical proof: stdout from busybox echo matches verbatim.
+    run_log="${SCRATCH}/online-run.log"
+    "${ELFUSE}" oci run --store "${ONLINE_STORE}" alpine:3 \
+        /bin/busybox echo "elfuse-online-ok" \
+        >"${run_log}" 2>&1
+    run_rc=$?
+    if [ "${run_rc}" = 0 ] && grep -q "^elfuse-online-ok$" "${run_log}"; then
+        ok "online: oci run alpine:3 prints expected line"
+    elif grep -q "manifest config descriptor missing" "${run_log}"; then
+        bad "online: oci run alpine:3" \
+            "regressed to pre-fix index-walk error: $(tail -n 3 "${run_log}")"
+    else
+        bad "online: oci run alpine:3" \
+            "rc=${run_rc} log=$(tail -n 3 "${run_log}")"
+    fi
 else
     skip "alpine:3 online pull + run" \
          "OCI_FETCH_ONLINE=1 gates docker.io network access"
