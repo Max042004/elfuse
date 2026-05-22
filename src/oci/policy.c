@@ -720,3 +720,147 @@ void oci_policy_lookup(const oci_policy_t *p, const char *host,
         return;
     }
 }
+
+/* Static error literals. The auth-file load path has no policy_t err_buf to
+ * share, and the diagnostic is short enough that a fixed table beats a
+ * dynamic format. The caller composes the final user-facing message with
+ * the path it already knows.
+ */
+static const char AUTH_ERR_OPEN[]      = "auth file could not be opened";
+static const char AUTH_ERR_FSTAT[]     = "auth file could not be stat'd";
+static const char AUTH_ERR_NOT_REG[]   = "auth file is not a regular file";
+static const char AUTH_ERR_MODE[]      = "auth file has insecure mode (must be 0600)";
+static const char AUTH_ERR_TOO_BIG[]   = "auth file is too large";
+static const char AUTH_ERR_READ[]      = "auth file could not be read";
+static const char AUTH_ERR_NOMEM[]     = "out of memory parsing auth file";
+static const char AUTH_ERR_BAD_JSON[]  = "auth file is not valid JSON";
+static const char AUTH_ERR_NOT_OBJ[]   = "auth file body must be a JSON object";
+static const char AUTH_ERR_NO_USER[]   = "auth file missing required string field 'username'";
+static const char AUTH_ERR_NO_PASS[]   = "auth file missing required string field 'password'";
+
+int oci_policy_load_auth(const char *path, char **out_user, char **out_pass,
+                         const char **err_msg)
+{
+    if (!path || !out_user || !out_pass) {
+        if (err_msg)
+            *err_msg = "invalid arguments";
+        errno = EINVAL;
+        return -1;
+    }
+    *out_user = NULL;
+    *out_pass = NULL;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        int e = errno;
+        if (err_msg)
+            *err_msg = AUTH_ERR_OPEN;
+        errno = e;
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int e = errno;
+        close(fd);
+        if (err_msg)
+            *err_msg = AUTH_ERR_FSTAT;
+        errno = e;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        if (err_msg)
+            *err_msg = AUTH_ERR_NOT_REG;
+        errno = EINVAL;
+        return -1;
+    }
+    /* Mode must grant access to the owner only. 0600 is the canonical
+     * shape; 0400 (read-only) is also accepted. Any bit in the group or
+     * other triad fails the check.
+     */
+    if ((st.st_mode & 077) != 0) {
+        close(fd);
+        if (err_msg)
+            *err_msg = AUTH_ERR_MODE;
+        errno = EPERM;
+        return -1;
+    }
+    if (st.st_size < 0 || (uint64_t) st.st_size >= (uint64_t) SIZE_MAX) {
+        close(fd);
+        if (err_msg)
+            *err_msg = AUTH_ERR_TOO_BIG;
+        errno = EFBIG;
+        return -1;
+    }
+    size_t len = (size_t) st.st_size;
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        close(fd);
+        if (err_msg)
+            *err_msg = AUTH_ERR_NOMEM;
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = read(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            int e = errno;
+            free(buf);
+            close(fd);
+            if (err_msg)
+                *err_msg = AUTH_ERR_READ;
+            errno = e;
+            return -1;
+        }
+        if (n == 0)
+            break;
+        off += (size_t) n;
+    }
+    close(fd);
+    buf[off] = '\0';
+
+    cJSON *json = cJSON_ParseWithLength(buf, off);
+    free(buf);
+    if (!json) {
+        if (err_msg)
+            *err_msg = AUTH_ERR_BAD_JSON;
+        errno = EINVAL;
+        return -1;
+    }
+    if (!cJSON_IsObject(json)) {
+        cJSON_Delete(json);
+        if (err_msg)
+            *err_msg = AUTH_ERR_NOT_OBJ;
+        errno = EINVAL;
+        return -1;
+    }
+    cJSON *ju = cJSON_GetObjectItemCaseSensitive(json, "username");
+    if (!cJSON_IsString(ju) || !ju->valuestring) {
+        cJSON_Delete(json);
+        if (err_msg)
+            *err_msg = AUTH_ERR_NO_USER;
+        errno = EINVAL;
+        return -1;
+    }
+    cJSON *jp = cJSON_GetObjectItemCaseSensitive(json, "password");
+    if (!cJSON_IsString(jp) || !jp->valuestring) {
+        cJSON_Delete(json);
+        if (err_msg)
+            *err_msg = AUTH_ERR_NO_PASS;
+        errno = EINVAL;
+        return -1;
+    }
+    *out_user = xstrdup(ju->valuestring);
+    *out_pass = xstrdup(jp->valuestring);
+    cJSON_Delete(json);
+    if (!*out_user || !*out_pass) {
+        if (err_msg)
+            *err_msg = AUTH_ERR_NOMEM;
+        errno = ENOMEM;
+        return -1;
+    }
+    return 0;
+}

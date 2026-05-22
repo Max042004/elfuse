@@ -82,6 +82,16 @@ case "${pull_help}" in
         ;;
 esac
 
+# `oci pull --help` documents the policy.json file lookup added in C6.2.
+case "${pull_help}" in
+    *"Policy:"*)
+        ok "pull-smoke: --help mentions policy.json"
+        ;;
+    *)
+        bad "pull-smoke: --help lacks Policy section" "${pull_help}"
+        ;;
+esac
+
 # Missing IMAGE returns rc=2.
 "${ELFUSE}" oci run --keep >/dev/null 2>&1
 rc=$?

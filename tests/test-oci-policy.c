@@ -23,6 +23,10 @@
  *  11. invalid_shapes (4 sub-cases)
  *  12. ca_bundle_missing_is_hard_error
  *  13. ca_bundle_null_inherits_default
+ *  14. auth_file_happy_path        (oci_policy_load_auth C6.2)
+ *  15. auth_file_bad_mode          (oci_policy_load_auth C6.2)
+ *  16. auth_file_missing_username  (oci_policy_load_auth C6.2)
+ *  17. auth_file_malformed_json    (oci_policy_load_auth C6.2)
  */
 
 #include <errno.h>
@@ -710,6 +714,159 @@ done:
     fx_teardown(&fx);
 }
 
+/* ---------- C6.2 auth-file loader cases ---------- */
+
+/* Drop body at scratch/relpath with mode `mode`, returning the heap path. */
+static char *write_auth_file(const fx_t *fx, const char *relpath,
+                             const char *body, mode_t mode)
+{
+    char *path = path_join(fx->scratch, relpath);
+    if (!path)
+        return NULL;
+    if (write_file(path, body) < 0) {
+        free(path);
+        return NULL;
+    }
+    if (chmod(path, mode) < 0) {
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+static void case_auth_file_happy_path(void)
+{
+    const char *name = "auth_file_happy_path";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    char *user = NULL;
+    char *pass = NULL;
+    char *path = write_auth_file(&fx, "auth.json",
+                                 "{\"username\":\"alice\",\"password\":\"s3cret\"}",
+                                 0600);
+    if (!path) { report_fail(name, "write: %s", strerror(errno)); goto done; }
+    const char *err = NULL;
+    int rc = oci_policy_load_auth(path, &user, &pass, &err);
+    if (rc != 0) {
+        report_fail(name, "load rc=%d err=%s", rc, err ? err : "(none)");
+        goto done;
+    }
+    if (!user || strcmp(user, "alice") != 0) {
+        report_fail(name, "user wrong: %s", user ? user : "(null)");
+        goto done;
+    }
+    if (!pass || strcmp(pass, "s3cret") != 0) {
+        report_fail(name, "pass wrong: %s", pass ? pass : "(null)");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(user);
+    free(pass);
+    free(path);
+    fx_teardown(&fx);
+}
+
+static void case_auth_file_bad_mode(void)
+{
+    const char *name = "auth_file_bad_mode";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    char *user = NULL;
+    char *pass = NULL;
+    char *path = write_auth_file(&fx, "auth.json",
+                                 "{\"username\":\"alice\",\"password\":\"s3cret\"}",
+                                 0644);
+    if (!path) { report_fail(name, "write: %s", strerror(errno)); goto done; }
+    const char *err = NULL;
+    errno = 0;
+    int rc = oci_policy_load_auth(path, &user, &pass, &err);
+    if (rc == 0) {
+        report_fail(name, "expected failure");
+        goto done;
+    }
+    if (errno != EPERM) {
+        report_fail(name, "expected errno=EPERM, got %d", errno);
+        goto done;
+    }
+    if (!err || !strstr(err, "mode")) {
+        report_fail(name, "diagnostic wrong: %s", err ? err : "(none)");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(user);
+    free(pass);
+    free(path);
+    fx_teardown(&fx);
+}
+
+static void case_auth_file_missing_username(void)
+{
+    const char *name = "auth_file_missing_username";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    char *user = NULL;
+    char *pass = NULL;
+    char *path = write_auth_file(&fx, "auth.json",
+                                 "{\"password\":\"s3cret\"}", 0600);
+    if (!path) { report_fail(name, "write: %s", strerror(errno)); goto done; }
+    const char *err = NULL;
+    errno = 0;
+    int rc = oci_policy_load_auth(path, &user, &pass, &err);
+    if (rc == 0) {
+        report_fail(name, "expected failure");
+        goto done;
+    }
+    if (errno != EINVAL) {
+        report_fail(name, "expected errno=EINVAL, got %d", errno);
+        goto done;
+    }
+    if (!err || !strstr(err, "username")) {
+        report_fail(name, "diagnostic wrong: %s", err ? err : "(none)");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(user);
+    free(pass);
+    free(path);
+    fx_teardown(&fx);
+}
+
+static void case_auth_file_malformed_json(void)
+{
+    const char *name = "auth_file_malformed_json";
+    fx_t fx;
+    if (fx_setup(&fx) < 0) { report_fail(name, "fx_setup: %s", strerror(errno)); return; }
+    char *user = NULL;
+    char *pass = NULL;
+    char *path = write_auth_file(&fx, "auth.json",
+                                 "{this is not json", 0600);
+    if (!path) { report_fail(name, "write: %s", strerror(errno)); goto done; }
+    const char *err = NULL;
+    errno = 0;
+    int rc = oci_policy_load_auth(path, &user, &pass, &err);
+    if (rc == 0) {
+        report_fail(name, "expected failure");
+        goto done;
+    }
+    if (errno != EINVAL) {
+        report_fail(name, "expected errno=EINVAL, got %d", errno);
+        goto done;
+    }
+    if (!err || !strstr(err, "JSON")) {
+        report_fail(name, "diagnostic wrong: %s", err ? err : "(none)");
+        goto done;
+    }
+    report_pass(name);
+done:
+    free(user);
+    free(pass);
+    free(path);
+    fx_teardown(&fx);
+}
+
 int main(void)
 {
     printf("== test-oci-policy ==\n");
@@ -726,6 +883,10 @@ int main(void)
     case_invalid_shapes();
     case_ca_bundle_missing_is_hard_error();
     case_ca_bundle_null_inherits_default();
+    case_auth_file_happy_path();
+    case_auth_file_bad_mode();
+    case_auth_file_missing_username();
+    case_auth_file_malformed_json();
     printf("\n%d/%d passed\n", g_passed, g_total);
     return g_passed == g_total ? 0 : 1;
 }

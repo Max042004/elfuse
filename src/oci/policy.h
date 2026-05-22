@@ -109,3 +109,28 @@ void oci_policy_lookup(const oci_policy_t *p, const char *host,
  * returns "".
  */
 const char *oci_policy_source(const oci_policy_t *p);
+
+/* Read a podman/skopeo-style auth file from path. The body must be JSON of
+ * the shape:
+ *
+ *   { "username": "<user>", "password": "<pass>" }
+ *
+ * Both fields are required; either may not be NULL. A missing field, a
+ * malformed JSON body, a non-regular file, or a mode that grants group or
+ * other access is a hard error (the file must satisfy (st_mode & 077) == 0,
+ * matching the credential-handling discipline ssh and curl both use).
+ *
+ * On success returns 0 and writes heap-owned strings into *out_user and
+ * *out_pass which the caller frees. On failure returns -1 with errno set
+ * (ENOENT, EACCES, EPERM for mode, EINVAL for missing fields / malformed
+ * JSON) and *err_msg (when non-NULL) pointing at a static description
+ * suitable for direct caller-side use. *out_user and *out_pass may be
+ * partially populated on failure (one strdup succeeded, another failed); the
+ * caller must free both unconditionally, including on rc != 0. NULL path,
+ * NULL out_user, or NULL out_pass is EINVAL.
+ *
+ * The diagnostic does not include the path; the caller already knows it and
+ * is free to compose its own message ("auth file %s: %s", path, err).
+ */
+int oci_policy_load_auth(const char *path, char **out_user, char **out_pass,
+                         const char **err_msg);

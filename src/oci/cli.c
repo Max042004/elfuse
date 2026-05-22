@@ -24,6 +24,7 @@
 #include "clone-rootfs.h"
 #include "fetch.h"
 #include "inspect.h"
+#include "policy.h"
 #include "pull.h"
 #include "rebuild-cache.h"
 #include "ref.h"
@@ -68,6 +69,13 @@ static int print_usage(FILE *out)
         "                        on 304 reuse the cached manifest and only\n"
         "                        re-fetch missing layer blobs\n"
         "  -q, --quiet           Suppress per-blob progress output\n"
+        "\n"
+        "Policy: optional policy.json controls per-registry insecure /\n"
+        "        ca_bundle / auth_file. Read from $ELFUSE_POLICY_FILE >\n"
+        "        $XDG_CONFIG_HOME/elfuse/policy.json >\n"
+        "        $HOME/.config/elfuse/policy.json >\n"
+        "        $HOME/Library/Application Support/elfuse/policy.json.\n"
+        "        CLI flags override; --quiet silences override warnings.\n"
         "\n"
         "Inspect options:\n"
         "  --store DIR           Override the local store root\n"
@@ -399,16 +407,54 @@ static int cmd_pull(int argc, char **argv)
         return 1;
     }
 
+    oci_policy_t *policy = NULL;
+    const char *perr = NULL;
+    if (oci_policy_load(&policy, &perr) < 0) {
+        fprintf(stderr, "error: policy load failed: %s\n",
+                perr ? perr : strerror(errno));
+        oci_policy_free(policy);
+        oci_store_close(store);
+        oci_ref_free(&ref);
+        free(default_root);
+        free(args.user_pass_buf);
+        return 1;
+    }
+
+    /* Warn when a CLI flag overrides a policy-declared value for the same
+     * registry. The check is gated on having actually loaded a policy file
+     * (source != "") so the user sees nothing when no policy is configured.
+     * The warn surface is intentionally minimal: one line per overridden
+     * field, host-scoped, no JSON pointer plumbing. --quiet silences all.
+     */
+    if (!args.quiet && policy && oci_policy_source(policy)[0] != '\0') {
+        oci_policy_effective_t pol;
+        oci_policy_lookup(policy, ref.registry, &pol);
+        if (args.allow_insecure && !pol.insecure)
+            fprintf(stderr,
+                    "warning: --insecure overrides policy.insecure for %s\n",
+                    ref.registry);
+        if (args.user && pol.auth_file)
+            fprintf(stderr,
+                    "warning: -u overrides policy.auth_file for %s\n",
+                    ref.registry);
+        if (args.ca_file && pol.ca_bundle)
+            fprintf(stderr,
+                    "warning: --insecure-ca overrides policy.ca_bundle for %s\n",
+                    ref.registry);
+    }
+
     oci_fetcher_options_t fopts = {
         .username = args.user,
         .password = args.password,
         .ca_file = args.ca_file,
         .allow_insecure = args.allow_insecure,
+        .policy = policy,
     };
     oci_fetcher_t *fetcher = oci_fetcher_new(&fopts);
     if (!fetcher) {
         fprintf(stderr, "error: could not create fetcher: %s\n",
                 strerror(errno));
+        oci_policy_free(policy);
         oci_store_close(store);
         oci_ref_free(&ref);
         free(default_root);
@@ -437,6 +483,7 @@ static int cmd_pull(int argc, char **argv)
     }
 
     oci_fetcher_free(fetcher);
+    oci_policy_free(policy);
     oci_store_close(store);
     oci_ref_free(&ref);
     free(default_root);

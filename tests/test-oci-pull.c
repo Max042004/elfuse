@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <curl/curl.h>
@@ -34,6 +36,7 @@
 #include "oci/digest.h"
 #include "oci/fetch.h"
 #include "oci/manifest.h"
+#include "oci/policy.h"
 #include "oci/pull.h"
 #include "oci/ref.h"
 #include "oci/store.h"
@@ -1097,6 +1100,367 @@ cleanup:
     oci_store_close(store);
 }
 
+/* ── Policy fixture helpers (C6.2) ────────────────────────────────── */
+
+/* Per-policy-test snapshot of the env vars oci_policy_load consults so each
+ * case can scribble a fresh ELFUSE_POLICY_FILE / HOME / XDG without bleeding
+ * into the next case or the suite's outer environment.
+ */
+typedef struct {
+    char *saved_policy;
+    bool had_policy;
+    char *saved_home;
+    bool had_home;
+    char *saved_xdg;
+    bool had_xdg;
+    char *scratch;
+} policy_env_t;
+
+static char *dup_env_(const char *name, bool *had)
+{
+    const char *v = getenv(name);
+    *had = v != NULL;
+    return v ? strdup(v) : NULL;
+}
+
+static void restore_env_(const char *name, char *saved, bool had)
+{
+    if (had)
+        setenv(name, saved, 1);
+    else
+        unsetenv(name);
+    free(saved);
+}
+
+static int policy_env_setup(policy_env_t *pe)
+{
+    memset(pe, 0, sizeof(*pe));
+    pe->saved_policy = dup_env_("ELFUSE_POLICY_FILE", &pe->had_policy);
+    pe->saved_home = dup_env_("HOME", &pe->had_home);
+    pe->saved_xdg = dup_env_("XDG_CONFIG_HOME", &pe->had_xdg);
+    char tmpl[] = "/tmp/elfuse-test-oci-pull-policy-XXXXXX";
+    if (!mkdtemp(tmpl))
+        return -1;
+    pe->scratch = strdup(tmpl);
+    if (!pe->scratch)
+        return -1;
+    setenv("HOME", pe->scratch, 1);
+    unsetenv("XDG_CONFIG_HOME");
+    unsetenv("ELFUSE_POLICY_FILE");
+    return 0;
+}
+
+static void policy_env_teardown(policy_env_t *pe)
+{
+    restore_env_("ELFUSE_POLICY_FILE", pe->saved_policy, pe->had_policy);
+    restore_env_("HOME", pe->saved_home, pe->had_home);
+    restore_env_("XDG_CONFIG_HOME", pe->saved_xdg, pe->had_xdg);
+    if (pe->scratch) {
+        /* Wipe everything we wrote under the scratch dir. The pull tests do
+         * not stress the file count so a simple opendir loop suffices, but
+         * to stay symmetric with test-oci-policy reuse nftw via the helper
+         * exposed by the mock library (it already pulls in ftw.h).
+         */
+        oci_mock_wipe_dir(pe->scratch);
+        free(pe->scratch);
+    }
+    memset(pe, 0, sizeof(*pe));
+}
+
+static int write_policy_file(const policy_env_t *pe, const char *body,
+                             char *out_path, size_t cap)
+{
+    snprintf(out_path, cap, "%s/policy.json", pe->scratch);
+    FILE *fp = fopen(out_path, "w");
+    if (!fp)
+        return -1;
+    if (fputs(body, fp) == EOF) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int write_auth_file_mode(const policy_env_t *pe, const char *body,
+                                mode_t mode, char *out_path, size_t cap)
+{
+    snprintf(out_path, cap, "%s/auth.json", pe->scratch);
+    FILE *fp = fopen(out_path, "w");
+    if (!fp)
+        return -1;
+    if (fputs(body, fp) == EOF) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    if (chmod(out_path, mode) < 0)
+        return -1;
+    return 0;
+}
+
+/* Compose a ref string targeted at the mock server's host:port, then parse it
+ * into *ref. Returns 0 on success or -1 with errno set.
+ */
+static int parse_loopback_ref(const fixture_t *fx, oci_ref_t *ref)
+{
+    char ref_str[128];
+    snprintf(ref_str, sizeof(ref_str),
+             "127.0.0.1:%d/library/alpine:3.20", fx->server->port);
+    const char *err = NULL;
+    return oci_ref_parse(ref_str, ref, &err);
+}
+
+/* Build a routes table that serves the synthetic image under the
+ * /v2/library/alpine/... prefix. The first route's docker-content-digest is
+ * the sub-manifest digest because pulls via the index land there.
+ */
+static void populate_routes_for_loopback(router_ctx_t *ctx, const image_t *img)
+{
+    char dc[80];
+    snprintf(dc, sizeof(dc), "sha256:%s", img->index_hex);
+    populate_routes_index(ctx, img, dc);
+}
+
+/* ── Tests (C6.2: policy.json) ────────────────────────────────────── */
+
+static void test_pull_policy_insecure_loopback(fixture_t *fx)
+{
+    const char *name = "pull: policy insecure=true for loopback host";
+    image_t *img = fx->img;
+    router_ctx_t ctx = {0};
+    populate_routes_for_loopback(&ctx, img);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    policy_env_t pe;
+    if (policy_env_setup(&pe) < 0) {
+        report_fail(name, "policy_env_setup: %s", strerror(errno));
+        return;
+    }
+    char policy_path[256];
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"registries\":{\"127.0.0.1:%d\":{\"insecure\":true}}}",
+             fx->server->port);
+    if (write_policy_file(&pe, body, policy_path, sizeof(policy_path)) < 0) {
+        report_fail(name, "write policy: %s", strerror(errno));
+        goto teardown_env;
+    }
+    setenv("ELFUSE_POLICY_FILE", policy_path, 1);
+
+    oci_policy_t *policy = NULL;
+    const char *perr = NULL;
+    if (oci_policy_load(&policy, &perr) < 0) {
+        report_fail(name, "policy load: %s", perr ? perr : "(none)");
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-policy-insecure", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    if (!store) {
+        report_fail(name, "store open: %s", strerror(errno));
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+
+    /* Deliberately omit ca_file and allow_insecure. The policy supplies the
+     * insecure bit so the pull must succeed against the self-signed mock
+     * without the test passing a CA bundle or a CLI flag.
+     */
+    oci_fetcher_options_t fopts = {
+        .policy = policy,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    if (!f) {
+        report_fail(name, "fetcher_new: %s", strerror(errno));
+        oci_store_close(store);
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+
+    oci_ref_t ref = {0};
+    if (parse_loopback_ref(fx, &ref) < 0) {
+        report_fail(name, "ref parse");
+        oci_fetcher_free(f);
+        oci_store_close(store);
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+
+    oci_pull_options_t popts = {.quiet = true};
+    const char *err = NULL;
+    int rc = oci_pull(f, store, &ref, &popts, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup;
+    }
+    if (!all_blobs_present(store, img)) {
+        report_fail(name, "store missing blobs after pull");
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+    oci_policy_free(policy);
+teardown_env:
+    policy_env_teardown(&pe);
+}
+
+static void test_pull_policy_auth_file_bad_mode(fixture_t *fx)
+{
+    const char *name = "pull: policy auth_file with insecure mode rejected";
+    image_t *img = fx->img;
+    router_ctx_t ctx = {0};
+    populate_routes_for_loopback(&ctx, img);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    policy_env_t pe;
+    if (policy_env_setup(&pe) < 0) {
+        report_fail(name, "policy_env_setup: %s", strerror(errno));
+        return;
+    }
+    char auth_path[256];
+    if (write_auth_file_mode(&pe, "{\"username\":\"u\",\"password\":\"p\"}",
+                             0644, auth_path, sizeof(auth_path)) < 0) {
+        report_fail(name, "write auth: %s", strerror(errno));
+        goto teardown_env;
+    }
+    char policy_path[256];
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"registries\":{\"127.0.0.1:%d\":"
+             "{\"insecure\":true,\"auth_file\":\"%s\"}}}",
+             fx->server->port, auth_path);
+    if (write_policy_file(&pe, body, policy_path, sizeof(policy_path)) < 0) {
+        report_fail(name, "write policy: %s", strerror(errno));
+        goto teardown_env;
+    }
+    setenv("ELFUSE_POLICY_FILE", policy_path, 1);
+
+    oci_policy_t *policy = NULL;
+    const char *perr = NULL;
+    if (oci_policy_load(&policy, &perr) < 0) {
+        report_fail(name, "policy load: %s", perr ? perr : "(none)");
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-policy-authmode", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    oci_fetcher_options_t fopts = {
+        .policy = policy,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    oci_ref_t ref = {0};
+    if (parse_loopback_ref(fx, &ref) < 0) {
+        report_fail(name, "ref parse");
+        oci_fetcher_free(f);
+        oci_store_close(store);
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+    oci_pull_options_t popts = {.quiet = true};
+    const char *err = NULL;
+    errno = 0;
+    int rc = oci_pull(f, store, &ref, &popts, &err);
+    if (rc == 0) {
+        report_fail(name, "expected failure, got success");
+        goto cleanup;
+    }
+    if (!err || !strstr(err, "mode")) {
+        report_fail(name, "expected mode diagnostic, got: %s",
+                    err ? err : "(none)");
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+    oci_policy_free(policy);
+teardown_env:
+    policy_env_teardown(&pe);
+}
+
+static void test_pull_cli_overrides_policy_insecure(fixture_t *fx)
+{
+    const char *name = "pull: CLI --insecure overrides policy insecure=false";
+    image_t *img = fx->img;
+    router_ctx_t ctx = {0};
+    populate_routes_for_loopback(&ctx, img);
+    oci_mock_set_handler(fx->server, router_handler, &ctx);
+
+    policy_env_t pe;
+    if (policy_env_setup(&pe) < 0) {
+        report_fail(name, "policy_env_setup: %s", strerror(errno));
+        return;
+    }
+    char policy_path[256];
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"registries\":{\"127.0.0.1:%d\":{\"insecure\":false}}}",
+             fx->server->port);
+    if (write_policy_file(&pe, body, policy_path, sizeof(policy_path)) < 0) {
+        report_fail(name, "write policy: %s", strerror(errno));
+        goto teardown_env;
+    }
+    setenv("ELFUSE_POLICY_FILE", policy_path, 1);
+
+    oci_policy_t *policy = NULL;
+    const char *perr = NULL;
+    if (oci_policy_load(&policy, &perr) < 0) {
+        report_fail(name, "policy load: %s", perr ? perr : "(none)");
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/store-policy-cli-wins", fx->store_root);
+    oci_store_t *store = oci_store_open(root);
+    /* CLI --insecure=true: should win over policy insecure=false. No ca_file
+     * needed because the effective insecure=true turns TLS verify off. */
+    oci_fetcher_options_t fopts = {
+        .policy = policy,
+        .allow_insecure = true,
+    };
+    oci_fetcher_t *f = oci_fetcher_new(&fopts);
+    oci_ref_t ref = {0};
+    if (parse_loopback_ref(fx, &ref) < 0) {
+        report_fail(name, "ref parse");
+        oci_fetcher_free(f);
+        oci_store_close(store);
+        oci_policy_free(policy);
+        goto teardown_env;
+    }
+    oci_pull_options_t popts = {.quiet = true};
+    const char *err = NULL;
+    int rc = oci_pull(f, store, &ref, &popts, &err);
+    if (rc != 0) {
+        report_fail(name, "rc=%d err=%s", rc, err ? err : "(none)");
+        goto cleanup;
+    }
+    if (!all_blobs_present(store, img)) {
+        report_fail(name, "store missing blobs after pull");
+        goto cleanup;
+    }
+    report_pass(name);
+
+cleanup:
+    oci_ref_free(&ref);
+    oci_fetcher_free(f);
+    oci_store_close(store);
+    oci_policy_free(policy);
+teardown_env:
+    policy_env_teardown(&pe);
+}
+
 /* ── main ────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1154,6 +1518,9 @@ int main(void)
     test_pull_refresh_changed(&fx);
     test_pull_refresh_no_pin_falls_through(&fx);
     test_pull_refresh_digest_only_noop(&fx);
+    test_pull_policy_insecure_loopback(&fx);
+    test_pull_policy_auth_file_bad_mode(&fx);
+    test_pull_cli_overrides_policy_insecure(&fx);
 
     free_image(&img);
     free(base_url);

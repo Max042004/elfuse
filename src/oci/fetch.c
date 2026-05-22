@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "../../externals/cjson/cJSON.h"
+#include "policy.h"
 
 /* Hard ceiling on a single manifest / index / config response. Real-world
  * documents are well under 1 MiB; the limit is here so a misbehaving registry
@@ -51,11 +52,11 @@ struct oci_fetcher {
     char *base_url_override;
     char *bearer_token;
     bearer_challenge_t challenge;
-    /* Pre-built "user:pass" string for CURLOPT_USERPWD. NULL when basic auth
-     * is disabled. The fetcher attaches it to every easy-handle reset (manifest
-     * GET, blob GET, token GET) so a registry that bridges basic and bearer
-     * sees the basic credentials on both the manifest probe and the token
-     * exchange.
+    /* Pre-built "user:pass" string for CURLOPT_USERPWD. NULL when CLI basic
+     * auth is disabled. The fetcher attaches it to every easy-handle reset
+     * (manifest GET, blob GET, token GET) so a registry that bridges basic
+     * and bearer sees the basic credentials on both the manifest probe and
+     * the token exchange.
      */
     char *user_pass;
     /* PEM bundle path passed through to CURLOPT_CAINFO. NULL leaves libcurl on
@@ -63,7 +64,105 @@ struct oci_fetcher {
      */
     char *ca_file;
     bool allow_insecure;
+    /* Caller-owned policy. NULL when the caller has not loaded a policy.json.
+     * Consulted by resolve_effective on every manifest/blob entry; the
+     * fetcher does not take a copy and does not free it.
+     */
+    const oci_policy_t *policy;
 };
+
+/* Per-request merge of CLI-supplied options and the policy lookup for the
+ * current ref->registry. resolve_effective produces one of these and the
+ * request paths read it instead of f->{user_pass,ca_file,allow_insecure}.
+ * Strings are borrowed (point into f->* or into the policy_t entry) except
+ * user_pass_loaded, which holds a heap "user:pass" built from a policy
+ * auth_file. effective_free releases that one allocation.
+ */
+typedef struct {
+    const char *user_pass;
+    const char *ca_file;
+    bool allow_insecure;
+    char *user_pass_loaded;
+} effective_opts_t;
+
+static void effective_free(effective_opts_t *eff)
+{
+    if (!eff)
+        return;
+    free(eff->user_pass_loaded);
+    eff->user_pass_loaded = NULL;
+    eff->user_pass = NULL;
+    eff->ca_file = NULL;
+    eff->allow_insecure = false;
+}
+
+/* Build the per-request effective options from the fetcher's CLI defaults and
+ * any policy entry matching ref->registry. CLI flags win: a CLI-supplied
+ * user_pass / ca_file / allow_insecure shadows the policy value for the same
+ * field. A policy auth_file is loaded via oci_policy_load_auth, which
+ * enforces 0600 mode and the {username,password} JSON shape. Returns 0 on
+ * success, -1 with errno + *err_msg on auth_file load failure. The caller
+ * always invokes effective_free, including on rc != 0.
+ */
+static int resolve_effective(const oci_fetcher_t *f, const oci_ref_t *ref,
+                             effective_opts_t *eff, const char **err_msg)
+{
+    memset(eff, 0, sizeof(*eff));
+    eff->user_pass = f->user_pass;
+    eff->ca_file = f->ca_file;
+    eff->allow_insecure = f->allow_insecure;
+
+    if (!f->policy || !ref || !ref->registry)
+        return 0;
+
+    oci_policy_effective_t pol;
+    oci_policy_lookup(f->policy, ref->registry, &pol);
+
+    if (!eff->allow_insecure && pol.insecure)
+        eff->allow_insecure = true;
+    if (!eff->ca_file && pol.ca_bundle)
+        eff->ca_file = pol.ca_bundle;
+
+    /* Only consult policy auth_file when the caller did not supply CLI
+     * credentials. The load happens per-request; auth files are small and
+     * mode-checked each time, which avoids any cache-vs-disk consistency
+     * worry at the cost of re-parsing a sub-kilobyte JSON document.
+     */
+    if (!eff->user_pass && pol.auth_file) {
+        char *user = NULL;
+        char *pass = NULL;
+        const char *aerr = NULL;
+        if (oci_policy_load_auth(pol.auth_file, &user, &pass, &aerr) < 0) {
+            int e = errno;
+            free(user);
+            free(pass);
+            if (err_msg)
+                *err_msg = aerr ? aerr : "policy auth file load failed";
+            errno = e ? e : EINVAL;
+            return -1;
+        }
+        size_t ul = strlen(user);
+        size_t pl = strlen(pass);
+        char *up = malloc(ul + 1 + pl + 1);
+        if (!up) {
+            free(user);
+            free(pass);
+            if (err_msg)
+                *err_msg = "out of memory composing policy credentials";
+            errno = ENOMEM;
+            return -1;
+        }
+        memcpy(up, user, ul);
+        up[ul] = ':';
+        memcpy(up + ul + 1, pass, pl);
+        up[ul + 1 + pl] = '\0';
+        free(user);
+        free(pass);
+        eff->user_pass_loaded = up;
+        eff->user_pass = up;
+    }
+    return 0;
+}
 
 static pthread_once_t g_curl_init_once = PTHREAD_ONCE_INIT;
 static int g_curl_init_rc = -1;
@@ -164,6 +263,8 @@ oci_fetcher_t *oci_fetcher_new(const oci_fetcher_options_t *opts)
     }
     if (opts)
         f->allow_insecure = opts->allow_insecure;
+    if (opts)
+        f->policy = opts->policy;
     return f;
 }
 
@@ -247,12 +348,14 @@ static bool is_loopback_host(const char *host)
  * whitelist. Honors ref->registry as the authoritative target even when a
  * test passes base_url_override, so that policy reflects the production
  * surface ("which host am I pulling from?") rather than where the bytes
- * happen to flow during a unit test.
+ * happen to flow during a unit test. The decision is made on the effective
+ * opts (CLI || policy), so a policy insecure=true on a non-loopback host
+ * fails the same way a CLI --insecure on a non-loopback host fails.
  */
-static int check_insecure_policy(const oci_fetcher_t *f, const oci_ref_t *ref,
-                                 const char **err_msg)
+static int check_insecure_policy(const effective_opts_t *eff,
+                                 const oci_ref_t *ref, const char **err_msg)
 {
-    if (!f->allow_insecure)
+    if (!eff->allow_insecure)
         return 0;
     char host[256];
     if (!extract_host_from_registry(ref->registry, host, sizeof(host))) {
@@ -270,19 +373,19 @@ static int check_insecure_policy(const oci_fetcher_t *f, const oci_ref_t *ref,
     return 0;
 }
 
-/* Apply the per-fetcher security options to the easy handle in its post-reset
- * state. Called from every GET path (manifest, blob, token) after
+/* Apply the per-request effective security options to the easy handle in its
+ * post-reset state. Called from every GET path (manifest, blob, token) after
  * curl_easy_reset so the option set survives the reset.
  */
-static void apply_security_opts(CURL *easy, const oci_fetcher_t *f)
+static void apply_security_opts(CURL *easy, const effective_opts_t *eff)
 {
-    if (f->user_pass) {
-        curl_easy_setopt(easy, CURLOPT_USERPWD, f->user_pass);
+    if (eff->user_pass) {
+        curl_easy_setopt(easy, CURLOPT_USERPWD, eff->user_pass);
         curl_easy_setopt(easy, CURLOPT_HTTPAUTH, (long) CURLAUTH_BASIC);
     }
-    if (f->ca_file)
-        curl_easy_setopt(easy, CURLOPT_CAINFO, f->ca_file);
-    if (f->allow_insecure) {
+    if (eff->ca_file)
+        curl_easy_setopt(easy, CURLOPT_CAINFO, eff->ca_file);
+    if (eff->allow_insecure) {
         curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
     }
@@ -592,7 +695,8 @@ static struct curl_slist *build_request_headers(const oci_fetcher_t *f,
     return hdrs;
 }
 
-static int fetch_token(oci_fetcher_t *f, const char **err_msg)
+static int fetch_token(oci_fetcher_t *f, const effective_opts_t *eff,
+                       const char **err_msg)
 {
     if (!f->challenge.realm) {
         if (err_msg)
@@ -635,7 +739,7 @@ static int fetch_token(oci_fetcher_t *f, const char **err_msg)
     body_buf_t body = {.max = FETCH_BODY_MAX};
     headers_ctx_t hctx = {0};
     curl_easy_reset(f->easy);
-    apply_security_opts(f->easy, f);
+    apply_security_opts(f->easy, eff);
     curl_easy_setopt(f->easy, CURLOPT_URL, url);
     curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
@@ -705,6 +809,7 @@ static int fetch_token(oci_fetcher_t *f, const char **err_msg)
 }
 
 static int perform_manifest_get(oci_fetcher_t *f,
+                                const effective_opts_t *eff,
                                 const char *url,
                                 const char *const *accept_types,
                                 const char *if_none_match,
@@ -718,7 +823,7 @@ static int perform_manifest_get(oci_fetcher_t *f,
         bearer_challenge_free(challenge_out);
 
     curl_easy_reset(f->easy);
-    apply_security_opts(f->easy, f);
+    apply_security_opts(f->easy, eff);
     curl_easy_setopt(f->easy, CURLOPT_URL, url);
     curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
@@ -782,8 +887,13 @@ int oci_fetch_manifest(oci_fetcher_t *f,
         return -1;
     }
     memset(out, 0, sizeof(*out));
-    if (check_insecure_policy(f, ref, err_msg) < 0)
+    effective_opts_t eff;
+    if (resolve_effective(f, ref, &eff, err_msg) < 0)
         return -1;
+    if (check_insecure_policy(&eff, ref, err_msg) < 0) {
+        effective_free(&eff);
+        return -1;
+    }
     const char *selector = digest_or_tag;
     if (!selector)
         selector = ref->digest;
@@ -793,6 +903,7 @@ int oci_fetch_manifest(oci_fetcher_t *f,
         if (err_msg)
             *err_msg = "reference has no tag or digest";
         errno = EINVAL;
+        effective_free(&eff);
         return -1;
     }
     char *url = build_manifest_url(f, ref, selector);
@@ -800,16 +911,19 @@ int oci_fetch_manifest(oci_fetcher_t *f,
         if (err_msg)
             *err_msg = "out of memory";
         errno = ENOMEM;
+        effective_free(&eff);
         return -1;
     }
 
     bearer_challenge_t challenge = {0};
-    int rc = perform_manifest_get(f, url, accept_types, if_none_match, out,
+    int rc = perform_manifest_get(f, &eff, url, accept_types, if_none_match,
+                                  out,
                                   f->bearer_token ? NULL : &challenge,
                                   err_msg);
     if (rc < 0) {
         free(url);
         bearer_challenge_free(&challenge);
+        effective_free(&eff);
         return -1;
     }
 
@@ -819,14 +933,16 @@ int oci_fetch_manifest(oci_fetcher_t *f,
         memset(&challenge, 0, sizeof(challenge));
         oci_fetch_response_free(out);
         memset(out, 0, sizeof(*out));
-        if (fetch_token(f, err_msg) < 0) {
+        if (fetch_token(f, &eff, err_msg) < 0) {
             free(url);
+            effective_free(&eff);
             return -1;
         }
-        rc = perform_manifest_get(f, url, accept_types, if_none_match, out,
-                                  NULL, err_msg);
+        rc = perform_manifest_get(f, &eff, url, accept_types, if_none_match,
+                                  out, NULL, err_msg);
         if (rc < 0) {
             free(url);
+            effective_free(&eff);
             return -1;
         }
     } else {
@@ -834,6 +950,7 @@ int oci_fetch_manifest(oci_fetcher_t *f,
     }
 
     free(url);
+    effective_free(&eff);
 
     /* 304 Not Modified is a success path for conditional revalidation: the
      * caller asked the registry whether the pinned digest still matches and
@@ -879,6 +996,7 @@ static size_t blob_stream_cb(char *ptr, size_t size, size_t nmemb, void *userdat
 }
 
 static int perform_blob_get(oci_fetcher_t *f,
+                            const effective_opts_t *eff,
                             const char *url,
                             blob_stream_ctx_t *bctx,
                             long *out_status,
@@ -890,7 +1008,7 @@ static int perform_blob_get(oci_fetcher_t *f,
         bearer_challenge_free(challenge_out);
 
     curl_easy_reset(f->easy);
-    apply_security_opts(f->easy, f);
+    apply_security_opts(f->easy, eff);
     curl_easy_setopt(f->easy, CURLOPT_URL, url);
     curl_easy_setopt(f->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(f->easy, CURLOPT_MAXREDIRS, 5L);
@@ -945,22 +1063,31 @@ int oci_fetch_blob(oci_fetcher_t *f,
         errno = EINVAL;
         return -1;
     }
-    if (check_insecure_policy(f, ref, err_msg) < 0)
+    effective_opts_t eff;
+    if (resolve_effective(f, ref, &eff, err_msg) < 0)
         return -1;
+    if (check_insecure_policy(&eff, ref, err_msg) < 0) {
+        effective_free(&eff);
+        return -1;
+    }
     if (desc->size < 0) {
         if (err_msg)
             *err_msg = "descriptor size is negative";
         errno = EINVAL;
+        effective_free(&eff);
         return -1;
     }
-    if (oci_blob_store_has(store, desc->algo, desc->hex))
+    if (oci_blob_store_has(store, desc->algo, desc->hex)) {
+        effective_free(&eff);
         return 0;
+    }
 
     char *url = build_blob_url(f, ref, desc->digest_str);
     if (!url) {
         if (err_msg)
             *err_msg = "out of memory";
         errno = ENOMEM;
+        effective_free(&eff);
         return -1;
     }
 
@@ -969,18 +1096,20 @@ int oci_fetch_blob(oci_fetcher_t *f,
         free(url);
         if (err_msg)
             *err_msg = "failed to start blob writer";
+        effective_free(&eff);
         return -1;
     }
     blob_stream_ctx_t bctx = {.w = w, .bytes_expected = desc->size};
 
     bearer_challenge_t challenge = {0};
     long status = 0;
-    int rc = perform_blob_get(f, url, &bctx, &status,
+    int rc = perform_blob_get(f, &eff, url, &bctx, &status,
                               f->bearer_token ? NULL : &challenge, err_msg);
     if (rc < 0) {
         free(url);
         oci_blob_writer_abort(w);
         bearer_challenge_free(&challenge);
+        effective_free(&eff);
         return -1;
     }
 
@@ -989,8 +1118,9 @@ int oci_fetch_blob(oci_fetcher_t *f,
         bearer_challenge_free(&f->challenge);
         f->challenge = challenge;
         memset(&challenge, 0, sizeof(challenge));
-        if (fetch_token(f, err_msg) < 0) {
+        if (fetch_token(f, &eff, err_msg) < 0) {
             free(url);
+            effective_free(&eff);
             return -1;
         }
         w = oci_blob_writer_begin(store, desc->algo, desc->hex);
@@ -998,13 +1128,15 @@ int oci_fetch_blob(oci_fetcher_t *f,
             free(url);
             if (err_msg)
                 *err_msg = "failed to restart blob writer";
+            effective_free(&eff);
             return -1;
         }
         bctx = (blob_stream_ctx_t){.w = w, .bytes_expected = desc->size};
-        rc = perform_blob_get(f, url, &bctx, &status, NULL, err_msg);
+        rc = perform_blob_get(f, &eff, url, &bctx, &status, NULL, err_msg);
         if (rc < 0) {
             free(url);
             oci_blob_writer_abort(w);
+            effective_free(&eff);
             return -1;
         }
     } else {
@@ -1012,6 +1144,7 @@ int oci_fetch_blob(oci_fetcher_t *f,
     }
 
     free(url);
+    effective_free(&eff);
 
     if (status < 200 || status >= 300) {
         oci_blob_writer_abort(w);

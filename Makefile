@@ -225,7 +225,7 @@ $(BUILD_DIR)/lib/oci-mock.o: CFLAGS += $(OPENSSL_CFLAGS)
 ## test mock terminates TLS using libssl from brew openssl@3 so the ca_file
 ## negative cases exercise a real certificate verification path.
 $(BUILD_DIR)/test-oci-fetch.o: CFLAGS += $(OPENSSL_CFLAGS)
-$(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-fetch: $(BUILD_DIR)/test-oci-fetch.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/policy.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
 
@@ -239,7 +239,7 @@ $(BUILD_DIR)/test-oci-store: $(BUILD_DIR)/test-oci-store.o $(BUILD_DIR)/oci/stor
 ## Build the OCI pull pipeline unit test (native macOS, no HVF). Shares the
 ## TLS-terminating mock server with test-oci-fetch via tests/lib/oci-mock.
 $(BUILD_DIR)/test-oci-pull.o: CFLAGS += $(OPENSSL_CFLAGS)
-$(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
+$(BUILD_DIR)/test-oci-pull: $(BUILD_DIR)/test-oci-pull.o $(BUILD_DIR)/lib/oci-mock.o $(BUILD_DIR)/oci/pull.o $(BUILD_DIR)/oci/store.o $(BUILD_DIR)/oci/fetch.o $(BUILD_DIR)/oci/policy.o $(BUILD_DIR)/oci/blob-store.o $(BUILD_DIR)/oci/digest.o $(BUILD_DIR)/oci/digest-set.o $(BUILD_DIR)/oci/manifest.o $(BUILD_DIR)/oci/media-type.o $(BUILD_DIR)/oci/origin-meta.o $(BUILD_DIR)/oci/volume-list.o $(BUILD_DIR)/oci/ref.o $(CJSON_OBJ) | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ -lcurl -lpthread $(OPENSSL_LDFLAGS)
 
