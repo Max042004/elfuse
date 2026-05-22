@@ -166,11 +166,16 @@ Image-provided `DYLD_*` entries pass through (the guest ignores them).
 
 ### User and WorkingDir
 
-`User` accepts numeric `UID` or `UID:GID` only. Symbolic users (`User
-nginx`) are rejected with a deterministic Phase 4 pointer message;
-static `/etc/passwd` parsing waits for Phase 4 along with the rest of
-the NSS resolution work. `--user UID` alone defaults GID to the same
-value.
+`User` accepts seven shapes: the empty string (no override), a numeric
+`UID`, `UID:GID`, a symbolic `name`, `name:group`, `uid:group`, or
+`name:gid`. Symbolic forms read `/etc/passwd` and `/etc/group` from
+the cloned rootfs. A token made entirely of ASCII digits is always
+parsed numerically, even when a same-named account ships in the image
+(this matches runc semantics, so an image that happens to carry a
+`1234` account does not capture `--user 1234`). When the symbolic
+form names an account the unpacked layers do not actually carry,
+lookup fails closed; `elfuse` never silently falls back to root.
+`--user UID` alone defaults GID to the same value.
 
 `WorkingDir` must be absolute and free of `..` segments. If neither the
 image nor the CLI sets it, the guest starts in `/`. The directory is
@@ -180,11 +185,92 @@ selects credentials).
 
 ### Scope guardrails
 
-- Symbolic `User` -> Phase 4 (NSS / static `/etc/passwd` resolution)
-- `/etc/resolv.conf`, `/etc/hosts`, `/dev/*`, `/proc/*` synthesis -> Phase 4
 - Auto-pull on `run` miss -> never; `elfuse oci pull` must run first
 - Network policy, `docker run -p`-style port mapping -> later phases
 - Live `docker exec`-style attach -> never
+
+### Runtime host-truth surface
+
+`elfuse oci run` runs the guest against a freshly cloned per-run
+rootfs and a small set of synthesized host-truth files. The rootfs
+is produced by APFS `clonefile(2)` against the unpacked image
+layers, so the first guest write to any path triggers copy-on-write
+in APFS without touching the original image. The clone is removed at
+guest exit unless `--keep` is set; nothing is ever pushed back to
+the on-disk image, and concurrent `oci run` invocations against the
+same image are isolated.
+
+Three `/etc` files are overwritten in the clone before the guest
+starts. Any pre-existing symlink (the common case is
+`/etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf`) is
+unlinked first so it does not dangle inside the guest:
+
+| File | Source |
+|--|--|
+| `/etc/resolv.conf` | `nameserver` lines harvested from `scutil --dns`; falls back to `8.8.8.8` and `1.1.1.1` on any scutil failure |
+| `/etc/hosts` | fixed 5-line block: `localhost`, the ip6-loopback aliases, ip6 link-local multicast, and `127.0.0.1 host.elfuse.internal` |
+| `/etc/hostname` | literal string `elfuse` |
+
+The following pseudo-filesystem paths are synthesized by the host-side
+openat interceptor and do not need to exist inside the rootfs:
+
+| Path | Behavior |
+|--|--|
+| `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/tty` | redirected to the host device of the same name |
+| `/dev/full` | reads zero-fill, writes of any non-zero length return `ENOSPC` |
+| `/dev/console` | mirrored from the controlling tty when present (macOS reserves the real `/dev/console` for the kernel) |
+| other `/dev/*` | `ENOENT` |
+| `/proc/cpuinfo`, `/proc/meminfo`, `/proc/version` | derived from host sysctl |
+| `/proc/self/{maps,exe,status,stat,comm,statm,cgroup}` | synthesized; `cgroup` reports the canonical `0::/` (elfuse runs outside any cgroup hierarchy) |
+| `/proc/sys/kernel/{ostype,osrelease,hostname}` | tracks the cached `uname` fields (`Linux`, `6.17.0-20-generic`, `elfuse`) |
+
+### Libc-adjacent compatibility
+
+`elfuse` does not patch libc-adjacent payload (NSS modules, time-zone
+data, locale data, character-set converters, dynamic-linker cache)
+inside the guest. Each item below names the contract `elfuse` honors
+and the failure mode an image hits when it does not ship the
+matching files.
+
+- **`/etc/nsswitch.conf`** is read by the guest's libc, not by
+  `elfuse`. Only the `files` and `dns` backends actually function:
+  `files` resolves through `/etc/{passwd,group,hosts}` in the cloned
+  rootfs, and `dns` resolves through host `getaddrinfo` via the
+  synthesized `/etc/resolv.conf`. Backends such as `systemd`, `sss`,
+  or `ldap` need their NSS shared object plus a matching daemon,
+  neither of which `elfuse` provides.
+- **NSS shared objects** (`libnss_systemd.so`, `libnss_sss.so`,
+  `libnss_ldap.so`, ...) are `dlopen`'d by guest libc against its own
+  loader. `elfuse` never injects NSS modules: they are aarch64-linux
+  ELF objects against guest libc, so the macOS host has no way to
+  load them, and the guest can only `dlopen` the modules its image
+  already carries.
+- **tzdata** (`/usr/share/zoneinfo`, `/etc/localtime`, `/etc/timezone`)
+  ships with the image. `elfuse` does not transcode macOS
+  `/var/db/timezone/zoneinfo` into the tzdata format; if the image is
+  missing the needed zone, glibc / musl fall back to UTC. The `TZ`
+  environment variable is honored as-is and is not rewritten by the
+  Env merge policy.
+- **`/usr/lib/locale/locale-archive`** is not regenerated. glibc
+  images without a built archive (or the matching `<lang>.UTF-8/`
+  directory) fall back to the `C` locale; locale-aware sort / printf
+  / strcoll outputs ASCII order. musl images do not use the archive
+  and are unaffected.
+- **`/usr/lib/<triple>/gconv/`** modules and the `gconv-modules`
+  index ship with the image. Missing modules surface as `EILSEQ` from
+  `iconv` / glibc's character-set conversion; this most often shows
+  up when an image ships a stripped glibc layer.
+- **`ld.so.cache`** is not rebuilt. The guest dynamic linker reads
+  whatever cache the image carries; missing entries fall through to
+  the linker's library-path search, which is the normal slow path.
+
+Common workloads and the symptom-to-workaround mapping:
+
+| Symptom | Trigger | Workaround |
+|--|--|--|
+| `getaddrinfo` returns `EAI_AGAIN` or an empty result | `/etc/nsswitch.conf` lists a backend (`systemd`, `sss`, ...) that needs a daemon | use a distro whose `nsswitch.conf` is `files dns` (alpine ships this by default; debian needs the file edited) |
+| `date`, `strftime` show UTC instead of the expected zone | the image does not contain `/usr/share/zoneinfo/<Zone>` | install tzdata in the image (`apk add tzdata` / `apt install tzdata`), or pass `-e TZ=UTC` to acknowledge UTC |
+| `sort`, `printf`, `strcoll` collate in ASCII order | the image is missing `/usr/lib/locale/locale-archive` or the matching `<lang>.UTF-8/` directory | accept the C-locale fallback, run `locale-gen` during the image build, or use a musl-based image (alpine), which does not depend on the archive |
 
 ## Guest Compatibility Model
 
