@@ -645,6 +645,82 @@ EOF
                 bad "heavy/B: oci run busybox-shaped" \
                     "rc=${run_rc} log=$(tail -n 5 "${run_log}")"
             fi
+
+            # ── Fixture C: two-layer-whiteout ───────────────────────────
+            #
+            # Layer 1 stages /bin/busybox + /bin/ls hardlink + a /data
+            # directory with two files (keep.txt, remove.txt). Layer 2
+            # whites out /data/remove.txt via the OCI ".wh.<name>" marker.
+            # After layer apply the unpacked rootfs must contain only
+            # /data/keep.txt under /data/ - never the whiteout marker
+            # itself and never the removed entry. The launch uses /bin/ls
+            # against /data (cmd = [/data]) so the proof is the exact
+            # stdout shape.
+            FIX_C_SRC1="${SCRATCH}/fix-c-l1"
+            FIX_C_SRC2="${SCRATCH}/fix-c-l2"
+            mkdir -p "${FIX_C_SRC1}/bin" "${FIX_C_SRC1}/data"
+            mkdir -p "${FIX_C_SRC2}/data"
+            cp "${heavy_busybox}" "${FIX_C_SRC1}/bin/busybox"
+            chmod 0755 "${FIX_C_SRC1}/bin/busybox"
+            ln "${FIX_C_SRC1}/bin/busybox" "${FIX_C_SRC1}/bin/ls"
+            printf "keep\n" > "${FIX_C_SRC1}/data/keep.txt"
+            printf "remove\n" > "${FIX_C_SRC1}/data/remove.txt"
+            # OCI spec: whiteout file is an empty regular file at the
+            # parent dir with name ".wh.<base>". Its presence alone tells
+            # the apply path to delete the matching entry from the lower
+            # layer.
+            : > "${FIX_C_SRC2}/data/.wh.remove.txt"
+            (cd "${FIX_C_SRC1}" && tar cf "${SCRATCH}/fix-c-l1.tar" bin data)
+            (cd "${FIX_C_SRC2}" && tar cf "${SCRATCH}/fix-c-l2.tar" data)
+
+            if "${BUILDER}" \
+                    --store "${HEAVY_STORE}" \
+                    --ref "compat/two-layer-whiteout:v1" \
+                    --entrypoint "/bin/ls" \
+                    --cmd "/data" \
+                    --workdir "/" \
+                    --layer "${SCRATCH}/fix-c-l1.tar" \
+                    --layer "${SCRATCH}/fix-c-l2.tar" \
+                    >/dev/null 2>"${SCRATCH}/fix-c-build.err"; then
+                ok "heavy/C: two-layer-whiteout fixture built"
+            else
+                bad "heavy/C: fixture build" \
+                    "$(cat "${SCRATCH}/fix-c-build.err")"
+            fi
+
+            run_log="${SCRATCH}/fix-c-run.log"
+            "${ELFUSE}" oci run \
+                --store "${HEAVY_STORE}" \
+                --volume "${HEAVY_MOUNT}" \
+                compat/two-layer-whiteout:v1 \
+                >"${run_log}" 2>&1
+            run_rc=$?
+            if [ "${run_rc}" != 0 ]; then
+                bad "heavy/C: oci run two-layer-whiteout" \
+                    "rc=${run_rc} log=$(tail -n 5 "${run_log}")"
+            elif grep -q "^keep.txt$" "${run_log}" \
+                 && ! grep -q "^remove.txt$" "${run_log}"; then
+                ok "heavy/C: whiteout dropped remove.txt, keep.txt survived"
+            else
+                bad "heavy/C: whiteout output shape" \
+                    "log=$(tr '\n' '|' < "${run_log}")"
+            fi
+            # The OCI image-spec is explicit that the ".wh.<name>" marker
+            # must never appear in the final filesystem. A regression that
+            # forwards the marker as a real file breaks layered tooling
+            # downstream, so the test asserts on the unpacked image tree
+            # in addition to the runtime stdout shape.
+            unpacked_data=$(find "${HEAVY_MOUNT}/images" -type d -name data \
+                                 2>/dev/null | head -n 1)
+            if [ -n "${unpacked_data}" ] \
+               && [ -e "${unpacked_data}/keep.txt" ] \
+               && [ ! -e "${unpacked_data}/remove.txt" ] \
+               && [ ! -e "${unpacked_data}/.wh.remove.txt" ]; then
+                ok "heavy/C: unpacked /data tree has only keep.txt"
+            else
+                bad "heavy/C: unpacked /data tree" \
+                    "data=${unpacked_data:-unset} keep=$(test -e ${unpacked_data}/keep.txt 2>/dev/null && echo y || echo n) remove=$(test -e ${unpacked_data}/remove.txt 2>/dev/null && echo y || echo n) wh=$(test -e ${unpacked_data}/.wh.remove.txt 2>/dev/null && echo y || echo n)"
+            fi
         fi
     fi
 else
