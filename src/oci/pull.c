@@ -150,6 +150,20 @@ static int pull_progress_init(pull_progress_t *pp, FILE *fp,
     memset(pp, 0, sizeof(*pp));
     pp->fp = fp;
     pp->is_tty = fp != NULL && isatty(fileno(fp));
+    /* ELFUSE_OCI_PROGRESS=plain (or =lines, =off) forces the
+     * line-per-completion path even on a real TTY. Some terminal panes
+     * (notably embedded ones that emulate a pty without honoring CSI
+     * cursor-up) leave the in-place redraw stacking copies down the
+     * screen instead of rewriting the active rows; the env override
+     * gives the operator a stable opt-out without touching code.
+     */
+    if (pp->is_tty) {
+        const char *override = getenv("ELFUSE_OCI_PROGRESS");
+        if (override
+            && (!strcmp(override, "plain") || !strcmp(override, "lines")
+                || !strcmp(override, "off")))
+            pp->is_tty = false;
+    }
 
     size_t cap = 1 + n_layers;
     pp->slots = calloc(cap, sizeof(*pp->slots));
