@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/clonefile.h>
+#include <copyfile.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -512,10 +512,15 @@ static int assembly_walk_content(const char *raw_dir,
             continue;
         }
         /* Regular file or symlink (or any other non-directory): unlink
-         * any existing destination then clonefile NOFOLLOW so APFS COW
-         * keeps the byte cost flat. Per D8, hardlink relationships from
-         * the tar are not reconstructed (each clonefile produces an
-         * independent inode).
+         * any existing destination then copyfile with COPYFILE_CLONE
+         * so APFS COW keeps the byte cost flat when raw cache and
+         * stage share a volume, and falls back to a byte copy when
+         * they do not (default elfuse layout puts the store on the
+         * root volume and the stage on a sparsebundle, so the EXDEV
+         * fallback is the steady-state path for fresh unpacks until
+         * the layouts are unified). Per D8, hardlink relationships
+         * from the tar are not reconstructed (each copyfile produces
+         * an independent inode).
          */
         struct stat dst;
         if (lstat(stage_child, &dst) == 0) {
@@ -527,14 +532,9 @@ static int assembly_walk_content(const char *raw_dir,
             rc = set_err(err, "assemble: dst lstat failed", errno);
             break;
         }
-        if (clonefile(raw_child, stage_child, CLONE_NOFOLLOW) < 0) {
-            if (errno == EXDEV) {
-                rc = set_err(err,
-                             "assemble: clonefile EXDEV (raw cache and "
-                             "stage must share an APFS volume)", EXDEV);
-                break;
-            }
-            rc = set_err(err, "assemble: clonefile failed", errno);
+        if (copyfile(raw_child, stage_child, NULL,
+                     COPYFILE_CLONE | COPYFILE_ALL) < 0) {
+            rc = set_err(err, "assemble: copyfile failed", errno);
             break;
         }
     }
@@ -882,22 +882,22 @@ int oci_unpack(oci_store_t *store,
         size_t sl = strlen(stack_dir);
         if (sl > 0 && stack_dir[sl - 1] == '/')
             stack_dir[sl - 1] = '\0';
-        /* clonefile rejects a pre-existing destination. The freshly
-         * mkdir_p'd stage_dir is empty but exists; rm it so the
-         * clonefile call can recreate it from the snapshot.
+        /* copyfile with COPYFILE_CLONE prefers an APFS clone (cheap
+         * COW) and falls back to a recursive byte copy on EXDEV, so
+         * stack restore works whether the store and stage share a
+         * volume or not. COPYFILE_CLONE implies an exclusive
+         * destination; the rm_recursive above prepares an absent
+         * target for both code paths.
          */
         if (rm_recursive(stage_dir) < 0) {
             set_err(err, "unpack: stage rm-for-stack failed", errno);
             goto fail_orch;
         }
-        if (clonefile(stack_dir, stage_dir, CLONE_NOFOLLOW) < 0) {
+        if (copyfile(stack_dir, stage_dir, NULL,
+                     COPYFILE_CLONE | COPYFILE_RECURSIVE | COPYFILE_NOFOLLOW
+                         | COPYFILE_ALL) < 0) {
             int saved = errno;
-            set_err(err,
-                    saved == EXDEV
-                        ? "unpack: stack restore EXDEV (store and stage "
-                          "must share an APFS volume)"
-                        : "unpack: stack restore clonefile failed",
-                    saved);
+            set_err(err, "unpack: stack restore copyfile failed", saved);
             goto fail_orch;
         }
         /* Re-load the cumulative meta sidecar the stack snapshot
@@ -1060,14 +1060,16 @@ int oci_unpack(oci_store_t *store,
             set_err(err, "unpack: stack stage_path resolve failed", errno);
             goto fail_orch;
         }
-        if (clonefile(stage_dir, stack_stage, CLONE_NOFOLLOW) < 0) {
+        /* Same copyfile + COPYFILE_CLONE rationale as the stack
+         * restore: prefer APFS clone, fall back to recursive byte
+         * copy on EXDEV so the cache populates regardless of which
+         * volume holds the stage.
+         */
+        if (copyfile(stage_dir, stack_stage, NULL,
+                     COPYFILE_CLONE | COPYFILE_RECURSIVE | COPYFILE_NOFOLLOW
+                         | COPYFILE_ALL) < 0) {
             int saved = errno;
-            set_err(err,
-                    saved == EXDEV
-                        ? "unpack: stack snapshot EXDEV (store and stage "
-                          "must share an APFS volume)"
-                        : "unpack: stack snapshot clonefile failed",
-                    saved);
+            set_err(err, "unpack: stack snapshot copyfile failed", saved);
             goto fail_orch;
         }
         const char *scerr = NULL;
