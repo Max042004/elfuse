@@ -582,6 +582,69 @@ EOF
                 bad "heavy/A: oci run alpine-shaped" \
                     "rc=${run_rc} log=$(tail -n 5 "${run_log}")"
             fi
+
+            # ── Fixture B: busybox-shaped ───────────────────────────────
+            #
+            # Single layer that hardlinks /bin/echo (the entrypoint) at
+            # /bin/busybox so the layer tar carries a typeflag '1' record
+            # the apply_hardlink path must rebuild. busybox dispatches on
+            # argv[0] when the program name is one of its applets, so
+            # launching via the hardlink (entrypoint /bin/echo) routes
+            # straight into the echo applet without an extra argv shuffle.
+            # BSD tar detects shared inodes on disk and emits the hardlink
+            # entry automatically, so the layout below produces a "regular
+            # file then hardlink" pair without any tar flag fiddling.
+            FIX_B_SRC="${SCRATCH}/fix-b-src"
+            mkdir -p "${FIX_B_SRC}/bin"
+            cp "${heavy_busybox}" "${FIX_B_SRC}/bin/busybox"
+            chmod 0755 "${FIX_B_SRC}/bin/busybox"
+            ln "${FIX_B_SRC}/bin/busybox" "${FIX_B_SRC}/bin/echo"
+            ln "${FIX_B_SRC}/bin/busybox" "${FIX_B_SRC}/bin/cat"
+            (cd "${FIX_B_SRC}" && tar cf "${SCRATCH}/fix-b.tar" bin)
+
+            # Sanity-check that tar wrote at least one hardlink entry, so
+            # a future change to the build host's tar that silently turns
+            # hardlinks into duplicates does not turn this fixture into a
+            # busybox-only smoke test. BSD tar prints "h<perm-bits>..."
+            # in the leading column for typeflag '1' records, distinct
+            # from "-<perm>" (regular file) and "l<perm>" (symlink).
+            hardlink_count=$(tar -tvf "${SCRATCH}/fix-b.tar" 2>/dev/null \
+                             | grep -c "^h")
+            if [ "${hardlink_count}" -ge 1 ]; then
+                ok "heavy/B: layer tar carries hardlink records (${hardlink_count})"
+            else
+                bad "heavy/B: layer tar hardlinks" \
+                    "tar emitted ${hardlink_count} hardlink rows (want >=1)"
+            fi
+
+            if "${BUILDER}" \
+                    --store "${HEAVY_STORE}" \
+                    --ref "compat/busybox-shaped:v1" \
+                    --entrypoint "/bin/echo" \
+                    --workdir "/" \
+                    --layer "${SCRATCH}/fix-b.tar" \
+                    >/dev/null 2>"${SCRATCH}/fix-b-build.err"; then
+                ok "heavy/B: busybox-shaped fixture built"
+            else
+                bad "heavy/B: fixture build" \
+                    "$(cat "${SCRATCH}/fix-b-build.err")"
+            fi
+
+            run_log="${SCRATCH}/fix-b-run.log"
+            "${ELFUSE}" oci run \
+                --store "${HEAVY_STORE}" \
+                --volume "${HEAVY_MOUNT}" \
+                compat/busybox-shaped:v1 \
+                "elfuse-busybox-shaped-ok" \
+                >"${run_log}" 2>&1
+            run_rc=$?
+            if [ "${run_rc}" = 0 ] \
+               && grep -q "^elfuse-busybox-shaped-ok$" "${run_log}"; then
+                ok "heavy/B: oci run via /bin/echo hardlink prints line"
+            else
+                bad "heavy/B: oci run busybox-shaped" \
+                    "rc=${run_rc} log=$(tail -n 5 "${run_log}")"
+            fi
         fi
     fi
 else
