@@ -527,6 +527,16 @@ static int layer_apply_impl(oci_tar_reader_t *r,
         while (gp[0] == '/')
             gp++;
 
+        /* Root-directory tar entry: docker/buildkit emit "./" as the
+         * first entry of a layer; the DIR-type trailing-slash strip
+         * upstream collapses it to ".". The unpack root already
+         * exists by the time the assembler enters this loop, so the
+         * root entry has no work to drive. Skip empty paths the same
+         * way for archives that record a zero-length root name.
+         */
+        if (gp[0] == '\0' || (gp[0] == '.' && gp[1] == '\0'))
+            continue;
+
         if (mode == APPLY_MODE_OVERLAY) {
             if (e.is_opaque_whiteout) {
                 oci_tar_entry_t e2 = e;
