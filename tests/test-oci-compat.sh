@@ -54,7 +54,20 @@ if [ ! -x "${BUILDER}" ]; then
 fi
 
 SCRATCH=$(mktemp -d /tmp/elfuse-compat-XXXXXX)
-trap 'rm -rf "${SCRATCH}"' EXIT
+# Track the heavy-mode hdiutil mountpoint so the EXIT trap can detach
+# the sparsebundle before the SCRATCH rm. Empty when heavy mode is not
+# active or the attach failed; the trap is a no-op in that case.
+HEAVY_MOUNT=""
+compat_cleanup() {
+    if [ -n "${HEAVY_MOUNT}" ] && [ -d "${HEAVY_MOUNT}" ]; then
+        # -force releases the volume even when a child process kept a
+        # file open inside the mount. The scratch sparsebundle is
+        # throwaway, so the safer plain detach is not worth retrying.
+        hdiutil detach -force "${HEAVY_MOUNT}" >/dev/null 2>&1 || true
+    fi
+    rm -rf "${SCRATCH}"
+}
+trap compat_cleanup EXIT
 
 # ── CLI surface smokes ───────────────────────────────────────────────
 
@@ -482,13 +495,95 @@ case "${nodu_out}" in
 esac
 
 # ── Heavy mode (full E2E launches) ───────────────────────────────────
+#
+# OCI_COMPAT_TEST=1 provisions a scratch case-sensitive APFS sparsebundle
+# at ${SCRATCH}/scratch.sparsebundle, attaches it under HEAVY_MOUNT, and
+# drives each Phase 3 plan fixture end-to-end through `elfuse oci run`.
+# The volume is detached and the SCRATCH dir is wiped on EXIT. The
+# default ${HOME}/Library/Application Support/elfuse/ volume is never
+# touched so the test cannot pollute a developer's working store.
 
 if [ -n "${OCI_COMPAT_TEST:-}" ]; then
-    skip "alpine-shaped / busybox-shaped / two-layer-whiteout" \
-         "OCI_COMPAT_TEST=1 is set but heavy harness is deferred:" \
-         "fixture builder is wired, sparsebundle volume provisioning" \
-         "and the three Phase 3 plan fixtures land in a follow-up" \
-         "compat-matrix patch (issue #31 Phase 3 acceptance 8)."
+    heavy_busybox="${GUEST_BUSYBOX:-${ROOT}/externals/test-fixtures/aarch64-musl/staticbin/bin/busybox}"
+    if [ ! -x "${heavy_busybox}" ]; then
+        skip "heavy: static busybox missing" \
+             "${heavy_busybox} not found; run tests/fetch-fixtures.sh first"
+    else
+        HEAVY_IMAGE="${SCRATCH}/scratch.sparsebundle"
+        HEAVY_MOUNT_DEST="${SCRATCH}/scratch-mount"
+        # hdiutil refuses to create over an existing path and refuses to
+        # attach onto a mountpoint dir that does not exist yet; the create
+        # call writes the sparsebundle to disk, mkdir provisions the
+        # mountpoint, attach binds them. -nobrowse keeps Finder from
+        # registering the volume on developer laptops.
+        if hdiutil create -size 256m \
+                          -fs "Case-sensitive APFS" \
+                          -volname "elfuse-compat" \
+                          -type SPARSEBUNDLE \
+                          -quiet "${HEAVY_IMAGE}" \
+            && mkdir -p "${HEAVY_MOUNT_DEST}" \
+            && hdiutil attach -mountpoint "${HEAVY_MOUNT_DEST}" \
+                              -nobrowse -quiet "${HEAVY_IMAGE}"; then
+            HEAVY_MOUNT="${HEAVY_MOUNT_DEST}"
+            ok "heavy: scratch sparsebundle attached at ${HEAVY_MOUNT}"
+        else
+            bad "heavy: sparsebundle setup" "hdiutil create+attach failed"
+        fi
+
+        if [ -n "${HEAVY_MOUNT}" ]; then
+            HEAVY_STORE="${SCRATCH}/heavy-store"
+            mkdir -p "${HEAVY_STORE}"
+
+            # ── Fixture A: alpine-shaped ────────────────────────────────
+            #
+            # Minimal single-layer image with a static busybox at
+            # /bin/busybox and a small /etc/os-release. Exercises the
+            # baseline unpack -> clone-rootfs -> guest-launch chain on a
+            # freshly attached sparsebundle volume without any hardlink
+            # or whiteout surface in the layer tar.
+            FIX_A_SRC="${SCRATCH}/fix-a-src"
+            mkdir -p "${FIX_A_SRC}/bin" "${FIX_A_SRC}/etc"
+            cp "${heavy_busybox}" "${FIX_A_SRC}/bin/busybox"
+            chmod 0755 "${FIX_A_SRC}/bin/busybox"
+            cat > "${FIX_A_SRC}/etc/os-release" <<'EOF'
+NAME="elfuse-compat-A"
+ID=alpine-shaped
+EOF
+            (cd "${FIX_A_SRC}" && tar cf "${SCRATCH}/fix-a.tar" bin etc)
+
+            if "${BUILDER}" \
+                    --store "${HEAVY_STORE}" \
+                    --ref "compat/alpine-shaped:v1" \
+                    --entrypoint "/bin/busybox" \
+                    --workdir "/" \
+                    --layer "${SCRATCH}/fix-a.tar" \
+                    >/dev/null 2>"${SCRATCH}/fix-a-build.err"; then
+                ok "heavy/A: alpine-shaped fixture built"
+            else
+                bad "heavy/A: fixture build" \
+                    "$(cat "${SCRATCH}/fix-a-build.err")"
+            fi
+
+            # busybox dispatches on argv[1] when argv[0] is the busybox
+            # binary itself, so passing "echo elfuse-..." as the CLI tail
+            # selects the echo applet.
+            run_log="${SCRATCH}/fix-a-run.log"
+            "${ELFUSE}" oci run \
+                --store "${HEAVY_STORE}" \
+                --volume "${HEAVY_MOUNT}" \
+                compat/alpine-shaped:v1 \
+                echo "elfuse-alpine-shaped-ok" \
+                >"${run_log}" 2>&1
+            run_rc=$?
+            if [ "${run_rc}" = 0 ] \
+               && grep -q "^elfuse-alpine-shaped-ok$" "${run_log}"; then
+                ok "heavy/A: oci run alpine-shaped prints expected line"
+            else
+                bad "heavy/A: oci run alpine-shaped" \
+                    "rc=${run_rc} log=$(tail -n 5 "${run_log}")"
+            fi
+        fi
+    fi
 else
     skip "alpine-shaped / busybox-shaped / two-layer-whiteout E2E" \
          "OCI_COMPAT_TEST=1 gates the hdiutil-backed pipeline"
