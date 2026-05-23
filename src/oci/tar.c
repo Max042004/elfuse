@@ -350,6 +350,123 @@ static int consume_long_record(oci_tar_reader_t *r,
     return 0;
 }
 
+/* Consume an 'x' (per-file) or 'g' (global) PAX extended-header
+ * payload. Per POSIX.1-2001 the payload is a stream of records of
+ * the form "<len> <key>=<value>\n" where <len> is the total byte
+ * count of the record including its own length digits and trailing
+ * newline. The unpack pipeline cares only about long names: `path`
+ * overrides the next entry's name and `linkpath` overrides its
+ * linkname. Both are promoted into the same pending buffers the GNU
+ * 'L'/'K' path uses so downstream code stays unaware of the format.
+ *
+ * Global ('g') records establish defaults for all subsequent
+ * entries; container builders almost never set path / linkpath
+ * defaults globally (the use case is local mtime / atime / uid
+ * defaults), so the implementation discards the payload bytes-
+ * correctly without parsing. Other PAX keys (size, mtime, atime,
+ * uid, gid, xattrs) are not tracked by the unpack pipeline and are
+ * silently ignored from per-file records as well.
+ */
+static int consume_pax_record(oci_tar_reader_t *r,
+                              uint64_t size,
+                              int is_global,
+                              const char **err)
+{
+    if (size > TAR_MAX_LONG_RECORD) {
+        *err = "tar PAX record out of bounds";
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char *buf = NULL;
+    if (size > 0) {
+        buf = malloc((size_t) size + 1);
+        if (!buf) {
+            *err = "tar PAX buffer allocation failed";
+            errno = ENOMEM;
+            return -1;
+        }
+        int rc = read_full(r, buf, (size_t) size);
+        if (rc <= 0) {
+            free(buf);
+            *err = "tar PAX record truncated";
+            errno = EIO;
+            return -1;
+        }
+        buf[size] = '\0';
+    }
+    /* Padding alignment is computed against the on-wire record length,
+     * matching consume_long_record so the next header read stays
+     * aligned even when size is not a multiple of TAR_BLOCK_SIZE.
+     */
+    uint64_t pad = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
+    if (pad > 0 && discard_bytes(r, pad) < 0) {
+        free(buf);
+        *err = "tar PAX padding truncated";
+        errno = EIO;
+        return -1;
+    }
+
+    if (is_global || size == 0) {
+        free(buf);
+        return 0;
+    }
+
+    char *p = buf;
+    char *end = buf + size;
+    while (p < end) {
+        char *space = memchr(p, ' ', (size_t) (end - p));
+        if (!space) {
+            free(buf);
+            *err = "tar PAX record missing length terminator";
+            errno = EINVAL;
+            return -1;
+        }
+        char *endp = NULL;
+        long len = strtol(p, &endp, 10);
+        if (endp != space || len <= 0) {
+            free(buf);
+            *err = "tar PAX record length unparseable";
+            errno = EINVAL;
+            return -1;
+        }
+        char *record_end = p + len;
+        if (record_end > end || record_end[-1] != '\n') {
+            free(buf);
+            *err = "tar PAX record framing invalid";
+            errno = EINVAL;
+            return -1;
+        }
+        char *kvp = space + 1;
+        char *eq = memchr(kvp, '=', (size_t) (record_end - 1 - kvp));
+        if (eq) {
+            size_t key_len = (size_t) (eq - kvp);
+            const char *val = eq + 1;
+            size_t val_len = (size_t) (record_end - 1 - val);
+            char **slot = NULL;
+            if (key_len == 4 && memcmp(kvp, "path", 4) == 0)
+                slot = &r->pending_long_name;
+            else if (key_len == 8 && memcmp(kvp, "linkpath", 8) == 0)
+                slot = &r->pending_long_link;
+            if (slot) {
+                char *copy = malloc(val_len + 1);
+                if (!copy) {
+                    free(buf);
+                    *err = "tar PAX value allocation failed";
+                    errno = ENOMEM;
+                    return -1;
+                }
+                memcpy(copy, val, val_len);
+                copy[val_len] = '\0';
+                free(*slot);
+                *slot = copy;
+            }
+        }
+        p = record_end;
+    }
+    free(buf);
+    return 0;
+}
+
 static int classify_typeflag(uint8_t flag, oci_tar_type_t *out)
 {
     switch (flag) {
@@ -467,9 +584,9 @@ int oci_tar_next(oci_tar_reader_t *r, oci_tar_entry_t *out, const char **err)
             continue;
         }
         if (klass == 2) {
-            *err = "tar PAX extensions not supported";
-            errno = EPROTONOSUPPORT;
-            return -1;
+            if (consume_pax_record(r, size, typeflag == 'g', err) < 0)
+                return -1;
+            continue;
         }
 
         /* Real entry. Materialize path and linkname into reader-owned

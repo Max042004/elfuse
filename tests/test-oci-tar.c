@@ -407,17 +407,26 @@ static void test_gnu_long_name(void)
     bb_free(&b);
 }
 
-static void test_pax_rejected(void)
+static void test_pax_extended_path(void)
 {
     bb_t b;
     bb_init(&b);
-    /* PAX extended header 'x' carries a payload the reader should not
-     * silently consume; the contract is to reject the whole stream.
+    /* PAX 'x' extended header carries a per-file path override that
+     * applies to the next non-extension entry. The record format is
+     * "<len> key=value\n" where <len> covers the entire on-wire
+     * record bytes. The reader must consume the record, latch
+     * path / linkpath into the same pending buffers the GNU long-
+     * name path uses, and surface the long name through entry.path.
      */
-    append_header(&b, "PaxHeaders/etc/hostname", 32, 0644, 'x', NULL, true,
-                  false);
-    /* Payload content is irrelevant: reader refuses before reading. */
-    append_payload(&b, "20 path=etc/hostname\n", 32);
+    const char *record = "21 path=etc/hostname\n";
+    size_t rlen = 21;
+    append_header(&b, "PaxHeaders/etc/hostname", (uint32_t) rlen, 0644, 'x',
+                  NULL, true, false);
+    append_payload(&b, record, rlen);
+    /* Follow with the actual file entry. The ustar name is a stub the
+     * PAX path record overrides.
+     */
+    append_header(&b, "stub", 0, 0644, '0', NULL, true, false);
     bb_zero(&b, BLOCK * 2);
 
     src_t s = {.buf = b.buf, .len = b.len};
@@ -425,15 +434,53 @@ static void test_pax_rejected(void)
 
     oci_tar_entry_t e;
     const char *err = NULL;
-    errno = 0;
     int rc = oci_tar_next(r, &e, &err);
-    if (rc != -1)
-        report_fail("pax rejected", "expected -1, got %d", rc);
-    else if (errno != EPROTONOSUPPORT)
-        report_fail("pax rejected", "expected EPROTONOSUPPORT, got %d (%s)",
-                    errno, err ? err : "(null)");
+    if (rc != 1)
+        report_fail("pax extended path", "expected rc=1, got %d (%s)", rc,
+                    err ? err : "(null)");
+    else if (e.type != OCI_TAR_REG)
+        report_fail("pax extended path", "type=%d (want REG)", (int) e.type);
+    else if (strcmp(e.path, "etc/hostname") != 0)
+        report_fail("pax extended path", "path=\"%s\" (want etc/hostname)",
+                    e.path ? e.path : "(null)");
     else
-        report_pass("pax rejected with EPROTONOSUPPORT");
+        report_pass("pax extended path latched onto next entry");
+
+    oci_tar_reader_free(r);
+    bb_free(&b);
+}
+
+static void test_pax_global_skipped(void)
+{
+    bb_t b;
+    bb_init(&b);
+    /* PAX 'g' global record sets defaults for all subsequent entries.
+     * The unpack pipeline does not consume any global key today, so
+     * the reader silently discards the payload bytes-correctly and
+     * surfaces the next real entry with its own ustar fields.
+     */
+    const char *gdata = "23 comment=elfuse-test\n";
+    size_t glen = 23;
+    append_header(&b, "PaxGlobalHeader", (uint32_t) glen, 0644, 'g', NULL, true,
+                  false);
+    append_payload(&b, gdata, glen);
+    append_header(&b, "etc/host.conf", 0, 0644, '0', NULL, true, false);
+    bb_zero(&b, BLOCK * 2);
+
+    src_t s = {.buf = b.buf, .len = b.len};
+    oci_tar_reader_t *r = oci_tar_reader_new(src_read, &s);
+
+    oci_tar_entry_t e;
+    const char *err = NULL;
+    int rc = oci_tar_next(r, &e, &err);
+    if (rc != 1)
+        report_fail("pax global skipped", "expected rc=1, got %d (%s)", rc,
+                    err ? err : "(null)");
+    else if (strcmp(e.path, "etc/host.conf") != 0)
+        report_fail("pax global skipped", "path=\"%s\" (want etc/host.conf)",
+                    e.path ? e.path : "(null)");
+    else
+        report_pass("pax global record silently skipped");
 
     oci_tar_reader_free(r);
     bb_free(&b);
@@ -593,7 +640,8 @@ int main(void)
     test_regular_file(512); /* exact block */
     test_directory_and_symlink_and_hardlink();
     test_gnu_long_name();
-    test_pax_rejected();
+    test_pax_extended_path();
+    test_pax_global_skipped();
     test_unsupported_typeflags();
     test_unknown_typeflag_rejected();
     test_chksum_mismatch();
