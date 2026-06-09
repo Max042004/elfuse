@@ -259,3 +259,168 @@ jobs:
           path: build/scan-build
           retention-days: 7
           if-no-files-found: ignore
+  runtime-macos:
+    name: Runtime (macOS Apple Silicon, HVF)
+    needs: build-macos
+    if: >
+      github.repository == 'sysprog21/elfuse' &&
+      (github.event_name == 'push' || github.event_name == 'pull_request')
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 20
+
+    # contents: read for the checkout; pull-requests: read so the guard can
+    # query the PR's current HEAD; actions: write so the guard can cancel
+    # this run when it is superseded. If the Set up job log does not show
+    # "Actions: write", repo/org policy is capping it and the self-cancel
+    # path is unavailable.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+
+    concurrency:
+      group: runtime-macos-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+    env:
+      LINUX_TOOLCHAIN: /opt/toolchain/aarch64-linux-gnu
+      GNU_OBJCOPY: /opt/homebrew/opt/binutils/bin/objcopy
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      BREW_PKGS: binutils qemu
+
+    steps:
+      # Bail out early if this run targets a commit that is no longer the
+      # PR's HEAD. cancel-in-progress covers "commit 2 pushed while commit
+      # 1 is still running", but NOT a manual "Re-run jobs" on an old run:
+      # a re-run replays the original event payload (a frozen head.sha)
+      # against this single self-hosted runner, which would otherwise burn
+      # up to the full job timeout re-testing stale code. Compare the
+      # frozen head.sha against the live PR HEAD and skip the rest of the
+      # job when they differ. We set an output and gate every later step
+      # on it (instead
+      # of `exit 1`) so a superseded run ends green rather than emitting
+      # another spurious failure notification. The API lookup fails open:
+      # if HEAD can't be determined the job runs normally.
+      - name: Skip if superseded by a newer PR commit
+        id: guard
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          # curl and system python3 are always present on macOS; jq/gh are
+          # not guaranteed on a self-hosted runner, so don't depend on them.
+          latest=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])') \
+            || latest=""
+          echo "Run targets : $RUN_SHA"
+          echo "PR HEAD now : ${latest:-<unknown>}"
+          if [ -z "$latest" ]; then
+            echo "::warning::Could not determine current PR HEAD; running without supersede check."
+          elif [ "$latest" != "$RUN_SHA" ]; then
+            echo "::notice::PR #$PR_NUMBER HEAD is now $latest; this run targets $RUN_SHA -- skipping superseded run."
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.guard.outputs.superseded != 'true'
+        uses: actions/checkout@v6
+
+      - name: Host info
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          sw_vers
+          uname -a
+          uname -m
+          sysctl kern.hv_support || true
+          test "$(uname -m)" = "arm64"
+
+      - name: Cache Homebrew downloads
+        if: steps.guard.outputs.superseded != 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-runtime-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
+
+      - name: Install missing Homebrew packages
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          missing=()
+
+          for pkg in $BREW_PKGS; do
+            if ! brew list --formula "$pkg" >/dev/null 2>&1; then
+              missing+=("$pkg")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            brew install --quiet "${missing[@]}"
+          else
+            echo "All Homebrew packages are already installed: $BREW_PKGS"
+          fi
+
+      - name: Tool versions
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          command -v make
+          command -v "$GNU_OBJCOPY"
+          make -V .MAKE.VERSION 2>/dev/null || true
+          "$GNU_OBJCOPY" --version | head -1
+          qemu-aarch64 --version | head -1 || true
+          python3 --version
+
+      - name: Check Rosetta for Linux
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          ROSETTA=/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta
+
+          if [ ! -x "$ROSETTA" ]; then
+            echo "::error::Rosetta for Linux runtime was not found at $ROSETTA"
+            echo
+            echo "Install Rosetta on the self-hosted Mac runner first:"
+            echo "  sudo softwareupdate --install-rosetta --agree-to-license"
+            echo
+            echo "Current /Library/Apple/usr/libexec/oah contents:"
+            ls -R /Library/Apple/usr/libexec/oah || true
+            exit 1
+          fi
+
+          ls -l "$ROSETTA"
+
+      - name: Build elfuse
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          make elfuse
+
+      - name: Verify HVF entitlement is embedded
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          codesign -d --entitlements - build/elfuse 2>&1 \
+            | grep -q 'com\.apple\.security\.hypervisor'
+
+      - name: test-hello
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          make test-hello
+
+      - name: test-multi-vcpu
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          make test-multi-vcpu
+
+      - name: make check
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          make check
+
+      - name: Test matrix
+        if: steps.guard.outputs.superseded != 'true'
+        run: |
+          bash tests/test-matrix.sh all
