@@ -1,0 +1,91 @@
+# Throwaway probe: does a GitHub-hosted macOS Apple Silicon runner expose
+# Hypervisor.framework? The hosted runner is itself a VM (Azure), and Apple's
+# HVF historically cannot be nested, so `hv_vm_create` returns HV_UNSUPPORTED
+# and `sysctl kern.hv_support` reads 0. This workflow re-verifies that empirically
+# on current hosted images (chip generation + nested-virt support can change).
+#
+# Delete this file once the question is answered.
+name: HVF Probe (hosted)
+
+on:
+  push:
+    branches: [ci/hvf-hosted-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe-hvf:
+    name: Probe HVF on hosted ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      GNU_OBJCOPY: /opt/homebrew/opt/binutils/bin/objcopy
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Host, chip, and HVF capability flags
+        run: |
+          set -uo pipefail
+          {
+            echo "## ${{ matrix.runner }}"
+            echo '```'
+            sw_vers
+            uname -a
+            echo "arch: $(uname -m)"
+            echo "chip: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo '?')"
+            echo "model: $(sysctl -n hw.model 2>/dev/null || echo '?')"
+            echo "kern.hv_support: $(sysctl -n kern.hv_support 2>/dev/null || echo '<absent>')"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build elfuse (host-side build sanity)
+        run: |
+          set -euo pipefail
+          brew install --quiet binutils
+          make elfuse
+          codesign -d --entitlements - build/elfuse 2>&1 \
+            | grep -q 'com\.apple\.security\.hypervisor' \
+            && echo "entitlement embedded: yes"
+
+      - name: Direct hv_vm_create() probe (signed with HVF entitlement)
+        # End-to-end test of the one call that gates every elfuse run. Sidesteps
+        # the baremetal cross toolchain that `make test-hello` would need to build
+        # a guest -- if hv_vm_create fails, no guest can run anyway. Non-fatal so
+        # the verdict always reaches the step summary.
+        run: |
+          set -uo pipefail
+          cat > /tmp/hvf_probe.c <<'EOF'
+          #include <Hypervisor/Hypervisor.h>
+          #include <stdio.h>
+          int main(void) {
+              hv_return_t r = hv_vm_create(NULL);
+              printf("hv_vm_create() -> 0x%08x\n", r);
+              if (r == HV_SUCCESS) {
+                  hv_vm_destroy();
+                  printf("VERDICT: HVF AVAILABLE\n");
+                  return 0;
+              }
+              const char *name =
+                  r == 0xfae9400f ? "HV_UNSUPPORTED" :
+                  r == 0xfae94007 ? "HV_DENIED" :
+                  r == 0xfae94001 ? "HV_ERROR" : "other";
+              printf("VERDICT: HVF UNAVAILABLE (%s)\n", name);
+              return 1;
+          }
+          EOF
+          clang -arch arm64 -framework Hypervisor -o /tmp/hvf_probe /tmp/hvf_probe.c
+          codesign --entitlements entitlements.plist -f -s - /tmp/hvf_probe
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          /tmp/hvf_probe | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "probe exit code: $rc"
