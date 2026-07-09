@@ -139,6 +139,11 @@ int path_check_intercept_access(const struct stat *st, int mode, int flags)
     return -1;
 }
 
+/* Forward-declared: defined below dirfd_guest_base_path(), which it needs. */
+static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
+                                                   const char *path,
+                                                   unsigned int flags);
+
 int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
@@ -200,6 +205,27 @@ int path_translate_at(guest_fd_t dirfd,
     } else {
         tx->host_path = path_resolve_sysroot_path(tx->guest_path, tx->host_buf,
                                                   sizeof(tx->host_buf));
+    }
+
+    /* The resolvers above key off guest_path[0] == '/': a relative path is
+     * handed back untouched because they have no dirfd context to rebuild a
+     * host location from, so it never gets the sysroot-prefix + realpath()
+     * containment check that absolute paths get. That leaves the actual
+     * openat(dirfd, name) to the host kernel's own resolution, which is not
+     * confined to dirfd's subtree -- a symlink reachable through dirfd (a
+     * relative target with enough ".." components, or an absolute target)
+     * walks straight out of the sysroot with no check at all. Reconstruct the
+     * equivalent absolute guest path from dirfd's guest base path and run it
+     * back through the same containment-checked resolver; its realpath() call
+     * collapses ".." and any symlink indirection, including an absolute
+     * target, before the prefix check runs.
+     */
+    if (tx->host_path && tx->guest_path[0] != '/' && proc_get_sysroot() &&
+        path_check_relative_sysroot_containment(dirfd, tx->guest_path, flags) <
+            0) {
+        tx->host_path = NULL;
+        if (errno == 0)
+            errno = ELOOP;
     }
 
     /* Sidecar only runs after sysroot resolution succeeds. If the resolver
@@ -892,6 +918,41 @@ static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz)
     out[0] = '/';
     out[1] = '\0';
     return 0;
+}
+
+static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
+                                                   const char *path,
+                                                   unsigned int flags)
+{
+    char base[LINUX_PATH_MAX];
+    if (dirfd_guest_base_path(dirfd, base, sizeof(base)) < 0)
+        return -1;
+
+    char abs_path[LINUX_PATH_MAX];
+    int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", base, path);
+    if (n < 0 || (size_t) n >= sizeof(abs_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    char host_buf[LINUX_PATH_MAX];
+    const char *checked;
+    if (flags & PATH_TR_NOFOLLOW) {
+        checked = path_resolve_sysroot_nofollow_path(abs_path, host_buf,
+                                                     sizeof(host_buf));
+    } else if (flags & PATH_TR_CREATE) {
+        /* create_parents=false regardless of the caller's actual flags: this
+         * pass only checks whether the resolution is contained, and must not
+         * mkdir() anything on the reconstructed path as a side effect.
+         */
+        checked = path_resolve_sysroot_create_path(abs_path, host_buf,
+                                                   sizeof(host_buf), false);
+    } else {
+        checked =
+            path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf));
+    }
+
+    return checked ? 0 : -1;
 }
 
 static bool normalized_proc_self_fd_anchor(const char *path)

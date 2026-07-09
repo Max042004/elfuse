@@ -15,7 +15,8 @@
         test-sysroot-create-paths test-fork-ipc-protocol-host test-identity-override-host \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
-        test-sysroot-nofollow test-sysroot-chdir perf
+        test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
+        test-linkat-symlink-fallback perf
 
 ## Build and run the assembly hello world test
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
@@ -113,6 +114,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-host-fallback
 	@printf "\n$(BLUE)━━━ sysroot byte-exact lookup validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-case-exact
+	@printf "\n$(BLUE)━━━ sysroot relative-dirfd symlink escape validation ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-symlink-escape
 	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
@@ -171,6 +174,59 @@ test-sysroot-chdir: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-chdir
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$tmpdir/bin" "$$tmpdir/lib" "$$tmpdir/lib/elfuse-sysroot-shadow"; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-chdir
+
+## A symlink reachable through a sysroot-contained dirfd must not escape via
+## openat(dirfd, name): stages both an absolute-target and a deep-".."
+## relative-target symlink under $sysroot/d1, each pointing at a secret file
+## in a second tmpdir well outside the sysroot.
+test-sysroot-symlink-escape: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-escape
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	secret_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir" "$$secret_dir"' EXIT; \
+	mkdir -p "$$tmpdir/d1"; \
+	printf 'inside-sysroot\n' > "$$tmpdir/d1/normal.txt"; \
+	printf 'SECRET-HOST-FILE\n' > "$$secret_dir/secret.txt"; \
+	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d1/abs-link"; \
+	depth=$$(printf '%s' "$$tmpdir/d1" | tr -cd '/' | wc -c | tr -d ' '); \
+	relback=""; i=0; \
+	while [ "$$i" -lt "$$depth" ]; do relback="../$$relback"; i=$$((i + 1)); done; \
+	ln -sf "$${relback}$${secret_dir#/}/secret.txt" "$$tmpdir/d1/rel-link"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-symlink-escape
+
+## sys_linkat() falls back to symlinkat() when the host linkat() rejects a
+## hard link to a symlink source. APFS accepts that call directly and would
+## never exercise the fallback, so this builds a scratch Case-sensitive HFS+
+## disk image via hdiutil (same tool sysroot.c uses for --create-sysroot
+## sparsebundles) and uses it as --sysroot. Not wired into `check`: like
+## test-case-collision, disk-image creation is heavier than the plain-tmpdir
+## sysroot tests above, so this stays a standalone, manually-run target.
+## Skips (exit 0) when hdiutil/HFS+ is unavailable, or when this particular
+## volume happens to allow linkat-to-symlink directly and so cannot exercise
+## the fallback.
+test-linkat-symlink-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-linkat-symlink-fallback
+	@dmg=$$(mktemp -u).dmg; mnt=""; \
+	trap '[ -n "$$mnt" ] && hdiutil detach "$$mnt" -quiet >/dev/null 2>&1; rm -f "$$dmg"' EXIT; \
+	if ! hdiutil create -size 16m -fs "Case-sensitive HFS+" \
+	        -volname elfuselinkfb -quiet "$$dmg" >/dev/null 2>&1; then \
+		printf "$(YELLOW)SKIP$(RESET) test-linkat-symlink-fallback (hdiutil create failed)\n"; \
+		exit 0; \
+	fi; \
+	mnt=$$(hdiutil attach "$$dmg" -nobrowse | awk '/\/Volumes\//{print $$NF}'); \
+	if [ -z "$$mnt" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) test-linkat-symlink-fallback (hdiutil attach failed)\n"; \
+		exit 0; \
+	fi; \
+	sysroot="$$mnt/sysroot"; \
+	mkdir -p "$$sysroot/d1"; \
+	printf 'hello\n' > "$$sysroot/d1/target.txt"; \
+	ln -s target.txt "$$sysroot/d1/sym"; \
+	if ln -P "$$sysroot/d1/sym" "$$sysroot/d1/probe" 2>/dev/null; then \
+		rm -f "$$sysroot/d1/probe"; \
+		printf "$(YELLOW)SKIP$(RESET) test-linkat-symlink-fallback (volume allows linkat-to-symlink directly; fallback not exercised)\n"; \
+		exit 0; \
+	fi; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" $(BUILD_DIR)/test-linkat-symlink-fallback
 
 test-case-collision: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
 	@tmpdir=$$(mktemp -d); \

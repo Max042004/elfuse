@@ -2184,9 +2184,42 @@ int64_t sys_linkat(guest_t *g,
     int mac_flags = translate_at_flags(flags);
     if (linkat(olddir_ref.fd, old_tx.host_path, newdir_ref.fd, new_tx.host_path,
                mac_flags) < 0) {
-        host_fd_ref_close(&olddir_ref);
-        host_fd_ref_close(&newdir_ref);
-        return linux_errno();
+        /* Darwin's linkat(2) man page: without AT_SYMLINK_FOLLOW, hard-linking
+         * a symlink itself (rather than its target) "may result in some file
+         * systems returning an error" -- reproduced here as ENOTSUP on
+         * Case-sensitive HFS+ (EPERM has also been reported on other
+         * filesystems/macOS versions for the same condition), unlike APFS
+         * which allows it. Linux allows it unconditionally, so recreate the
+         * same effect with a plain symlink to the same target: a new
+         * directory entry that resolves identically, even though it is a
+         * distinct inode rather than a second link to the original.
+         */
+        if ((errno != EPERM && errno != ENOTSUP) ||
+            (flags & LINUX_AT_SYMLINK_FOLLOW)) {
+            host_fd_ref_close(&olddir_ref);
+            host_fd_ref_close(&newdir_ref);
+            return linux_errno();
+        }
+
+        struct stat old_st;
+        char target[LINUX_PATH_MAX];
+        ssize_t target_len;
+        if (fstatat(olddir_ref.fd, old_tx.host_path, &old_st,
+                    AT_SYMLINK_NOFOLLOW) < 0 ||
+            !S_ISLNK(old_st.st_mode) ||
+            (target_len = readlinkat(olddir_ref.fd, old_tx.host_path, target,
+                                     sizeof(target) - 1)) < 0) {
+            host_fd_ref_close(&olddir_ref);
+            host_fd_ref_close(&newdir_ref);
+            return -LINUX_EPERM;
+        }
+        target[target_len] = '\0';
+
+        if (symlinkat(target, newdir_ref.fd, new_tx.host_path) < 0) {
+            host_fd_ref_close(&olddir_ref);
+            host_fd_ref_close(&newdir_ref);
+            return linux_errno();
+        }
     }
 
     host_fd_ref_close(&olddir_ref);
