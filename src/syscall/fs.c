@@ -1017,6 +1017,109 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags)
     return newfd;
 }
 
+/* Translate a Linux struct flock (aarch64) at `arg` to macOS layout, run
+ * fcntl(host_fd, mac_cmd, ...), and for a GETLK command write the result
+ * back translated to Linux layout. Shared by the traditional (F_GETLK/
+ * F_SETLK/F_SETLKW) and OFD (F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW) lock
+ * commands, which differ only in the macOS cmd values and in how l_pid is
+ * reported back for a GETLK conflict.
+ *
+ * Linux aarch64 layout: {short l_type, short l_whence,
+ *   long l_start, long l_len, int l_pid, pad[4]}
+ * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
+ *   short l_type, short l_whence}
+ * Use guest_read/guest_write (not guest_ptr) to safely handle structs that
+ * span 2MiB page table block boundaries.
+ */
+static int64_t fcntl_flock_op(guest_t *g,
+                              host_fd_ref_t *host_ref,
+                              uint64_t arg,
+                              int mac_cmd,
+                              bool is_getlk,
+                              bool is_ofd)
+{
+    uint8_t lflock[32]; /* Linux struct flock is 32 bytes on aarch64 */
+    if (guest_read_small(g, arg, lflock, sizeof(lflock)) < 0)
+        return -LINUX_EFAULT;
+
+    int16_t l_type, l_whence;
+    int64_t l_start, l_len;
+    memcpy(&l_type, lflock + 0, 2);
+    memcpy(&l_whence, lflock + 2, 2);
+    memcpy(&l_start, lflock + 8, 8); /* offset 8 due to padding */
+    memcpy(&l_len, lflock + 16, 8);
+
+    /* l_type constants differ between Linux and macOS/BSD:
+     *   Linux: F_RDLCK=0, F_WRLCK=1, F_UNLCK=2
+     *   macOS: F_RDLCK=1, F_UNLCK=2, F_WRLCK=3
+     * Passing the Linux value straight through makes a Linux F_RDLCK (0) an
+     * invalid type on macOS, which fcntl() rejects with EINVAL. This is the
+     * lock POSIX databases (e.g. SQLite) take first, so it must map.
+     */
+    short mac_type;
+    switch (l_type) {
+    case 0: /* LINUX_F_RDLCK */
+        mac_type = F_RDLCK;
+        break;
+    case 1: /* LINUX_F_WRLCK */
+        mac_type = F_WRLCK;
+        break;
+    case 2: /* LINUX_F_UNLCK */
+        mac_type = F_UNLCK;
+        break;
+    default:
+        return -LINUX_EINVAL;
+    }
+
+    struct flock mac_fl = {
+        .l_start = l_start,
+        .l_len = l_len,
+        .l_pid = 0,
+        .l_type = mac_type,
+        .l_whence = l_whence, /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2 same */
+    };
+
+    if (fcntl(host_ref->fd, mac_cmd, &mac_fl) < 0)
+        return linux_errno();
+
+    if (!is_getlk)
+        return 0;
+
+    /* Map macOS l_type back to Linux constants (see above). */
+    int16_t rt;
+    switch (mac_fl.l_type) {
+    case F_RDLCK:
+        rt = 0; /* LINUX_F_RDLCK */
+        break;
+    case F_WRLCK:
+        rt = 1; /* LINUX_F_WRLCK */
+        break;
+    default:
+        rt = 2; /* LINUX_F_UNLCK */
+        break;
+    }
+    int16_t rw = mac_fl.l_whence;
+    int64_t rs = mac_fl.l_start, rl = mac_fl.l_len;
+    int32_t rp;
+    if (is_ofd)
+        /* OFD locks are owned by the open file description, not a single
+         * process, so Linux always reports l_pid=-1 on a conflicting
+         * F_OFD_GETLK lock instead of leaking a host PID to the guest.
+         */
+        rp = (rt == 2) ? 0 : -1;
+    else
+        rp = mac_fl.l_pid;
+    memset(lflock, 0, sizeof(lflock));
+    memcpy(lflock + 0, &rt, 2);
+    memcpy(lflock + 2, &rw, 2);
+    memcpy(lflock + 8, &rs, 8);
+    memcpy(lflock + 16, &rl, 8);
+    memcpy(lflock + 24, &rp, 4);
+    if (guest_write_small(g, arg, lflock, sizeof(lflock)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
 int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -1196,95 +1299,28 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         host_fd_ref_t host_ref;
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
-        /* Translate Linux struct flock (aarch64) to macOS struct flock. Linux
-         * aarch64 layout: {short l_type, short l_whence,
-         *   long l_start, long l_len, int l_pid, pad[4]}
-         * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
-         *   short l_type, short l_whence}
-         * Use guest_read/guest_write (not guest_ptr) to safely handle structs
-         * that span 2MiB page table block boundaries.
-         */
-        uint8_t lflock[32]; /* Linux struct flock is 32 bytes on aarch64 */
-        if (guest_read_small(g, arg, lflock, sizeof(lflock)) < 0)
-            return -LINUX_EFAULT;
-
-        /* Read Linux flock fields */
-        int16_t l_type, l_whence;
-        int64_t l_start, l_len;
-        memcpy(&l_type, lflock + 0, 2);
-        memcpy(&l_whence, lflock + 2, 2);
-        memcpy(&l_start, lflock + 8, 8); /* offset 8 due to padding */
-        memcpy(&l_len, lflock + 16, 8);
-
-        /* l_type constants differ between Linux and macOS/BSD:
-         *   Linux: F_RDLCK=0, F_WRLCK=1, F_UNLCK=2
-         *   macOS: F_RDLCK=1, F_UNLCK=2, F_WRLCK=3
-         * Passing the Linux value straight through makes a Linux F_RDLCK (0) an
-         * invalid type on macOS, which fcntl() rejects with EINVAL. This is the
-         * lock POSIX databases (e.g. SQLite) take first, so it must map.
-         */
-        short mac_type;
-        switch (l_type) {
-        case 0: /* LINUX_F_RDLCK */
-            mac_type = F_RDLCK;
-            break;
-        case 1: /* LINUX_F_WRLCK */
-            mac_type = F_WRLCK;
-            break;
-        case 2: /* LINUX_F_UNLCK */
-            mac_type = F_UNLCK;
-            break;
-        default:
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EINVAL;
-        }
-
-        struct flock mac_fl = {
-            .l_start = l_start,
-            .l_len = l_len,
-            .l_pid = 0,
-            .l_type = mac_type,
-            .l_whence = l_whence, /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2 same */
-        };
-
         int mac_cmd = (cmd == 5) ? F_GETLK : (cmd == 6) ? F_SETLK : F_SETLKW;
-        if (fcntl(host_ref.fd, mac_cmd, &mac_fl) < 0) {
-            host_fd_ref_close(&host_ref);
-            return linux_errno();
-        }
-
-        /* For F_GETLK, write back the result */
-        if (cmd == 5) {
-            /* Map macOS l_type back to Linux constants (see above). */
-            int16_t rt;
-            switch (mac_fl.l_type) {
-            case F_RDLCK:
-                rt = 0; /* LINUX_F_RDLCK */
-                break;
-            case F_WRLCK:
-                rt = 1; /* LINUX_F_WRLCK */
-                break;
-            default:
-                rt = 2; /* LINUX_F_UNLCK */
-                break;
-            }
-            int16_t rw = mac_fl.l_whence;
-            int64_t rs = mac_fl.l_start, rl = mac_fl.l_len;
-            int32_t rp = mac_fl.l_pid;
-            memset(lflock, 0, sizeof(lflock));
-            memcpy(lflock + 0, &rt, 2);
-            memcpy(lflock + 2, &rw, 2);
-            memcpy(lflock + 8, &rs, 8);
-            memcpy(lflock + 16, &rl, 8);
-            memcpy(lflock + 24, &rp, 4);
-            if (guest_write_small(g, arg, lflock, sizeof(lflock)) < 0) {
-                host_fd_ref_close(&host_ref);
-                return -LINUX_EFAULT;
-            }
-        }
+        int64_t rc =
+            fcntl_flock_op(g, &host_ref, arg, mac_cmd, cmd == 5, false);
         host_fd_ref_close(&host_ref);
-        return 0;
+        return rc;
     }
+#if defined(F_OFD_GETLK) && defined(F_OFD_SETLK) && defined(F_OFD_SETLKW)
+    case 36:   /* F_OFD_GETLK */
+    case 37:   /* F_OFD_SETLK */
+    case 38: { /* F_OFD_SETLKW */
+        host_fd_ref_t host_ref;
+        if (host_fd_ref_open(fd, &host_ref) < 0)
+            return -LINUX_EBADF;
+        int mac_cmd = (cmd == 36)   ? F_OFD_GETLK
+                      : (cmd == 37) ? F_OFD_SETLK
+                                    : F_OFD_SETLKW;
+        int64_t rc =
+            fcntl_flock_op(g, &host_ref, arg, mac_cmd, cmd == 36, true);
+        host_fd_ref_close(&host_ref);
+        return rc;
+    }
+#endif
     case 8: { /* F_SETOWN */
         /* SIGIO/SIGURG delivery owner. The arg is a signed value passed by
          * value: pid > 0 targets a process, pid < 0 targets a process group,

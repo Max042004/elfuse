@@ -47,6 +47,7 @@ test-socket
 [section] Syscall coverage tests
 test-file-ops
 test-flock
+test-ofd-lock
 test-sysinfo
 test-times
 test-io-opt
