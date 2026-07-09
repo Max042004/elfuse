@@ -875,8 +875,13 @@ static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz)
     if (path_openat2_dirfd_host_path(dirfd, host_path, sizeof(host_path)) == 0)
         return host_path_to_guest_path(host_path, out, outsz);
 
+    /* fd_snapshot already proved dirfd is open, so a valid-but-wrong-type fd
+     * (pipe, socket, epoll, ...) belongs here, not in the "bad fd" case: Linux
+     * resolves a relative path against such a dirfd with ENOTDIR, reserving
+     * EBADF for a closed or out-of-range descriptor.
+     */
     if (snap.type != FD_DIR) {
-        errno = EBADF;
+        errno = ENOTDIR;
         return -1;
     }
 

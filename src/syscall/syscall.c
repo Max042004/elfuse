@@ -1944,6 +1944,14 @@ static int64_t sc_openat2(guest_t *g,
         if (guest_read_str(g, x1, path, sizeof(path)) < 0)
             return -LINUX_EFAULT;
 
+        /* openat2() has no AT_EMPTY_PATH equivalent in how.flags, so an empty
+         * pathname is always ENOENT. Without this, RESOLVE_IN_ROOT's "."
+         * substitution for an empty path (see path_openat2_normalize_in_root)
+         * would resolve to dirfd itself and let the open succeed.
+         */
+        if (path[0] == '\0')
+            return -LINUX_ENOENT;
+
         if ((resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)) &&
             path_openat2_is_fd_magiclink_anchor((int) x0, path))
             return -LINUX_ELOOP;

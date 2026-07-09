@@ -1289,6 +1289,58 @@ static void test_mmap_low_hint_exact(void)
     munmap(p, len);
 }
 
+/* A dirfd that is open but not a directory (and has no host-nameable path,
+ * e.g. a pipe) must resolve a relative path with ENOTDIR, not EBADF: the fd
+ * itself is valid, it just cannot anchor a lookup. Issue #133.
+ */
+static void test_openat2_resolve_no_xdev_non_directory_dirfd_rejects_enotdir(
+    void)
+{
+    TEST("openat2 RESOLVE_NO_XDEV non-directory dirfd rejects ENOTDIR");
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        FAIL("pipe");
+        return;
+    }
+    close(pipefd[1]);
+
+    struct open_how how = {
+        .flags = O_RDONLY, .mode = 0, .resolve = RESOLVE_NO_XDEV};
+    long fd = syscall(SYS_openat2, pipefd[0], "relative", &how, sizeof(how));
+    close(pipefd[0]);
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("expected ENOTDIR, openat2 unexpectedly succeeded");
+        return;
+    }
+    EXPECT_TRUE(errno == ENOTDIR, "wrong errno");
+}
+
+/* openat2() has no AT_EMPTY_PATH equivalent, so an empty pathname must always
+ * fail ENOENT -- even under RESOLVE_IN_ROOT, whose "." substitution for the
+ * empty-path case could otherwise resolve to dirfd itself. Issue #133.
+ */
+static void test_openat2_empty_path_rejects_enoent(void)
+{
+    TEST("openat2 empty path rejects ENOENT under RESOLVE_IN_ROOT");
+    int dirfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (dirfd < 0) {
+        FAIL("open /tmp");
+        return;
+    }
+
+    struct open_how how = {
+        .flags = O_RDONLY, .mode = 0, .resolve = RESOLVE_IN_ROOT};
+    long fd = syscall(SYS_openat2, dirfd, "", &how, sizeof(how));
+    close(dirfd);
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("expected ENOENT, openat2 unexpectedly succeeded");
+        return;
+    }
+    EXPECT_TRUE(errno == ENOENT, "wrong errno");
+}
+
 int main(void)
 {
     printf("Linux syscall fidelity tests:\n");
@@ -1332,6 +1384,8 @@ int main(void)
     test_openat2_resolve_no_xdev_rejects_dev_fd_magiclink();
     test_openat2_rejects_dev_fd_magiclink_variants();
     test_openat2_resolve_no_xdev_rejects_normalized_proc_fd_magiclink();
+    test_openat2_resolve_no_xdev_non_directory_dirfd_rejects_enotdir();
+    test_openat2_empty_path_rejects_enoent();
 
     /* O_PATH */
     test_opath_read_fails();
