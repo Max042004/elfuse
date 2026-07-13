@@ -1483,6 +1483,25 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
 
 /* Syscall entry point. */
 
+static bool futex_cmd_supported(int cmd)
+{
+    switch (cmd) {
+    case FUTEX_WAIT:
+    case FUTEX_WAKE:
+    case FUTEX_REQUEUE:
+    case FUTEX_CMP_REQUEUE:
+    case FUTEX_WAKE_OP:
+    case FUTEX_WAIT_BITSET:
+    case FUTEX_WAKE_BITSET:
+    case FUTEX_LOCK_PI:
+    case FUTEX_UNLOCK_PI:
+    case FUTEX_TRYLOCK_PI:
+        return true;
+    default:
+        return false;
+    }
+}
+
 int64_t sys_futex(guest_t *g,
                   uint64_t uaddr,
                   int op,
@@ -1492,6 +1511,23 @@ int64_t sys_futex(guest_t *g,
                   uint32_t val3)
 {
     int cmd = op & FUTEX_CMD_MASK;
+
+    /* Reject unsupported commands (robust futexes, PI requeue) before the
+     * pre-fault below, so an invalid op never materializes guest memory as a
+     * side effect.
+     */
+    if (!futex_cmd_supported(cmd))
+        return -LINUX_ENOSYS;
+
+    /* Pre-fault lazy mappings before any bucket lock is taken. The word
+     * resolves below run under per-bucket locks, which rank after mmap_lock;
+     * materializing there would invert the lock order. A futex word in a
+     * mapping the guest never touched reads as zero, matching Linux.
+     */
+    guest_lazy_faultin(g, uaddr, sizeof(uint32_t));
+    if (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE ||
+        cmd == FUTEX_WAKE_OP)
+        guest_lazy_faultin(g, uaddr2, sizeof(uint32_t));
 
     switch (cmd) {
     case FUTEX_WAIT:
@@ -1734,6 +1770,11 @@ int64_t sys_futex_waitv(guest_t *g,
          */
         if (!futex_uaddr_is_aligned(elts[i].uaddr))
             return -LINUX_EINVAL;
+        /* Pre-fault lazy mappings: the word resolves below run with every
+         * bucket lock held, where materializing would invert the lock order
+         * against mmap_lock.
+         */
+        guest_lazy_faultin(g, elts[i].uaddr, sizeof(uint32_t));
     }
 
     waitv_shared_t shared;

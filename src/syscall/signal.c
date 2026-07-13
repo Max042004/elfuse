@@ -1144,6 +1144,17 @@ int64_t signal_rt_sigaction(guest_t *g,
 
     int idx = signum - 1;
 
+    /* Pre-fault act/oldact before sig_lock is taken. guest_read_small/
+     * guest_write_small fall back to a lazy fault-in that acquires mmap_lock
+     * when the fast walk misses; doing that under sig_lock would invert the
+     * documented lock order (syscall/internal.h ranks mmap_lock before
+     * sig_lock). Same rationale as signal_prefault_frame.
+     */
+    if (act_gva)
+        guest_lazy_faultin(g, act_gva, sizeof(linux_sigaction_t));
+    if (oldact_gva)
+        guest_lazy_faultin(g, oldact_gva, sizeof(linux_sigaction_t));
+
     pthread_mutex_lock(&sig_lock);
 
     /* Return old action if requested */
@@ -1192,6 +1203,12 @@ int64_t signal_rt_sigprocmask(guest_t *g,
 {
     if (sigsetsize != 8)
         return -LINUX_EINVAL;
+
+    /* Pre-fault set/oldset before sig_lock; see signal_rt_sigaction. */
+    if (set_gva)
+        guest_lazy_faultin(g, set_gva, sizeof(uint64_t));
+    if (oldset_gva)
+        guest_lazy_faultin(g, oldset_gva, sizeof(uint64_t));
 
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
@@ -1748,8 +1765,35 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     return 1;
 }
 
+/* Pre-fault the candidate signal-frame windows (current stack and altstack
+ * top) before sig_lock is taken. The frame write in deliver_signal_locked
+ * runs under sig_lock; letting it materialize lazy stack pages there would
+ * acquire mmap_lock in descending lock order. The pre-fault is advisory --
+ * the write path still faults in as a backstop -- but it makes the
+ * under-lock engagement unreachable in practice. Reading the altstack
+ * fields without sig_lock is benign for the same reason.
+ */
+static void signal_prefault_frame(hv_vcpu_t vcpu, guest_t *g)
+{
+    uint64_t need = sizeof(linux_rt_sigframe_t) + 512;
+    uint64_t sp = 0;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp);
+    if (sp > need && sp <= g->guest_size)
+        guest_lazy_faultin(g, sp - need, need);
+    thread_entry_t *thr = current_thread;
+    if (thr && thr->altstack_sp != 0 &&
+        !(thr->altstack_flags & LINUX_SS_DISABLE) &&
+        thr->altstack_size >= sizeof(linux_rt_sigframe_t)) {
+        uint64_t alt_need =
+            thr->altstack_size < need ? thr->altstack_size : need;
+        guest_lazy_faultin(g, thr->altstack_sp + thr->altstack_size - alt_need,
+                           alt_need);
+    }
+}
+
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 {
+    signal_prefault_frame(vcpu, g);
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
     /* Consider this thread's private (thread-directed) set plus the shared
@@ -1811,6 +1855,7 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
      * threads faulting on the same signal collapse into one bit so one fault is
      * lost. Deliver directly here, never touching sig_state.pending.
      */
+    signal_prefault_frame(vcpu, g);
     pthread_mutex_lock(&sig_lock);
 
     /* Linux force_sig_info_to_task(): a forced synchronous fault cannot be

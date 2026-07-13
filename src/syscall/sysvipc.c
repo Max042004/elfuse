@@ -253,7 +253,19 @@ int64_t sys_shmat(guest_t *g, int shmid, uint64_t shmaddr_gva, int shmflg)
         return gva; /* propagate mmap error */
     }
 
-    /* Copy host shm content into guest memory */
+    /* Copy host shm content into guest memory. sys_shmat runs under
+     * mmap_lock (SC_LOCKED), so the resolve-time lazy fault-in inside
+     * guest_write would self-deadlock on it; materialize the fresh anonymous
+     * mapping through the locked variant first. The mapping was just created
+     * lazy above, so a failure here is a genuine materialization failure, not
+     * a "not lazy" no-op; entering guest_write anyway would retry the same
+     * fault-in through its unlocked path and re-acquire this already-held
+     * lock.
+     */
+    if (guest_lazy_faultin_locked(g, (uint64_t) gva, seg_size) < 0) {
+        shmdt(host_addr);
+        return -LINUX_EFAULT;
+    }
     if (guest_write(g, (uint64_t) gva, host_addr, seg_size) < 0) {
         shmdt(host_addr);
         return -LINUX_EFAULT;
@@ -312,8 +324,15 @@ int64_t sys_shmdt(guest_t *g, uint64_t shmaddr_gva)
 
     /* Write back guest modifications to host shm (unless read-only) */
     if (!entry.rdonly) {
-        /* Read guest memory back to host shm buffer */
-        guest_read(g, entry.guest_gva, entry.host_addr, entry.size);
+        /* Read guest memory back to host shm buffer. Same SC_LOCKED
+         * self-deadlock hazard as the shmat copy-in: pages the guest never
+         * touched may still be unmaterialized. If materialization genuinely
+         * fails, skip the copy instead of entering guest_read, which would
+         * retry the same fault-in through its unlocked path and re-acquire
+         * this already-held lock.
+         */
+        if (guest_lazy_faultin_locked(g, entry.guest_gva, entry.size) == 0)
+            guest_read(g, entry.guest_gva, entry.host_addr, entry.size);
     }
 
     /* Detach host shm */
