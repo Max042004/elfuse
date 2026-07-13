@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <ctype.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -913,6 +914,9 @@ static int64_t proc_try_writev_intercept(int fd,
                                          int64_t offset,
                                          int use_pwrite)
 {
+    if (!proc_intercept_write_candidate(fd))
+        return INT64_MIN;
+
     size_t total = 0;
     char stack_buf[256];
     char *buf = stack_buf;
@@ -931,7 +935,8 @@ static int64_t proc_try_writev_intercept(int fd,
 
     size_t off = 0;
     for (int i = 0; i < iovcnt; i++) {
-        memcpy(buf + off, iov[i].iov_base, iov[i].iov_len);
+        if (iov[i].iov_len)
+            memcpy(buf + off, iov[i].iov_base, iov[i].iov_len);
         off += iov[i].iov_len;
     }
 
@@ -974,30 +979,19 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (count == 0)
         return io_return_zero(&host_ref);
 
-    /* Resolve buffer and cap count to available contiguous guest bytes.
-     * guest_ptr_avail returns the host pointer and remaining bytes in the
-     * current region. This prevents host write() from reading past the guest
-     * buffer boundary.
-     */
-    uint64_t avail = 0;
-    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_R, count);
-    if (!buf) {
+    host_iov_buf_t source;
+    err = host_iov_prepare_read_range(g, buf_gva, count, &source);
+    if (err < 0) {
         host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
+        return err;
     }
-    if (count > avail)
-        count = avail;
 
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
-        ssize_t intercepted = 0;
-        int handled = proc_intercept_write(fd, host_ref.fd, buf, count, offset,
-                                           0, &intercepted);
-        if (handled < 0) {
-            host_fd_ref_close(&host_ref);
-            return linux_errno();
-        }
-        if (handled > 0) {
+        int64_t intercepted = proc_try_writev_intercept(
+            fd, host_ref.fd, source.iov, source.iovcnt, offset, 0);
+        if (intercepted != INT64_MIN) {
+            host_iov_free(&source);
             host_fd_ref_close(&host_ref);
             return intercepted;
         }
@@ -1012,11 +1006,13 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     int64_t wwait = io_block_wait(fd, host_ref.fd, POLLOUT);
     if (wwait < 0) {
+        host_iov_free(&source);
         host_fd_ref_close(&host_ref);
         return wwait;
     }
 
-    ssize_t ret = write(host_ref.fd, buf, count);
+    ssize_t ret = writev(host_ref.fd, source.iov, source.iovcnt);
+    host_iov_free(&source);
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
 }
@@ -1056,23 +1052,55 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (count == 0)
         return io_return_zero(&host_ref);
 
-    /* Resolve buffer and cap count to available contiguous guest bytes.
-     * Prevents host read() from writing past the guest buffer boundary.
-     */
-    uint64_t avail = 0;
-    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_W, count);
-    if (!buf) {
+    /* Validate the writable VMA prefix without walking/materializing lazy PTEs.
+     * The host read below may return EOF, EINTR, or only a few bytes; resolving
+     * the destination directly with count would eagerly COW the whole request
+     * before knowing how much data exists. mmap_lock makes the region snapshot
+     * safe; a concurrent mapping change after unlock has the same user-buffer
+     * race Linux permits around copy_to_user. */
+    uint64_t writable = 0;
+    pthread_mutex_lock(&mmap_lock);
+    while (writable < count) {
+        uint64_t cur = buf_gva + writable;
+        if (cur < buf_gva)
+            break;
+        const guest_region_t *r = guest_region_find(g, cur);
+        if (!r || !(r->prot & LINUX_PROT_WRITE))
+            break;
+        uint64_t chunk = r->end - cur;
+        if (chunk > count - writable)
+            chunk = count - writable;
+        writable += chunk;
+    }
+    pthread_mutex_unlock(&mmap_lock);
+    if (writable == 0) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EFAULT;
     }
-    if (count > avail)
-        count = avail;
+    count = writable;
+
+    uint8_t stack_stage[16384];
+    void *stage = stack_stage;
+    bool mapped_stage = count > sizeof(stack_stage);
+    if (mapped_stage) {
+        stage = mmap(NULL, (size_t) count, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (stage == MAP_FAILED) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_ENOMEM;
+        }
+    }
 
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
         int64_t intercepted =
-            proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 0);
+            proc_try_read_intercept(fd, host_ref.fd, stage, count, offset, 0);
         if (intercepted != INT64_MIN) {
+            if (intercepted > 0 &&
+                guest_write(g, buf_gva, stage, (size_t) intercepted) < 0)
+                intercepted = -LINUX_EFAULT;
+            if (mapped_stage)
+                munmap(stage, (size_t) count);
             host_fd_ref_close(&host_ref);
             return intercepted;
         }
@@ -1083,11 +1111,17 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     int64_t rwait = io_block_wait(fd, host_ref.fd, POLLIN);
     if (rwait < 0) {
+        if (mapped_stage)
+            munmap(stage, (size_t) count);
         host_fd_ref_close(&host_ref);
         return rwait;
     }
 
-    ssize_t ret = read(host_ref.fd, buf, count);
+    ssize_t ret = read(host_ref.fd, stage, (size_t) count);
+    if (ret > 0 && guest_write(g, buf_gva, stage, (size_t) ret) < 0)
+        ret = -1, errno = EFAULT;
+    if (mapped_stage)
+        munmap(stage, (size_t) count);
     host_fd_ref_close(&host_ref);
     return ret < 0 ? linux_errno() : ret;
 }
@@ -1146,28 +1180,23 @@ int64_t sys_pwrite64(guest_t *g,
     if (count == 0)
         return io_return_zero(&host_ref);
 
-    uint64_t avail = 0;
-    void *buf = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_R, count);
-    if (!buf) {
+    host_iov_buf_t source;
+    err = host_iov_prepare_read_range(g, buf_gva, count, &source);
+    if (err < 0) {
         host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
+        return err;
     }
-    if (count > avail)
-        count = avail;
 
-    ssize_t intercepted = 0;
-    int handled = proc_intercept_write(fd, host_ref.fd, buf, count, offset, 1,
-                                       &intercepted);
-    if (handled < 0) {
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
-    if (handled > 0) {
+    int64_t intercepted = proc_try_writev_intercept(fd, host_ref.fd, source.iov,
+                                                    source.iovcnt, offset, 1);
+    if (intercepted != INT64_MIN) {
+        host_iov_free(&source);
         host_fd_ref_close(&host_ref);
         return intercepted;
     }
 
-    ssize_t ret = pwrite(host_ref.fd, buf, count, offset);
+    ssize_t ret = pwritev(host_ref.fd, source.iov, source.iovcnt, offset);
+    host_iov_free(&source);
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
 }
@@ -1179,10 +1208,118 @@ int64_t sys_pwrite64(guest_t *g,
  *                 MEM_PERM_R for writev (host reads from guest buffers).
  * Returns 0 on success, -LINUX_EFAULT on bad guest pointer.
  */
+static void host_iov_init(host_iov_buf_t *buf)
+{
+    buf->iov = buf->stack;
+    buf->heap = NULL;
+    buf->bounce = NULL;
+    buf->iovcnt = 0;
+    buf->capacity = SYSCALL_IOV_STACK_MAX;
+}
+
+static void *host_iov_alloc_bounce(host_iov_buf_t *buf, size_t length)
+{
+    void *bounce = malloc(length);
+    if (!bounce)
+        return NULL;
+    free(buf->heap);
+    buf->heap = NULL;
+    buf->bounce = bounce;
+    buf->iov = buf->stack;
+    buf->iov[0] = (struct iovec) {.iov_base = bounce, .iov_len = length};
+    buf->iovcnt = 1;
+    buf->capacity = SYSCALL_IOV_STACK_MAX;
+    return bounce;
+}
+
+#define HOST_ZERO_SOURCE_SIZE (1U << 20)
+static pthread_once_t host_zero_source_once = PTHREAD_ONCE_INIT;
+static void *host_zero_source;
+
+static void host_zero_source_init(void)
+{
+    void *p = mmap(NULL, HOST_ZERO_SOURCE_SIZE, PROT_READ,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p != MAP_FAILED)
+        host_zero_source = p;
+}
+
+static bool is_guest_zero_page_ptr(const guest_t *g, const void *ptr)
+{
+    uintptr_t zero = (uintptr_t) g->host_base + g->lazy_zero_gpa;
+    uintptr_t p = (uintptr_t) ptr;
+    return p >= zero && p < zero + GUEST_PAGE_SIZE;
+}
+
+/* Resolve one readable source chunk. Consecutive COW-zero aliases all point at
+ * the same 4 KiB GPA, so the generic contiguity walker stops at every page.
+ * Verify those pages one by one, then represent up to 1 MiB of the logical run
+ * with a process-global zero buffer. This preserves guest laziness while
+ * keeping large untouched ranges well below the host IOV_MAX limit. */
+static int resolve_host_read_chunk(guest_t *g,
+                                   uint64_t gva,
+                                   uint64_t remaining,
+                                   void **base_out,
+                                   uint64_t *length_out)
+{
+    uint64_t avail = 0;
+    void *base = guest_ptr_bound(g, gva, &avail, MEM_PERM_R, remaining);
+    if (!base)
+        return -1;
+    uint64_t length = remaining < avail ? remaining : avail;
+    if (is_guest_zero_page_ptr(g, base)) {
+        pthread_once(&host_zero_source_once, host_zero_source_init);
+        if (!host_zero_source) {
+            *base_out = base;
+            *length_out = length;
+            return 0;
+        }
+        uint64_t cap = remaining < HOST_ZERO_SOURCE_SIZE
+                           ? remaining
+                           : HOST_ZERO_SOURCE_SIZE;
+        while (length < cap) {
+            uint64_t next_avail = 0;
+            void *next = guest_ptr_bound(g, gva + length, &next_avail,
+                                         MEM_PERM_R, cap - length);
+            if (!next || !is_guest_zero_page_ptr(g, next))
+                break;
+            uint64_t add =
+                cap - length < next_avail ? cap - length : next_avail;
+            length += add;
+        }
+        base = host_zero_source;
+    }
+    *base_out = base;
+    *length_out = length;
+    return 0;
+}
+
+static int host_iov_append(host_iov_buf_t *buf, void *base, size_t length)
+{
+    if (buf->iovcnt == buf->capacity) {
+        if (buf->capacity >= SYSCALL_IOV_MAX)
+            return 1; /* representable prefix; host syscall returns short */
+        int next = buf->capacity * 2;
+        if (next > SYSCALL_IOV_MAX)
+            next = SYSCALL_IOV_MAX;
+        struct iovec *grown = malloc((size_t) next * sizeof(*grown));
+        if (!grown)
+            return -1;
+        memcpy(grown, buf->iov, (size_t) buf->iovcnt * sizeof(*grown));
+        free(buf->heap);
+        buf->heap = grown;
+        buf->iov = grown;
+        buf->capacity = next;
+    }
+    buf->iov[buf->iovcnt++] =
+        (struct iovec) {.iov_base = base, .iov_len = length};
+    return 0;
+}
+
 static int64_t build_host_iov(guest_t *g,
                               uint64_t iov_gva,
                               int iovcnt,
-                              struct iovec *host_iov,
+                              host_iov_buf_t *buf,
                               int required_perms)
 {
     linux_iovec_t stack_giov[SYSCALL_IOV_STACK_MAX];
@@ -1199,37 +1336,81 @@ static int64_t build_host_iov(guest_t *g,
         free(heap);
         return -LINUX_EFAULT;
     }
+    bool needs_bounce = false;
     for (int i = 0; i < iovcnt; i++) {
         if (guest_iov[i].iov_len == 0) {
-            host_iov[i].iov_base = NULL;
-            host_iov[i].iov_len = 0;
+            if (host_iov_append(buf, NULL, 0) < 0) {
+                free(heap);
+                return -LINUX_ENOMEM;
+            }
             continue;
         }
-        uint64_t avail = 0;
-        void *base = guest_ptr_bound(g, guest_iov[i].iov_base, &avail,
-                                     required_perms, guest_iov[i].iov_len);
-        if (!base) {
-            free(heap);
-            return -LINUX_EFAULT;
-        }
-        /* Cap to contiguous permitted bytes. When the guest iov entry spans a
-         * non-contiguous boundary (different mapping or permission), zero every
-         * subsequent host iov length so the host readv/writev returns a
-         * POSIX-compliant short I/O rather than silently packing the truncated
-         * tail of buffer i into buffer i+1 -- which corrupts the guest's data
-         * layout.
-         */
-        uint64_t len = guest_iov[i].iov_len;
-        host_iov[i].iov_base = base;
-        if (len > avail) {
-            host_iov[i].iov_len = avail;
-            for (int j = i + 1; j < iovcnt; j++) {
-                host_iov[j].iov_base = NULL;
-                host_iov[j].iov_len = 0;
+        uint64_t cur = guest_iov[i].iov_base;
+        uint64_t remaining = guest_iov[i].iov_len;
+        while (remaining > 0) {
+            uint64_t chunk;
+            void *base;
+            if (required_perms == MEM_PERM_R) {
+                if (resolve_host_read_chunk(g, cur, remaining, &base, &chunk) <
+                    0) {
+                    free(heap);
+                    return -LINUX_EFAULT;
+                }
+            } else {
+                uint64_t avail = 0;
+                base =
+                    guest_ptr_bound(g, cur, &avail, required_perms, remaining);
+                if (!base) {
+                    free(heap);
+                    return -LINUX_EFAULT;
+                }
+                chunk = remaining < avail ? remaining : avail;
             }
-            break;
+            if (!base) {
+                free(heap);
+                return -LINUX_EFAULT;
+            }
+            int append = host_iov_append(buf, base, (size_t) chunk);
+            if (append < 0) {
+                free(heap);
+                return -LINUX_ENOMEM;
+            }
+            if (append > 0) {
+                needs_bounce = true;
+                break;
+            }
+            cur += chunk;
+            remaining -= chunk;
+            if (required_perms != MEM_PERM_R)
+                break;
         }
-        host_iov[i].iov_len = len;
+        if (remaining > 0)
+            break;
+    }
+    if (needs_bounce) {
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            if (guest_iov[i].iov_len > (uint64_t) SSIZE_MAX - total) {
+                free(heap);
+                return -LINUX_EINVAL;
+            }
+            total += (size_t) guest_iov[i].iov_len;
+        }
+        uint8_t *bounce = host_iov_alloc_bounce(buf, total);
+        if (!bounce) {
+            free(heap);
+            return -LINUX_ENOMEM;
+        }
+        size_t copied = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            size_t len = (size_t) guest_iov[i].iov_len;
+            if (len && guest_read(g, guest_iov[i].iov_base, bounce + copied,
+                                  len) < 0) {
+                free(heap);
+                return -LINUX_EFAULT;
+            }
+            copied += len;
+        }
     }
     free(heap);
     return 0;
@@ -1241,24 +1422,14 @@ int64_t host_iov_prepare(guest_t *g,
                          int required_perms,
                          host_iov_buf_t *buf)
 {
-    buf->iov = buf->stack;
-    buf->heap = NULL;
+    host_iov_init(buf);
 
     if (iovcnt <= 0 || iovcnt > SYSCALL_IOV_MAX)
         return -LINUX_EINVAL;
 
-    if (iovcnt > SYSCALL_IOV_STACK_MAX) {
-        buf->heap = malloc((size_t) iovcnt * sizeof(*buf->iov));
-        if (!buf->heap)
-            return -LINUX_ENOMEM;
-        buf->iov = buf->heap;
-    }
-
-    int64_t err = build_host_iov(g, iov_gva, iovcnt, buf->iov, required_perms);
+    int64_t err = build_host_iov(g, iov_gva, iovcnt, buf, required_perms);
     if (err < 0) {
-        free(buf->heap);
-        buf->heap = NULL;
-        buf->iov = NULL;
+        host_iov_free(buf);
         return err;
     }
 
@@ -1272,18 +1443,66 @@ int64_t host_iov_prepare_msg(guest_t *g,
                              host_iov_buf_t *buf)
 {
     if (iovcnt == 0) {
-        buf->iov = buf->stack;
-        buf->heap = NULL;
+        host_iov_init(buf);
         return 0;
     }
     return host_iov_prepare(g, iov_gva, iovcnt, required_perms, buf);
 }
 
+int64_t host_iov_prepare_read_range(guest_t *g,
+                                    uint64_t gva,
+                                    uint64_t length,
+                                    host_iov_buf_t *buf)
+{
+    host_iov_init(buf);
+    if (length == 0)
+        return 0;
+    uint64_t cur = gva, remaining = length;
+    bool needs_bounce = false;
+    while (remaining > 0) {
+        uint64_t chunk;
+        void *base;
+        if (resolve_host_read_chunk(g, cur, remaining, &base, &chunk) < 0)
+            return -LINUX_EFAULT;
+        int append = host_iov_append(buf, base, (size_t) chunk);
+        if (append < 0) {
+            host_iov_free(buf);
+            return -LINUX_ENOMEM;
+        }
+        if (append > 0) {
+            needs_bounce = true;
+            break;
+        }
+        cur += chunk;
+        remaining -= chunk;
+    }
+    if (needs_bounce) {
+        if (length > SSIZE_MAX) {
+            host_iov_free(buf);
+            return -LINUX_EINVAL;
+        }
+        void *bounce = host_iov_alloc_bounce(buf, (size_t) length);
+        if (!bounce) {
+            host_iov_free(buf);
+            return -LINUX_ENOMEM;
+        }
+        if (guest_read(g, gva, bounce, (size_t) length) < 0) {
+            host_iov_free(buf);
+            return -LINUX_EFAULT;
+        }
+    }
+    return 0;
+}
+
 void host_iov_free(host_iov_buf_t *buf)
 {
     free(buf->heap);
+    free(buf->bounce);
     buf->heap = NULL;
+    buf->bounce = NULL;
     buf->iov = NULL;
+    buf->iovcnt = 0;
+    buf->capacity = 0;
 }
 
 static int64_t single_guest_iov(guest_t *g,
@@ -1384,7 +1603,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_W, &host_iov);
         if (err < 0)
             return err;
-        int64_t ret = urandom_fill_iov(fd, host_iov.iov, iovcnt);
+        int64_t ret = urandom_fill_iov(fd, host_iov.iov, host_iov.iovcnt);
         host_iov_free(&host_iov);
         /* Mirror sys_read's slow-path refill so a readv consumer that drains
          * the shim ring leaves it ready for the next call, instead of forcing
@@ -1418,7 +1637,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         host_fd_ref_close(&host_ref);
         return err;
     }
-    if (!host_iov_has_payload(&host_iov, iovcnt)) {
+    if (!host_iov_has_payload(&host_iov)) {
         err = io_check_access(host_ref.fd, POLLIN);
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
@@ -1428,7 +1647,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
         int64_t intercepted = proc_try_readv_intercept(
-            fd, host_ref.fd, host_iov.iov, iovcnt, offset, 0);
+            fd, host_ref.fd, host_iov.iov, host_iov.iovcnt, offset, 0);
         if (intercepted != INT64_MIN) {
             host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
@@ -1443,7 +1662,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         return rwait;
     }
 
-    ssize_t ret = readv(host_ref.fd, host_iov.iov, iovcnt);
+    ssize_t ret = readv(host_ref.fd, host_iov.iov, host_iov.iovcnt);
     int64_t result = ret < 0 ? linux_errno() : ret;
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -1487,7 +1706,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         host_fd_ref_close(&host_ref);
         return err;
     }
-    if (!host_iov_has_payload(&host_iov, iovcnt)) {
+    if (!host_iov_has_payload(&host_iov)) {
         err = io_check_access(host_ref.fd, POLLOUT);
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
@@ -1497,7 +1716,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
         int64_t intercepted = proc_try_writev_intercept(
-            fd, host_ref.fd, host_iov.iov, iovcnt, offset, 0);
+            fd, host_ref.fd, host_iov.iov, host_iov.iovcnt, offset, 0);
         if (intercepted != INT64_MIN) {
             host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
@@ -1512,7 +1731,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         return wwait;
     }
 
-    ssize_t ret = writev(host_ref.fd, host_iov.iov, iovcnt);
+    ssize_t ret = writev(host_ref.fd, host_iov.iov, host_iov.iovcnt);
     int64_t result = io_write_result(ret);
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -1555,14 +1774,14 @@ int64_t sys_preadv(guest_t *g,
     }
 
     int64_t intercepted = proc_try_readv_intercept(
-        fd, host_ref.fd, host_iov.iov, iovcnt, offset, 1);
+        fd, host_ref.fd, host_iov.iov, host_iov.iovcnt, offset, 1);
     if (intercepted != INT64_MIN) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return intercepted;
     }
 
-    ssize_t ret = preadv(host_ref.fd, host_iov.iov, iovcnt, offset);
+    ssize_t ret = preadv(host_ref.fd, host_iov.iov, host_iov.iovcnt, offset);
     int64_t result = ret < 0 ? linux_errno() : ret;
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -1602,14 +1821,14 @@ int64_t sys_pwritev(guest_t *g,
     }
 
     int64_t intercepted = proc_try_writev_intercept(
-        fd, host_ref.fd, host_iov.iov, iovcnt, offset, 1);
+        fd, host_ref.fd, host_iov.iov, host_iov.iovcnt, offset, 1);
     if (intercepted != INT64_MIN) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return intercepted;
     }
 
-    ssize_t ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, offset);
+    ssize_t ret = pwritev(host_ref.fd, host_iov.iov, host_iov.iovcnt, offset);
     int64_t result = io_write_result(ret);
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -1639,14 +1858,15 @@ static int64_t sys_pwritev_append(guest_t *g,
         if (lseek(host_ref.fd, 0, SEEK_END) < 0) {
             ret = -1;
         } else {
-            ret = writev(host_ref.fd, host_iov.iov, iovcnt);
+            ret = writev(host_ref.fd, host_iov.iov, host_iov.iovcnt);
         }
     } else {
         struct stat st;
         if (fstat(host_ref.fd, &st) < 0) {
             ret = -1;
         } else {
-            ret = pwritev(host_ref.fd, host_iov.iov, iovcnt, st.st_size);
+            ret =
+                pwritev(host_ref.fd, host_iov.iov, host_iov.iovcnt, st.st_size);
         }
     }
 
@@ -2650,26 +2870,28 @@ int64_t sys_vmsplice(guest_t *g,
 
         if (liov.iov_len == 0)
             continue;
-        uint64_t avail = 0;
-        void *src =
-            guest_ptr_bound(g, liov.iov_base, &avail, MEM_PERM_R, liov.iov_len);
-        if (!src)
+        host_iov_buf_t source;
+        int64_t source_err = host_iov_prepare_read_range(g, liov.iov_base,
+                                                         liov.iov_len, &source);
+        if (source_err < 0)
             return host_fd_ref_close(&host_ref),
-                   (total > 0 ? (int64_t) total : -LINUX_EFAULT);
-        uint64_t len = liov.iov_len;
-        if (len > avail)
-            len = avail;
+                   (total > 0 ? (int64_t) total : source_err);
 
-        ssize_t w = write(host_ref.fd, src, len);
+        ssize_t w = writev(host_ref.fd, source.iov, source.iovcnt);
         if (w < 0) {
+            host_iov_free(&source);
             if (errno == EPIPE)
                 signal_queue(LINUX_SIGPIPE);
             err = total > 0 ? (int64_t) total : linux_errno();
             host_fd_ref_close(&host_ref);
             return err;
         }
+        size_t requested = 0;
+        for (int j = 0; j < source.iovcnt; j++)
+            requested += source.iov[j].iov_len;
+        host_iov_free(&source);
         total += w;
-        if ((uint64_t) w < len)
+        if ((size_t) w < requested)
             break;
     }
 

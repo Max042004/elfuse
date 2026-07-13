@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -163,6 +164,25 @@ tcp_done:;
             EXPECT_TRUE(!strcmp(buf, msg), "data mismatch");
         } else
             FAIL("recvfrom failed");
+
+        TEST("UDP sendto untouched lazy buffer");
+        size_t lazy_len = 8192;
+        unsigned char *lazy = mmap(NULL, lazy_len, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        unsigned char received[8192];
+        bool lazy_ok = lazy != MAP_FAILED;
+        if (lazy_ok) {
+            sent = sendto(sock, lazy, lazy_len, 0, (struct sockaddr *) &addr,
+                          sizeof(addr));
+            n = sent == (ssize_t) lazy_len
+                    ? recvfrom(sock, received, sizeof(received), 0, NULL, NULL)
+                    : -1;
+            lazy_ok = n == (ssize_t) lazy_len;
+            for (size_t i = 0; lazy_ok && i < lazy_len; i++)
+                lazy_ok = received[i] == 0;
+            munmap(lazy, lazy_len);
+        }
+        EXPECT_TRUE(lazy_ok, "sendto stopped at shared-zero GPA boundary");
 
         close(sock);
     }

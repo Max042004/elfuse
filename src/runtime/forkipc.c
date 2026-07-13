@@ -282,6 +282,14 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
+    /* The snapshot may carry PTEs a parent-side COW materializer had claimed
+     * but not yet published; no owner exists in this process to finish them,
+     * so any first touch would wait on the descriptor forever. Needs the
+     * region table restored just above to rebuild window-descriptor
+     * attributes.
+     */
+    guest_reset_orphaned_cow_claims(&g);
+
     if (chown_overlay_recv(ipc_fd) < 0) {
         log_error("fork-child: failed to receive chown overlay");
         guest_destroy(&g);
@@ -818,8 +826,8 @@ static void *thread_create_and_run(void *arg)
      * hv_vcpus_exit. Consume it under the same lock and self-kick below so the
      * first hv_vcpu_run returns CANCELED into the ptrace-stop path.
      */
-    bool ptrace_interrupt = t->ptrace_interrupt_pending;
-    t->ptrace_interrupt_pending = false;
+    bool ptrace_interrupt = __atomic_exchange_n(
+        &t->ptrace_interrupt_pending, false, __ATOMIC_ACQ_REL);
     pthread_mutex_unlock(tlock);
     if (ptrace_interrupt)
         hv_vcpus_exit(&vcpu, 1);
@@ -1182,8 +1190,8 @@ static void *vm_clone_thread_run(void *arg)
     /* Deliver a PTRACE_INTERRUPT that raced bring-up; see
      * thread_create_and_run. vm-clone children are the usual ptrace targets.
      */
-    bool ptrace_interrupt = t->ptrace_interrupt_pending;
-    t->ptrace_interrupt_pending = false;
+    bool ptrace_interrupt = __atomic_exchange_n(
+        &t->ptrace_interrupt_pending, false, __ATOMIC_ACQ_REL);
     pthread_mutex_unlock(tlock);
     if (ptrace_interrupt)
         hv_vcpus_exit(&vcpu, 1);

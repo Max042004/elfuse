@@ -289,7 +289,9 @@ static bool build_boot_regions(mem_region_t *regions,
      * to the vDSO page when splitting the block; otherwise vdso_build cannot
      * write into it through guest_ptr.
      */
-    if (!append_boot_region(regions, nregions, g->shim_base,
+    if (!append_boot_region(regions, nregions, g->pt_pool_base, g->pt_pool_end,
+                            MEM_PERM_RW_EL1_ONLY) ||
+        !append_boot_region(regions, nregions, g->shim_base,
                             g->shim_base + shim_bin_len, MEM_PERM_RX) ||
         /* shim_data is EL1-only: the guest must not directly read or write the
          * identity cache, attention flag, urandom bitmap, or ring, any of which
@@ -513,6 +515,15 @@ int guest_bootstrap_prepare(guest_t *g,
         log_error("failed to build page tables");
         return -1;
     }
+    if (guest_split_block(g, g->shim_data_base) < 0) {
+        log_error("failed to split shim-data block for COW scratch PTEs");
+        return -1;
+    }
+    if (guest_prepare_fast_mmap_arena(g, SHIM_FAST_MMAP_ARENA_BASE,
+                                      SHIM_FAST_MMAP_ARENA_END) < 0) {
+        log_error("failed to prepare EL1 fast mmap arena");
+        return -1;
+    }
     startup_trace_step("guest_build_page_tables", t0);
     /* No TLBI request here: the shim's _start does TLBI VMALLE1IS before
      * enabling the MMU (src/core/shim.S), and the per-vCPU accumulator is the
@@ -710,6 +721,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      * identity.
      */
     shim_globals_init(g);
+    shim_fast_mmap_init(g);
     shim_globals_publish_stats_gate(g);
     shim_globals_set_trace_enabled(g, verbose);
     shim_globals_publish_pid(g, proc_get_pid(), proc_get_ppid());
@@ -831,6 +843,15 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
     if (!ttbr0) {
         log_error(
             "guest_build_page_tables failed in rosetta exec re-bootstrap");
+        return -1;
+    }
+    if (guest_split_block(g, g->shim_data_base) < 0) {
+        log_error("failed to split shim-data block for COW scratch PTEs");
+        return -1;
+    }
+    if (guest_prepare_fast_mmap_arena(g, SHIM_FAST_MMAP_ARENA_BASE,
+                                      SHIM_FAST_MMAP_ARENA_END) < 0) {
+        log_error("failed to prepare EL1 fast mmap arena");
         return -1;
     }
     g->ttbr0 = ttbr0;

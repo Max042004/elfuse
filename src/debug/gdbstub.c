@@ -24,6 +24,7 @@
  */
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -151,6 +152,10 @@ static struct {
     int resume_action;  /* 0=continue, 1=step (per stop_tid) */
     int stop_requested; /* GDB sent Ctrl+C or bp hit */
 
+    /* Incremented when the listener thread changes a stage-1 leaf. Each vCPU
+     * owner observes it before returning to EL0 from an all-stop pause. */
+    _Atomic uint64_t tlbi_generation;
+
     /* Breakpoints and watchpoints */
     hw_bp_t breakpoints[MAX_HW_BREAKPOINTS];
     hw_wp_t watchpoints[MAX_HW_WATCHPOINTS];
@@ -165,6 +170,26 @@ static struct {
     .rsp_ctx = NULL,
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+static _Thread_local uint64_t gdb_seen_tlbi_generation;
+
+static void gdb_resume_tlbi_if_needed(bool direct_el0_stop)
+{
+    uint64_t generation =
+        atomic_load_explicit(&gdb.tlbi_generation, memory_order_acquire);
+    if (!current_thread || !direct_el0_stop ||
+        generation == gdb_seen_tlbi_generation)
+        return;
+
+    hv_vcpu_t vcpu = current_thread->vcpu;
+    HV_CHECK(hv_vcpu_set_reg(
+        vcpu, HV_REG_PC,
+        gdb.guest->shim_base + SHIM_GDB_TLBI_TRAMPOLINE_OFF));
+    /* EL1h with D/A/I/F masked, matching bootstrap's shim entry state. The
+     * trampoline ERET restores the guest PSTATE already held in SPSR_EL1. */
+    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5));
+    gdb_seen_tlbi_generation = generation;
+}
 
 /* Send an unescaped RSP response body. */
 static int rsp_reply(const char *data)
@@ -587,7 +612,14 @@ static void handle_write_mem(const char *pkt)
         return;
     }
 
-    if (guest_write(gdb.guest, addr, tmp, len) < 0) {
+    int write_rc = guest_write(gdb.guest, addr, tmp, len);
+    if (cpu_tlbi_req.kind != TLBI_NONE) {
+        atomic_fetch_add_explicit(&gdb.tlbi_generation, 1,
+                                  memory_order_release);
+        /* This TLS slot belongs to the listener and has no shim epilogue. */
+        tlbi_request_clear();
+    }
+    if (write_rc < 0) {
         free(tmp);
         rsp_reply_error(14);
         return;
@@ -1300,6 +1332,11 @@ void gdb_stub_wait_for_attach(void)
 
     pthread_mutex_unlock(&gdb.lock);
 
+    /* No guest instruction or translation has run yet, so pre-entry writes do
+     * not need a TLBI and must not bypass the shim's normal _start sequence. */
+    gdb_seen_tlbi_generation =
+        atomic_load_explicit(&gdb.tlbi_generation, memory_order_acquire);
+
     /* Apply any register changes GDB made. Stop-on-entry is shim-mediated (not
      * TDE), so tde_stop=0.
      */
@@ -1321,12 +1358,30 @@ int gdb_stub_is_active(void)
     return gdb.initialized && gdb.client_fd >= 0;
 }
 
-int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
+static int gdb_stub_handle_stop_impl(int stop_reason,
+                                     uint64_t stop_addr,
+                                     bool frame_free_el1)
 {
     if (!gdb.initialized || gdb.client_fd < 0)
         return 0;
 
     int64_t my_tid = current_thread ? current_thread->guest_tid : 1;
+    bool direct_el0_stop = false;
+
+    /* A TDE breakpoint/watchpoint, or a cancellation of an EL0 vCPU for
+     * all-stop, bypasses the EL1 vector and leaves ELR/SPSR stale. Normalize
+     * them before snapshotting so both GDB register edits and the TLBI
+     * trampoline return to the actual interrupted state. */
+    if (current_thread) {
+        uint64_t live_cpsr = vcpu_get_reg(current_thread->vcpu, HV_REG_CPSR);
+        direct_el0_stop = (live_cpsr & 0xfULL) == 0;
+        if (direct_el0_stop) {
+            uint64_t live_pc = vcpu_get_reg(current_thread->vcpu, HV_REG_PC);
+            vcpu_set_sysreg(current_thread->vcpu, HV_SYS_REG_ELR_EL1, live_pc);
+            vcpu_set_sysreg(current_thread->vcpu, HV_SYS_REG_SPSR_EL1,
+                            live_cpsr);
+        }
+    }
 
     /* Snapshot vCPU registers into thread entry. Must happen on the vCPU's
      * owning thread (HVF requirement). The GDB handler thread reads/writes this
@@ -1382,22 +1437,28 @@ int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
     int do_step = gdb.resume_action;
     pthread_mutex_unlock(&gdb.lock);
 
-    /* Apply any register changes GDB made to the snapshot. TDE debug stops
-     * (breakpoint, step, watchpoint) bypassed EL1, so HV_REG_PC must also be
-     * written for the resume to work. Shim-mediated stops (signals, Ctrl+C)
-     * only need ELR_EL1.
-     */
-    int tde =
-        (stop_reason == GDB_STOP_BREAKPOINT || stop_reason == GDB_STOP_STEP ||
-         stop_reason == GDB_STOP_WATCHPOINT);
+    /* Direct EL0 stops bypassed the EL1 vector, so a register edit must update
+     * both the exception-return state and the live HVF PC/PSTATE. */
     if (current_thread && current_thread->gdb_regs_dirty)
-        gdb_restore_vcpu(current_thread, tde);
+        gdb_restore_vcpu(current_thread, direct_el0_stop);
+
+    gdb_resume_tlbi_if_needed(direct_el0_stop || frame_free_el1);
 
     /* Re-sync debug registers before resuming */
     if (current_thread)
         gdb_stub_sync_debug_regs(current_thread->vcpu);
 
     return do_step;
+}
+
+int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr)
+{
+    return gdb_stub_handle_stop_impl(stop_reason, stop_addr, false);
+}
+
+int gdb_stub_handle_stop_framefree(int stop_reason, uint64_t stop_addr)
+{
+    return gdb_stub_handle_stop_impl(stop_reason, stop_addr, true);
 }
 
 int gdb_stub_stop_requested(void)

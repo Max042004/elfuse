@@ -361,13 +361,13 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         .msg_name = dest_sa,
         .msg_namelen = dest_len,
         .msg_iov = host_iov.iov,
-        .msg_iovlen = send_iovcnt,
+        .msg_iovlen = host_iov.iovcnt,
         .msg_control = ctrl_ptr,
         .msg_controllen = ctrl_len,
         .msg_flags = 0,
     };
 
-    bool blocking = host_iov_has_payload(&host_iov, send_iovcnt) &&
+    bool blocking = host_iov_has_payload(&host_iov) &&
                     sock_op_should_block(host_ref.fd, linux_flags);
     int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
     ssize_t ret;
@@ -493,7 +493,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         host_fd_ref_close(&host_ref);
         return iov_err;
     }
-    int64_t waited = host_iov_has_payload(&host_iov, recv_iovcnt)
+    int64_t waited = host_iov_has_payload(&host_iov)
                          ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
                          : net_recv_zero_payload_gate(host_ref.fd, flags);
     if (waited < 0) {
@@ -533,7 +533,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         .msg_name = lmsg.msg_name ? &mac_sa : NULL,
         .msg_namelen = lmsg.msg_name ? sa_len : 0,
         .msg_iov = host_iov.iov,
-        .msg_iovlen = recv_iovcnt,
+        .msg_iovlen = host_iov.iovcnt,
         .msg_control = ctrl_alloc > 0 ? mac_ctrl : NULL,
         .msg_controllen = ctrl_alloc,
         .msg_flags = 0,

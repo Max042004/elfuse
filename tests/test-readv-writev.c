@@ -15,6 +15,7 @@
 
 #include <fcntl.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -118,6 +119,70 @@ static void test_file_roundtrip(void)
         return;
     }
     EXPECT_TRUE(num2 == 42 && !strcmp(str2, "test-data"), "data mismatch");
+}
+
+static void test_lazy_source_full_write(void)
+{
+    TEST("lazy source buffers do not short-write");
+    const size_t len = 3 * 4096;
+    unsigned char *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = open("/tmp/elfuse-test-lazy-write.bin", O_RDWR | O_CREAT | O_TRUNC,
+                  0600);
+    if (p == MAP_FAILED || fd < 0) {
+        if (p != MAP_FAILED)
+            munmap(p, len);
+        if (fd >= 0)
+            close(fd);
+        unlink("/tmp/elfuse-test-lazy-write.bin");
+        FAIL("setup");
+        return;
+    }
+    unlink("/tmp/elfuse-test-lazy-write.bin");
+
+    bool ok = pwrite(fd, p, 8192, 0) == 8192;
+    ok = ok && lseek(fd, 0, SEEK_SET) == 0 && write(fd, p, 8192) == 8192;
+
+    /* Alternate zero-alias and identity pages in one scalar source range. */
+    p[4096] = 0x5A;
+    ok = ok && pwrite(fd, p, len, 0) == (ssize_t) len;
+    unsigned char check[3 * 4096];
+    ok = ok && pread(fd, check, len, 0) == (ssize_t) len && check[0] == 0 &&
+         check[4096] == 0x5A && check[8192] == 0;
+
+    unsigned char *q = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (q == MAP_FAILED) {
+        ok = false;
+    } else {
+        struct iovec iov[2] = {
+            {.iov_base = q, .iov_len = 8192},
+            {.iov_base = q + 8192, .iov_len = 4096},
+        };
+        ok = ok && lseek(fd, 0, SEEK_SET) == 0 &&
+             writev(fd, iov, 2) == (ssize_t) len;
+        munmap(q, len);
+    }
+
+    /* More than IOV_MAX alternating identity/zero runs uses the bounded
+     * fragmented-source fallback, but remains one complete positional write. */
+    const size_t fragmented_len = 5 * 1024 * 1024;
+    unsigned char *fragmented =
+        mmap(NULL, fragmented_len, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fragmented == MAP_FAILED) {
+        ok = false;
+    } else {
+        for (size_t off = 0; off < fragmented_len; off += 8192)
+            fragmented[off] = 1;
+        ok = ok && pwrite(fd, fragmented, fragmented_len, 0) ==
+                       (ssize_t) fragmented_len;
+        munmap(fragmented, fragmented_len);
+    }
+
+    close(fd);
+    munmap(p, len);
+    EXPECT_TRUE(ok, "lazy pwrite/writev stopped at a GPA boundary");
 }
 
 /* Test 3: Single iovec (degenerate case) */
@@ -456,6 +521,7 @@ int main(void)
 
     test_pipe_roundtrip();
     test_file_roundtrip();
+    test_lazy_source_full_write();
     test_single_iovec();
     test_zero_length_iovec();
     test_empty_iovec_access_checks();

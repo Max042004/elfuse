@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -55,6 +56,10 @@ int proc_intercept_write(int guest_fd,
                          int64_t offset,
                          int use_pwrite,
                          ssize_t *written_out);
+
+/* Cheap metadata-only gate for vector writers: false means the fd cannot be a
+ * stateful writable /proc node, so callers must skip payload flattening. */
+bool proc_intercept_write_candidate(int guest_fd);
 
 /* Intercept reads from synthetic proc files that must reflect shared state on
  * every read rather than the per-open temp-file snapshot.

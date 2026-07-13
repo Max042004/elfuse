@@ -540,9 +540,12 @@ static void test_stub_errnos(void)
         FAIL("mincore mmap");
         return;
     }
-    *(volatile char *) mc = 1; /* fault the page in */
     unsigned char vec = 0;
     errno = 0;
+    long mr_cold = syscall(SYS_mincore, mc, 4096, &vec);
+    bool cold_ok = mr_cold == 0 && !(vec & 1);
+    *(volatile char *) mc = 1; /* fault the page in */
+    vec = 0;
     long mr = syscall(SYS_mincore, mc, 4096, &vec);
     /* Mapped page: success with the residency LSB set. Unaligned addr: EINVAL.
      * A hole in the range: ENOMEM. Here the whole page is mapped.
@@ -553,10 +556,19 @@ static void test_stub_errnos(void)
     long mr_huge = syscall(SYS_mincore, 0, UINT64_MAX, 0);
     bool huge_ok = (mr_huge == -1);
     munmap(mc, 4096);
-    if (mapped_ok && einval_ok && huge_ok)
+
+    void *pop = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    vec = 0;
+    bool populate_ok = pop != MAP_FAILED &&
+                       syscall(SYS_mincore, pop, 4096, &vec) == 0 && (vec & 1);
+    if (pop != MAP_FAILED)
+        munmap(pop, 4096);
+
+    if (cold_ok && mapped_ok && populate_ok && einval_ok && huge_ok)
         PASS();
     else
-        FAIL("mincore should report residency and reject invalid ranges");
+        FAIL("mincore/MAP_POPULATE residency semantics");
 }
 
 static void test_memory_stubs(void)

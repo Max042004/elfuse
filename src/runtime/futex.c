@@ -403,13 +403,27 @@ static bool futex_quantum_deadline(const struct timespec *deadline,
  * the bucket walk; the loop counter is clamped to UINT32_MAX, which still
  * preserves the INT_MAX "wake all" sentinel without overflow.
  */
-static uint32_t futex_os_sync_wake_n(const guest_t *g,
+/* Resolve an os_sync futex key only after breaking a lazy-zero alias into its
+ * stable private backing. A read-only guest_ptr() may otherwise return the
+ * shared zero page: the waiter would sleep on that host address while the
+ * first guest write moves the futex word to its identity page, so WAKE would
+ * target a different kernel key and be lost. Do not use guest_ptr_w() here:
+ * ordinary non-COW read-only futex mappings retain their existing access
+ * semantics; only COW_ZERO descriptors need forced materialization. */
+static uint32_t *futex_os_sync_addr(guest_t *g, uint64_t uaddr)
+{
+    if (guest_materialize_lazy_zero(g, uaddr - g->ipa_base) < 0)
+        return NULL;
+    return (uint32_t *) guest_ptr(g, uaddr);
+}
+
+static uint32_t futex_os_sync_wake_n(guest_t *g,
                                      uint64_t uaddr,
                                      uint64_t budget)
 {
     if (!os_sync_available || !os_sync_wait_enabled || budget == 0)
         return 0;
-    void *host_addr = guest_ptr(g, uaddr);
+    void *host_addr = futex_os_sync_addr(g, uaddr);
     if (!host_addr)
         return 0;
     if (budget > UINT32_MAX)
@@ -459,7 +473,7 @@ static int64_t futex_os_sync_wait(guest_t *g,
             return -LINUX_EINVAL;
     }
 
-    uint32_t *host_addr = (uint32_t *) guest_ptr(g, uaddr);
+    uint32_t *host_addr = futex_os_sync_addr(g, uaddr);
     if (!host_addr)
         return -LINUX_EFAULT;
 
@@ -553,7 +567,7 @@ static int64_t futex_os_sync_wait(guest_t *g,
  * sites guard on os_sync_available, so this stub is unreachable at runtime, but
  * it keeps the link clean.
  */
-static uint32_t futex_os_sync_wake_n(const guest_t *g,
+static uint32_t futex_os_sync_wake_n(guest_t *g,
                                      uint64_t uaddr,
                                      uint64_t budget)
 {
@@ -580,7 +594,7 @@ static uint32_t futex_os_sync_wake_n(const guest_t *g,
  * not a rule each new caller has to remember. The int64_t return absorbs
  * futex_os_sync_wake_n's uint32_t count without sign-extension.
  */
-static int64_t futex_wake_topup_osync(const guest_t *g,
+static int64_t futex_wake_topup_osync(guest_t *g,
                                       uint64_t uaddr,
                                       int64_t woken,
                                       uint64_t target)
@@ -789,7 +803,7 @@ static int64_t futex_wait(guest_t *g,
  * (mask must be non-zero by Linux contract), so those waiters remain valid wake
  * targets.
  */
-static int64_t futex_wake(const guest_t *g,
+static int64_t futex_wake(guest_t *g,
                           uint64_t uaddr,
                           uint32_t val,
                           uint32_t bitset)

@@ -478,6 +478,7 @@ typedef struct {
 #define LINUX_MAP_FIXED 0x10
 #define LINUX_MAP_ANONYMOUS 0x20
 #define LINUX_MAP_NORESERVE 0x4000
+#define LINUX_MAP_POPULATE 0x8000
 #define LINUX_MAP_FIXED_NOREPLACE 0x100000
 
 /* Linux msync flags. */

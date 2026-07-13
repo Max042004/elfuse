@@ -918,8 +918,11 @@ int64_t sys_ptrace(guest_t *g,
          * (also under thread_lock), so exactly one of the two paths delivers
          * it.
          */
-        if (!vcpu)
-            target->ptrace_interrupt_pending = true;
+        /* Record the request even for a published vCPU. If cancellation lands
+         * inside EL1, the tracee must finish that transaction and rendezvous
+         * through HVC #13 before ptrace snapshots its registers. */
+        __atomic_store_n(&target->ptrace_interrupt_pending, true,
+                         __ATOMIC_RELEASE);
         pthread_mutex_unlock(tlock);
 
         if (vcpu)
@@ -1718,6 +1721,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
 {
     int exit_code = 0;
     bool running = true;
+    bool resume_el1_rendezvous = false;
     int iter = 0;
     const int is_main = (timeout_sec > 0);
     const char *prefix = is_main ? "elfuse" : "elfuse: worker";
@@ -1740,7 +1744,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
 
     while (running) {
         /* Check if another thread called exit_group */
-        if (proc_exit_group_requested()) {
+        if (proc_exit_group_requested() && !resume_el1_rendezvous) {
             exit_code = proc_exit_group_code();
             break;
         }
@@ -1757,6 +1761,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
         if (is_main)
             alarm((unsigned) timeout_sec);
 
+        resume_el1_rendezvous = false;
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
         drain_external_guest_signal();
@@ -1765,8 +1770,37 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
         if (is_main)
             alarm(0);
 
-        /* Re-check exit_group after waking from hv_vcpu_run */
-        if (proc_exit_group_requested()) {
+        /* A cancellation may land halfway through an EL1 COW/fast-mmap
+         * transaction. Do not inspect scratch registers, deliver a signal, or
+         * abandon an owned MATERIALIZING PTE. Arm this vCPU's shim rendezvous
+         * and resume it until the common return tail restores the EL0 frame and
+         * exits through HVC #13. Fork-only cancellation deliberately remains
+         * parked: the parent owner resumes after the snapshot, while the child
+         * resets copied claims during restore. */
+        bool canceled_in_shim_el1 = false;
+        if (vexit->reason == HV_EXIT_REASON_CANCELED) {
+            uint64_t live_cpsr = 0, live_pc = 0;
+            hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &live_cpsr);
+            hv_vcpu_get_reg(vcpu, HV_REG_PC, &live_pc);
+            uint64_t mode = live_cpsr & 0xfULL;
+            canceled_in_shim_el1 =
+                (mode == 4 || mode == 5) && live_pc >= g->shim_base &&
+                live_pc < g->shim_base + INFRA_SHIM_SLOT;
+        }
+        bool ptrace_interrupt =
+            current_thread && __atomic_load_n(
+                                  &current_thread->ptrace_interrupt_pending,
+                                  __ATOMIC_ACQUIRE);
+        if (canceled_in_shim_el1 &&
+            (proc_exit_group_requested() || signal_pending() ||
+             ptrace_interrupt || gdb_stub_stop_requested())) {
+            shim_preempt_request(g, current_thread->sp_el1_slot);
+            resume_el1_rendezvous = true;
+        }
+
+        /* Re-check exit_group after waking from hv_vcpu_run. An EL1 owner gets
+         * its one safe completion/rendezvous pass first. */
+        if (proc_exit_group_requested() && !resume_el1_rendezvous) {
             exit_code = proc_exit_group_code();
             break;
         }
@@ -1809,7 +1843,68 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                 if (verbose)
                     log_debug("%s: HVC #%u", prefix, imm);
 
+                /* EL1-local mmap/munmap operations publish semantic changes
+                 * through a shared journal. Drain it before any host HVC path
+                 * can consult guest_t.regions[] or fork memory state. */
+                if (shim_fast_mmap_sync(g) < 0)
+                    log_warn(
+                        "%s: disabling EL1 mmap fast path after journal "
+                        "sync failure",
+                        prefix);
+
                 switch (imm) {
+                case 13: {
+                    /* Post-EL1 preemption rendezvous. The shim has completed
+                     * its transaction and restored live EL0 GPRs but has not
+                     * ERET'd, so signal frames and ptrace snapshots are now
+                     * safe. Preserve X8 across direct signal delivery: HVC #13
+                     * returns straight to ERET and does not consume the HVC #5
+                     * frame-drop marker. */
+                    if (current_thread && current_thread->ptraced &&
+                        __atomic_exchange_n(
+                            &current_thread->ptrace_interrupt_pending, false,
+                            __ATOMIC_ACQ_REL)) {
+                        int cont_sig = thread_ptrace_stop(current_thread, 5);
+                        if (cont_sig > 0)
+                            signal_queue(cont_sig);
+                    }
+                    if (gdb_stub_stop_requested()) {
+                        gdb_stub_handle_stop_framefree(GDB_STOP_SIGNAL, 0);
+                        gdb_stub_sync_debug_regs(vcpu);
+                    }
+                    signal_check_timer();
+                    if (signal_pending()) {
+                        uint64_t saved_x8 = 0;
+                        hv_vcpu_get_reg(vcpu, HV_REG_X8, &saved_x8);
+                        int sig_ret = signal_deliver(vcpu, g, &exit_code);
+                        if (sig_ret < 0)
+                            running = false;
+                        else if (sig_ret > 0)
+                            hv_vcpu_set_reg(vcpu, HV_REG_X8, saved_x8);
+                    }
+                    shim_globals_recompute_attention(g);
+                    break;
+                }
+                case 14: {
+                    /* EL1 fast munmap has already invalidated the selected
+                     * PTEs and published one bit per materialized page. Batch
+                     * adjacent bits into host memset runs before the slot can
+                     * be reused. */
+                    uint64_t addr = 0, len = 0;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &addr);
+                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &len);
+                    int sr = shim_fast_mmap_scrub(g, addr, len);
+                    hv_vcpu_set_reg(vcpu, HV_REG_X0,
+                                    sr == 0 ? 0 : (uint64_t) -LINUX_EFAULT);
+                    if (sr < 0) {
+                        shim_fast_mmap_disable(g);
+                        log_warn("%s: invalid fast-mmap scrub request "
+                                 "[0x%llx,0x%llx)",
+                                 prefix, (unsigned long long) addr,
+                                 (unsigned long long) (addr + len));
+                    }
+                    break;
+                }
                 case 5: {
                     /* HVC #5: Linux syscall forwarding */
                     int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
@@ -2121,6 +2216,19 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                                 vcpu, g, LINUX_SIGSEGV, &exit_code);
                             if (sig_ret < 0)
                                 running = false;
+                            break;
+                        }
+
+                        /* Ordinary anonymous mappings start as read-only
+                         * aliases of one shared zero page. A write permission
+                         * fault is their COW trigger, not a JIT W^X toggle.
+                         * Materialize exactly this 4 KiB page; the shim's
+                         * normal HVC #9 return path issues the matching TLBI.
+                         */
+                        if (type == 1 &&
+                            guest_materialize_lazy_zero(g, off) == 0) {
+                            pthread_mutex_unlock(&mmap_lock);
+                            tlbi_request_clear();
                             break;
                         }
                     }
@@ -2729,6 +2837,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                  */
                 continue;
             }
+            if (resume_el1_rendezvous)
+                continue;
             if (proc_exit_group_requested()) {
                 exit_code = proc_exit_group_code();
                 break;
@@ -2750,7 +2860,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
              * stopped, enter ptrace-stop so the tracer can inspect state. This
              * handles hv_vcpus_exit from sys_ptrace PTRACE_INTERRUPT.
              */
-            if (current_thread->ptraced && !current_thread->ptrace_stopped) {
+            if (current_thread->ptraced && !current_thread->ptrace_stopped &&
+                __atomic_exchange_n(
+                    &current_thread->ptrace_interrupt_pending, false,
+                    __ATOMIC_ACQ_REL)) {
                 if (verbose)
                     log_debug("%s: ptrace interrupt -> ptrace-stop", prefix);
                 int cont_sig = thread_ptrace_stop(current_thread, 5);

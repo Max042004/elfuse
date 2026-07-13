@@ -426,24 +426,25 @@ typedef struct {
     struct iovec stack[SYSCALL_IOV_STACK_MAX];
     struct iovec *iov;
     struct iovec *heap; /* non-NULL only when iov was heap-allocated */
+    void *bounce;       /* fragmented read source fallback */
+    int iovcnt;         /* resolved count; read-side guest iovs may expand */
+    int capacity;
 } host_iov_buf_t;
 
-static inline bool host_iov_has_payload(const host_iov_buf_t *buf, int iovcnt)
+static inline bool host_iov_has_payload(const host_iov_buf_t *buf)
 {
-    for (int i = 0; i < iovcnt; i++) {
+    for (int i = 0; i < buf->iovcnt; i++) {
         if (buf->iov[i].iov_len > 0)
             return true;
     }
     return false;
 }
 
-/* Translate a guest iovec array at iov_gva (iovcnt entries) into the host iovec
- * layout in buf->iov, resolving each guest_base to a contiguous host pointer
- * with the requested permissions. On a non-contiguous iov entry the helper
- * truncates that entry to the contiguous prefix and zeros every subsequent
- * entry; the host readv/writev/sendmsg/recvmsg then returns a POSIX-compliant
- * short I/O instead of silently packing bytes from the next guest buffer into
- * the truncated tail.
+/* Translate a guest iovec array at iov_gva into the host layout. Write-side
+ * sources (MEM_PERM_R) expand across physically-discontiguous guest runs, with
+ * consecutive shared-zero aliases represented by bounded host zero runs;
+ * read-side destinations retain the prior contiguous-prefix short-I/O rule so
+ * bytes can never be packed into the wrong guest iovec entry.
  *
  * iovcnt <= 0 or > SYSCALL_IOV_MAX returns -LINUX_EINVAL.
  *
@@ -463,6 +464,12 @@ int64_t host_iov_prepare_msg(guest_t *g,
                              int iovcnt,
                              int required_perms,
                              host_iov_buf_t *buf);
+
+/* Resolve one linear guest source range into one or more host read iovecs. */
+int64_t host_iov_prepare_read_range(guest_t *g,
+                                    uint64_t gva,
+                                    uint64_t length,
+                                    host_iov_buf_t *buf);
 
 /* Release any heap spillover backing a host_iov_buf_t. Idempotent. */
 void host_iov_free(host_iov_buf_t *buf);

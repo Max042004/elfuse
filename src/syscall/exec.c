@@ -113,6 +113,7 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
      * after exec.
      */
     shim_globals_init(g);
+    shim_fast_mmap_init(g);
     shim_globals_publish_stats_gate(g);
     shim_globals_set_trace_enabled(g, verbose);
 
@@ -965,14 +966,23 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * interpreter. Sized comfortably to keep the bounds-check loops simple
      * after the point of no return.
      */
-#define MAX_REGIONS (8 + 2 * ELF_MAX_SEGMENTS)
+#define MAX_REGIONS (9 + 2 * ELF_MAX_SEGMENTS)
     mem_region_t regions[MAX_REGIONS];
     int nregions = 0;
 
-    /* Fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX, mmap RW): 7
+    /* Fixed regions (PT pool, shim, shim-data, vDSO, brk, stack, mmap RX,
+     * mmap RW): 8
      * entries. Bounds-check before each to prevent array overflow. After the
      * point of no return, overflow is fatal (exit).
      */
+
+    /* EL1 walks guest page tables directly on the COW-zero fault path. Keep
+     * the pool inaccessible to EL0 while providing an identity VA for EL1. */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = g->pt_pool_base,
+                                          .gpa_end = g->pt_pool_end,
+                                          .perms = MEM_PERM_RW_EL1_ONLY};
 
     /* Keep the shim executable-only; HVF faults on merged RWX mappings. */
     if (nregions >= MAX_REGIONS)
@@ -1071,6 +1081,19 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         log_fatal(
             "execve failed after point of no return: "
             "failed to build page tables");
+        exit(128);
+    }
+    if (guest_split_block(g, g->shim_data_base) < 0) {
+        log_fatal(
+            "execve failed after point of no return: "
+            "failed to split shim-data block for COW scratch PTEs");
+        exit(128);
+    }
+    if (guest_prepare_fast_mmap_arena(g, SHIM_FAST_MMAP_ARENA_BASE,
+                                      SHIM_FAST_MMAP_ARENA_END) < 0) {
+        log_fatal(
+            "execve failed after point of no return: "
+            "failed to prepare EL1 fast mmap arena");
         exit(128);
     }
 

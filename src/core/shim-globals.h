@@ -198,12 +198,99 @@
 
 #define SHIM_GLOBALS_SIZE 0x1158
 
+/* Per-vCPU COW/preemption state: 64 bytes per EL1 stack slot. Fault-around
+ * keeps (expected next VA, window) pairs for writes at +0 and reads at +16;
+ * +32 is the host->EL1 preemption rendezvous flag. The window itself is a
+ * historic reservation from the former per-vCPU COW scratch aliases and stays
+ * 4 KiB per slot. */
+#define SHIM_COW_SCRATCH_OFF 0x2000
+#define SHIM_COW_SCRATCH_SLOTS 64
+#define SHIM_COW_SCRATCH_SIZE (SHIM_COW_SCRATCH_SLOTS * 4096)
+#define SHIM_COW_STATE_STRIDE 64
+#define SHIM_COW_PREEMPT_OFF 32
+
+/* EL1-local anonymous mmap arena and host synchronization journal. */
+#define SHIM_FAST_MMAP_ARENA_BASE MMAP_BASE
+#define SHIM_FAST_MMAP_ARENA_SIZE 0x01000000ULL
+#define SHIM_FAST_MMAP_ARENA_END \
+    (SHIM_FAST_MMAP_ARENA_BASE + SHIM_FAST_MMAP_ARENA_SIZE)
+/* 4096 pages. */
+#define SHIM_FAST_MMAP_ARENA_PAGES (SHIM_FAST_MMAP_ARENA_SIZE / 4096)
+#define SHIM_FAST_MMAP_MAX_LEN_PAGES 512 /* <=2 MiB fast-path length cap */
+#define SHIM_FAST_MMAP_NODE_CAP 64
+#define SHIM_FAST_MMAP_JOURNAL_CAP 128
+#define SHIM_FAST_MMAP_CTL_OFF 0x43000
+#define SHIM_FAST_MMAP_SENTINEL 0xFFFFFFFFu
+
+enum {
+    SHIM_FAST_MMAP_OP_MAP = 1,
+    SHIM_FAST_MMAP_OP_UNMAP = 2,
+};
+
+/* Intrusive free-list node: one per address the arena is currently willing to
+ * hand back out. `next` chains within whichever list currently owns the node
+ * -- either a bucket_head[] size class or the node_freelist_head pool -- a
+ * node is never in both at once. SHIM_FAST_MMAP_SENTINEL terminates a chain.
+ */
+typedef struct {
+    uint64_t addr;
+    uint32_t next;
+    uint32_t pad;
+} shim_fast_mmap_node_t;
+
+typedef struct {
+    uint32_t op;
+    uint32_t reserved;
+    uint64_t addr;
+    uint64_t len;
+} shim_fast_mmap_journal_entry_t;
+
+typedef struct {
+    _Atomic uint32_t lock;
+    _Atomic uint32_t enabled;
+    _Atomic uint32_t journal_head;
+    uint32_t reserved0;
+    uint64_t bump;
+    uint64_t zero_pte;
+    /* Reuse free-list: bucket_head[pages-1] chains addresses of exactly that
+     * page count through free_nodes[], giving mmap/munmap an O(1) exact-size
+     * match instead of a linear scan. node_freelist_head threads the pool of
+     * currently-unused node structs (population fixed at init; nodes move
+     * between a bucket chain and this pool, never both).
+     */
+    uint32_t bucket_head[SHIM_FAST_MMAP_MAX_LEN_PAGES];
+    uint32_t node_freelist_head;
+    uint32_t reserved1;
+    shim_fast_mmap_node_t free_nodes[SHIM_FAST_MMAP_NODE_CAP];
+    /* Direct-indexed liveness: live_len_pages[(addr>>12)&0xFFF] is the page
+     * count of the live fast-arena mapping starting at addr, or 0 if none.
+     * munmap's only valid fast-path targets are exact (addr,len) matches
+     * against a prior anon_mmap_fast return; anything else (partial unmap,
+     * wrong length, non-arena address) must fall back to the host's
+     * region-table path, which understands VMA splitting.
+     */
+    uint16_t live_len_pages[SHIM_FAST_MMAP_ARENA_PAGES];
+    shim_fast_mmap_journal_entry_t journal[SHIM_FAST_MMAP_JOURNAL_CAP];
+    uint64_t scrub_bitmap[8]; /* One bit per page in the <=2 MiB fast range. */
+} shim_fast_mmap_control_t;
+
+#define SHIM_FAST_MMAP_CTL_SIZE ((uint64_t) sizeof(shim_fast_mmap_control_t))
+
 /* Initialize the cache region to all-zero. Called once per process at the same
  * time the shim_data block is set up (initial bootstrap and fork-child). The
  * initial attention=0 means the shim takes the fast path until a setter raises
  * it.
  */
 void shim_globals_init(guest_t *g);
+void shim_fast_mmap_init(guest_t *g);
+int shim_fast_mmap_sync(guest_t *g);
+int shim_fast_mmap_scrub(guest_t *g, uint64_t addr, uint64_t len);
+void shim_fast_mmap_disable(guest_t *g);
+bool shim_fast_mmap_is_enabled(const guest_t *g);
+
+/* Request that one canceled vCPU rendezvous with the host only after its
+ * current EL1 transaction has reached a register-safe return tail. */
+void shim_preempt_request(guest_t *g, int sp_el1_slot);
 
 /* Publish pid + ppid pair atomically (release-store per slot). Called at
  * process init, after fork-child identity is installed, and after any future

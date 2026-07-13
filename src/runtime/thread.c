@@ -448,7 +448,7 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx)
     pthread_mutex_unlock(&thread_lock);
 }
 
-void thread_join_workers(void)
+bool thread_join_workers(void)
 {
     /* Snapshot worker threads under the lock. The code needs the host_thread
      * handle and a way to check the active flag without re-locking. Storing the
@@ -470,11 +470,17 @@ void thread_join_workers(void)
         bool recycled;
     } workers[MAX_THREADS];
     int nworkers = 0;
+    bool abandoned_active = false;
 
     pthread_mutex_lock(&thread_lock);
     THREAD_FOR_EACH (t) {
-        if (t == current_thread || t->join_abandoned)
+        if (t == current_thread)
             continue;
+        if (t->join_abandoned) {
+            if (__atomic_load_n(&t->active, __ATOMIC_ACQUIRE))
+                abandoned_active = true;
+            continue;
+        }
         /* Never wait for the main thread (slot 0): its entry only deactivates
          * inside guest_destroy, which runs on the main thread AFTER its own
          * thread_join_workers. A worker waiting here (exit_group called from
@@ -545,15 +551,20 @@ void thread_join_workers(void)
         usleep(5000);
     }
 
+    bool all_stopped = !abandoned_active;
     for (int w = 0; w < nworkers; w++) {
+        bool stopped =
+            workers[w].recycled ||
+            !__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE);
+        if (!stopped)
+            all_stopped = false;
         if (!workers[w].claimed)
             continue;
         /* recycled short-circuits before the active re-check: once recycled,
          * that bit belongs to the replacement thread and must not influence the
          * join-vs-detach decision for our (already-terminated) handle.
          */
-        if (workers[w].recycled ||
-            !__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE)) {
+        if (stopped) {
             pthread_join(workers[w].thr, NULL);
         } else {
             pthread_detach(workers[w].thr);
@@ -562,6 +573,7 @@ void thread_join_workers(void)
             pthread_mutex_unlock(&thread_lock);
         }
     }
+    return all_stopped;
 }
 
 void thread_destroy_all_vcpus(void)

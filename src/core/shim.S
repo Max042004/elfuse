@@ -49,6 +49,7 @@
  *                          preserves X0/X1/X2/X30 so signal_deliver's
  *                          register writes survive.)
  *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
+ *   #14 Scrub materialized fast-mmap backing selected by the shared bitmap
  *
  * macOS as uses ';' as a comment character on AArch64, NOT as a statement
  * separator. Each instruction must be on its own line.
@@ -194,6 +195,42 @@
  * via shim_globals_publish_stats_gate during bring-up.
  */
 .equ SHIM_STATS_EN_OFF,      0x04
+
+/* Anonymous zero-page COW. Keep synchronized with guest.h and
+ * shim-globals.h (shim-globals.c pins the literals with static assertions). */
+.equ PTE_SW_COW_ZERO_BIT,     55
+.equ PTE_SW_COW_MAT_BIT,      56
+/* Keep synchronized with TLBI_SELECTIVE_MAX_PAGES in core/guest.h. */
+.equ TLBI_SELECTIVE_MAX,      16
+/* Fault-around cursors and the host-requested preemption rendezvous live in
+ * 64-byte per-vCPU state slots in the former COW scratch window. */
+.equ SHIM_COW_SCRATCH_OFF,    0x2000
+.equ SHIM_COW_PREEMPT_OFF,    32
+.equ SHIM_DATA_SIZE,          0x200000
+.equ COW_FAULT_AROUND_MAX,    64
+.equ FAST_MMAP_CTL_OFF_HI,    0x43000
+.equ FAST_MMAP_ENABLED_OFF,   0x04
+.equ FAST_MMAP_HEAD_OFF,      0x08
+.equ FAST_MMAP_BUMP_OFF,      0x10
+.equ FAST_MMAP_ZERO_PTE_OFF,  0x18
+/* Reuse free-list: bucket_head[pages-1] chains through free_nodes[] (16
+ * bytes/node: 8-byte addr + 4-byte next + 4 pad), giving mmap/munmap an O(1)
+ * exact-size match instead of a linear slot scan. node_freelist_head threads
+ * the pool of currently-unused nodes. 0xFFFFFFFF terminates any chain. */
+.equ FAST_MMAP_BUCKET_OFF,    0x20
+.equ FAST_MMAP_NODE_FREE_OFF, 0x820
+.equ FAST_MMAP_NODES_OFF,     0x828
+.equ FAST_MMAP_NODE_SIZE,     0x10
+.equ FAST_MMAP_SENTINEL,      0xffffffff
+/* Direct-indexed liveness: live_len_pages[(addr>>12)&0xfff] is the page count
+ * of the live mapping starting at addr, 0 if none. munmap's only valid
+ * fast-path targets are exact matches against a prior anon_mmap_fast return. */
+.equ FAST_MMAP_LIVE_OFF,      0xc28
+.equ FAST_MMAP_JOURNAL_OFF_HI, 0x2000
+.equ FAST_MMAP_JOURNAL_OFF_LO, 0xc28
+.equ FAST_MMAP_JOURNAL_CAP,   128
+.equ FAST_MMAP_SCRUB_OFF_HI,  0x3000
+.equ FAST_MMAP_SCRUB_OFF_LO,  0x828
 
 .equ CB_ATTN_BAIL,           0
 .equ CB_URANDOM_FD_OOR,      8
@@ -437,6 +474,394 @@ svc_handler:
     b.eq getsid_fast
     cmp x10, #278                      /* SYS_getrandom? */
     b.eq getrandom_fast
+    cmp x10, #222                      /* SYS_mmap? */
+    b.eq anon_mmap_fast
+    cmp x10, #215                      /* SYS_munmap? */
+    b.eq anon_munmap_fast
+    b handle_svc_0
+
+/* Acquire/release the shared EL1 mmap control lock. x19 points at control. */
+fast_mmap_lock:
+1:  ldaxr w12, [x19]
+    cbnz w12, 2f
+    mov w13, #1
+    stxr w14, w13, [x19]
+    cbnz w14, 1b
+    ret
+2:  clrex
+    yield
+    b 1b
+
+fast_mmap_unlock:
+    stlr wzr, [x19]
+    ret
+
+/* Exact MAP_PRIVATE|MAP_ANONYMOUS RW mmap(NULL, ..., -1, 0). */
+anon_mmap_fast:
+    ldp x20, x21, [sp, #0]            /* addr, length */
+    cbnz x20, handle_svc_0
+    cbz x21, handle_svc_0
+    ldp x22, x23, [sp, #16]           /* prot, flags */
+    cmp x22, #3
+    b.ne handle_svc_0
+    cmp x23, #0x22
+    b.ne handle_svc_0
+    ldp x24, x25, [sp, #32]           /* fd, offset */
+    cmn x24, #1
+    b.ne handle_svc_0
+    cbnz x25, handle_svc_0
+
+    adds x21, x21, #0xfff
+    b.cs handle_svc_0
+    and x21, x21, #0xfffffffffffff000
+    mov x12, #0x200000
+    cmp x21, x12                      /* bound page-table work per call */
+    b.hi handle_svc_0
+
+    mrs x19, tpidr_el1
+    ldar w12, [x19]                  /* attention/verbose gate */
+    cbnz w12, handle_svc_0
+    add x19, x19, #(FAST_MMAP_CTL_OFF_HI >> 12), lsl #12
+    bl fast_mmap_lock
+    ldr w12, [x19, #FAST_MMAP_ENABLED_OFF]
+    cbz w12, .Lfast_mmap_bail
+    ldr w12, [x19, #FAST_MMAP_HEAD_OFF]
+    cmp w12, #FAST_MMAP_JOURNAL_CAP
+    b.hs .Lfast_mmap_bail
+
+    /* Exact-size reuse: class = pages-1 indexes bucket_head[], an O(1)
+     * exact-length match against addresses a prior munmap offered back,
+     * replacing a linear scan. Empty bucket falls through to bump-allocate a
+     * fresh address from the arena. x28 (class) and x20/x23 (rollback state)
+     * must survive the PTE-install loop below untouched. */
+    lsr x28, x21, #12
+    sub x28, x28, #1                  /* class = pages - 1, 0..511 */
+    add x26, x19, #FAST_MMAP_BUCKET_OFF
+    ldr w22, [x26, x28, lsl #2]       /* bucket_head[class] */
+    mov w0, #FAST_MMAP_SENTINEL
+    cmp w22, w0
+    b.eq .Lfast_mmap_bump
+
+    /* Pop node w22 from its bucket and return the node struct itself to the
+     * free-node pool -- the reuse bookkeeping is done once the address is
+     * handed out; only the address needs to survive to publish or roll back. */
+    add x27, x19, #FAST_MMAP_NODES_OFF
+    add x0, x27, x22, lsl #4          /* &free_nodes[w22] */
+    ldr x24, [x0]                     /* result address */
+    ldr w25, [x0, #8]                 /* node.next */
+    str w25, [x26, x28, lsl #2]       /* bucket_head[class] = node.next */
+    ldr w25, [x19, #FAST_MMAP_NODE_FREE_OFF]
+    str w25, [x0, #8]
+    str w22, [x19, #FAST_MMAP_NODE_FREE_OFF]
+    mov x20, x22                      /* stash popped node index for rollback */
+    mov x23, #1                       /* path marker: 1 = reuse */
+    b .Lfast_mmap_have_addr
+
+.Lfast_mmap_bump:
+    ldr x24, [x19, #FAST_MMAP_BUMP_OFF]
+    adds x25, x24, x21
+    b.cs .Lfast_mmap_bail
+    movz x26, #0x100, lsl #16
+    movk x26, #2, lsl #32           /* 0x201000000 arena end */
+    cmp x25, x26
+    b.hi .Lfast_mmap_bail
+    str x25, [x19, #FAST_MMAP_BUMP_OFF]
+    mov x23, #0                       /* path marker: 0 = bump, no node yet */
+
+.Lfast_mmap_have_addr:
+    /* Install one read-only COW_ZERO PTE per page. Arena L3 tables were
+     * pre-created by the host at bootstrap. */
+    ldr x25, [x19, #FAST_MMAP_ZERO_PTE_OFF]
+    mov x26, x24
+    add x27, x24, x21
+.Lfast_mmap_pte_loop:
+    mov x0, x26
+    bl cow_find_l3_pte
+    cbz x0, .Lfast_mmap_rollback
+    /* L3 descriptors are contiguous within one 2MiB block: walk once per
+     * block and stride the table until the block or the range ends. */
+    add x12, x26, #(1 << 21)
+    and x12, x12, #0xffffffffffe00000
+    cmp x12, x27
+    csel x12, x12, x27, lo
+.Lfast_mmap_pte_stride:
+    stlr x25, [x0]
+    add x0, x0, #8
+    add x26, x26, #0x1000
+    cmp x26, x12
+    b.lo .Lfast_mmap_pte_stride
+    cmp x26, x27
+    b.lo .Lfast_mmap_pte_loop
+    /* Make the template stores visible to table walkers before EL0 can
+     * touch the new mapping. No TLB maintenance is needed: the templates
+     * are invalid descriptors written over invalid entries, and every
+     * teardown path (fast munmap above, guest_invalidate_ptes) already
+     * invalidated whatever live translations it cleared, so no PE can
+     * cache anything stale for these VAs. */
+    dsb ishst
+    isb
+
+    /* Mark live: live_len_pages[(addr>>12)&0xfff] = pages. Arena addresses
+     * share MMAP_BASE's top bits, which are all zero below bit 24 (the arena
+     * is a 16 MiB, naturally-aligned window), so no explicit base subtraction
+     * is needed before the page-index mask. */
+    add x26, x19, #FAST_MMAP_LIVE_OFF
+    lsr x27, x24, #12
+    and x27, x27, #0xfff
+    add x0, x28, #1                   /* pages = class + 1 */
+    strh w0, [x26, x27, lsl #1]
+
+    /* Publish MAP journal entry, then its new head with release ordering. */
+    ldr w12, [x19, #FAST_MMAP_HEAD_OFF]
+    add x26, x19, #FAST_MMAP_JOURNAL_OFF_HI
+    add x26, x26, #FAST_MMAP_JOURNAL_OFF_LO
+    add x26, x26, x12, lsl #4
+    add x26, x26, x12, lsl #3
+    mov w25, #1
+    str w25, [x26]
+    str x24, [x26, #8]
+    str x21, [x26, #16]
+    add w12, w12, #1
+    str w12, [x19, #FAST_MMAP_HEAD_OFF]
+
+    bl fast_mmap_unlock
+    mov x0, x24
+    b svc_restore_eret
+
+.Lfast_mmap_rollback:
+    /* PTE install failed (extremely rare: page-table pool exhaustion). Return
+     * a popped node to the free-node pool rather than re-threading it back
+     * onto its bucket -- this specific address simply will not be offered
+     * for reuse again, which loses nothing the bump-allocated path (no node
+     * to begin with) does not already lose on this same failure. */
+    cbz x23, .Lfast_mmap_bail
+    add x27, x19, #FAST_MMAP_NODES_OFF
+    add x27, x27, x20, lsl #4
+    ldr w25, [x19, #FAST_MMAP_NODE_FREE_OFF]
+    str w25, [x27, #8]
+    str w20, [x19, #FAST_MMAP_NODE_FREE_OFF]
+.Lfast_mmap_bail:
+    bl fast_mmap_unlock
+    b handle_svc_0
+
+/* Exact munmap of a mapping owned by the local arena. */
+anon_munmap_fast:
+    ldp x20, x21, [sp, #0]
+    tst x20, #0xfff
+    b.ne handle_svc_0
+    cbz x21, handle_svc_0
+    adds x21, x21, #0xfff
+    b.cs handle_svc_0
+    and x21, x21, #0xfffffffffffff000
+
+    /* Arena bounds: addr must lie in [ARENA_BASE, ARENA_END). Anything else
+     * cannot be a fast-arena mapping regardless of what live_len_pages says,
+     * and an unchecked (addr>>12)&0xfff index would otherwise alias onto an
+     * unrelated live slot. */
+    movz x12, #2, lsl #32              /* SHIM_FAST_MMAP_ARENA_BASE */
+    sub x13, x20, x12
+    movz x14, #0x100, lsl #16          /* SHIM_FAST_MMAP_ARENA_SIZE */
+    cmp x13, x14
+    b.hs handle_svc_0
+
+    mrs x19, tpidr_el1
+    ldar w12, [x19]                  /* attention/verbose gate */
+    cbnz w12, handle_svc_0
+    add x19, x19, #(FAST_MMAP_CTL_OFF_HI >> 12), lsl #12
+    bl fast_mmap_lock
+    ldr w12, [x19, #FAST_MMAP_ENABLED_OFF]
+    cbz w12, .Lfast_munmap_bail
+
+    /* Exact live-mapping match: live_len_pages[idx] must equal the requested
+     * page count. A mismatch -- 0 (nothing live here), or a shorter/longer
+     * length (partial munmap) -- means this call did not originate from
+     * anon_mmap_fast, so fall back to the host's region-table path, which
+     * understands VMA splitting. */
+    lsr x14, x20, #12
+    and x14, x14, #0xfff               /* page index within arena */
+    add x15, x19, #FAST_MMAP_LIVE_OFF
+    ldrh w16, [x15, x14, lsl #1]       /* live_len_pages[idx], zero-extended */
+    lsr x17, x21, #12                  /* requested length in pages */
+    cmp x16, x17
+    b.ne .Lfast_munmap_bail
+    strh wzr, [x15, x14, lsl #1]       /* no longer live */
+
+    ldr w12, [x19, #FAST_MMAP_HEAD_OFF]
+    cbz w12, .Lfast_munmap_append
+    sub w13, w12, #1
+    add x26, x19, #FAST_MMAP_JOURNAL_OFF_HI
+    add x26, x26, #FAST_MMAP_JOURNAL_OFF_LO
+    add x26, x26, x13, lsl #4
+    add x26, x26, x13, lsl #3
+    ldr w14, [x26]
+    cmp w14, #1
+    b.ne .Lfast_munmap_append
+    ldr x14, [x26, #8]
+    cmp x14, x20
+    b.ne .Lfast_munmap_append
+    ldr x14, [x26, #16]
+    cmp x14, x21
+    b.ne .Lfast_munmap_append
+    /* The host never saw this adjacent MAP. Materialized backing is scrubbed
+     * below while its descriptor is still available, so drop the journal
+     * entry entirely. */
+    str w13, [x19, #FAST_MMAP_HEAD_OFF]
+    b .Lfast_munmap_invalidate
+
+.Lfast_munmap_append:
+    cmp w12, #FAST_MMAP_JOURNAL_CAP
+    b.hs .Lfast_munmap_bail
+    add x26, x19, #FAST_MMAP_JOURNAL_OFF_HI
+    add x26, x26, #FAST_MMAP_JOURNAL_OFF_LO
+    add x26, x26, x12, lsl #4
+    add x26, x26, x12, lsl #3
+    mov w14, #2
+    str w14, [x26]
+    str x20, [x26, #8]
+    str x21, [x26, #16]
+    add w12, w12, #1
+    str w12, [x19, #FAST_MMAP_HEAD_OFF]
+
+.Lfast_munmap_invalidate:
+    /* Shared 512-bit bitmap consumed and cleared synchronously by HVC #14.
+     * It starts zero, and the fast arena is single-vCPU. */
+    add x18, x19, #FAST_MMAP_SCRUB_OFF_HI
+    add x18, x18, #FAST_MMAP_SCRUB_OFF_LO
+    mov x17, #0                      /* any materialized page? */
+    mov x26, x20
+    add x27, x20, x21
+    mov x23, #-1                     /* lowest live-cleared VA (none yet) */
+    mov x24, #0                      /* end bound of live-cleared VAs */
+.Lfast_munmap_pte_loop:
+    mov x0, x26
+    bl cow_find_l3_pte
+    cbz x0, .Lfast_munmap_bail
+    /* L3 descriptors are contiguous within one 2MiB block: walk once per
+     * block and stride the table until the block or the range ends. */
+    add x13, x26, #(1 << 21)
+    and x13, x13, #0xffffffffffe00000
+    cmp x13, x27
+    csel x13, x13, x27, lo
+    /* Claim each descriptor with a compare-and-swap, waiting out a COW
+     * materializer: its publish is a blind store, so a plain stlr here
+     * could be overwritten and the mapping would outlive the munmap. The
+     * plain load only routes; casal (LSE, see urandom_lock_spin) re-checks
+     * the value atomically, so a claim slipping in between makes the swap
+     * miss and the page is re-handled. Track the bounding box of
+     * descriptors that were actually valid -- only those can be cached in
+     * a TLB. */
+.Lfast_munmap_pte_read:
+    ldr x25, [x0]
+    tbnz x25, #PTE_SW_COW_MAT_BIT, .Lfast_munmap_pte_wait
+    cbz x25, .Lfast_munmap_pte_next
+    tbnz x25, #PTE_SW_COW_ZERO_BIT, .Lfast_munmap_clear_cow
+    /* Winning the CAS prevents a concurrent materializer from publishing over
+     * the unmap. Record the page for one host-accelerated scrub after the walk
+     * instead of clearing 4 KiB with low-throughput EL1 stores. */
+    mov x28, x25
+    casal x28, xzr, [x0]
+    cmp x28, x25
+    b.ne .Lfast_munmap_pte_read
+    sub x14, x26, x20               /* page offset in this mapping */
+    lsr x14, x14, #12               /* page index, 0..511 */
+    lsr x15, x14, #6                /* bitmap word */
+    and x14, x14, #63               /* bit within word */
+    mov x16, #1
+    lsl x16, x16, x14
+    ldr x28, [x18, x15, lsl #3]
+    orr x28, x28, x16
+    str x28, [x18, x15, lsl #3]
+    mov x17, #1
+    b .Lfast_munmap_pte_cleared
+.Lfast_munmap_clear_cow:
+    /* Untouched templates and read-touched zero aliases have no meaningful
+     * identity bytes, so invalidate them directly. */
+    mov x28, x25
+    casal x28, xzr, [x0]
+    cmp x28, x25
+    b.ne .Lfast_munmap_pte_read
+.Lfast_munmap_pte_cleared:
+    tbz x25, #0, .Lfast_munmap_pte_next
+    cmp x26, x23
+    csel x23, x26, x23, lo
+    add x15, x26, #0x1000
+    cmp x15, x24
+    csel x24, x15, x24, hi
+.Lfast_munmap_pte_next:
+    add x0, x0, #8
+    add x26, x26, #0x1000
+    cmp x26, x13
+    b.lo .Lfast_munmap_pte_read
+    cmp x26, x27
+    b.lo .Lfast_munmap_pte_loop
+    b .Lfast_munmap_tlbi
+.Lfast_munmap_pte_wait:
+    yield
+    b .Lfast_munmap_pte_read
+
+.Lfast_munmap_tlbi:
+    /* The cleared descriptors must be visible to table walkers before the
+     * munmap returns (and before the slot can be reused). Untouched lazy
+     * templates were invalid and can be in no TLB, so a fully untouched
+     * mapping needs no TLB maintenance at all; a small touched footprint
+     * gets per-page invalidates and only a large one pays the full flush.
+     */
+    dsb ishst
+    cmn x23, #1
+    b.eq .Lfast_munmap_finish        /* no live translation was cleared */
+    sub x15, x24, x23
+    cmp x15, #(TLBI_SELECTIVE_MAX << 12)
+    b.hi .Lfast_munmap_flush_all
+    ubfx x12, x23, #12, #44
+    lsr x13, x15, #12
+.Lfast_munmap_sel_loop:
+    tlbi vae1is, x12
+    add x12, x12, #1
+    subs x13, x13, #1
+    b.ne .Lfast_munmap_sel_loop
+    dsb ish
+    isb
+    b .Lfast_munmap_finish
+.Lfast_munmap_flush_all:
+    tlbi vmalle1is
+    dsb ish
+    isb
+.Lfast_munmap_finish:
+    mov x22, x17                      /* stash: nonzero => HVC scrub needed */
+    /* Offer the freed range back to the reuse free-list if a tracking node
+     * is available; otherwise this specific address is not offered for
+     * reuse again (the arena itself is not exhausted, just this hint). */
+    ldr w12, [x19, #FAST_MMAP_NODE_FREE_OFF]
+    mov w13, #FAST_MMAP_SENTINEL
+    cmp w12, w13
+    b.eq .Lfast_munmap_release_done
+    add x14, x19, #FAST_MMAP_NODES_OFF
+    add x14, x14, x12, lsl #4          /* &free_nodes[w12] */
+    ldr w15, [x14, #8]                 /* next free node after this one */
+    str w15, [x19, #FAST_MMAP_NODE_FREE_OFF]
+    str x20, [x14]                     /* node.addr = freed addr */
+    lsr x16, x21, #12
+    sub x16, x16, #1                   /* class = pages - 1 */
+    add x18, x19, #FAST_MMAP_BUCKET_OFF
+    ldr w15, [x18, x16, lsl #2]        /* current bucket_head[class] */
+    str w15, [x14, #8]                 /* node.next = old head */
+    str w12, [x18, x16, lsl #2]        /* bucket_head[class] = this node */
+.Lfast_munmap_release_done:
+    /* HVC dispatch drains the MAP/UNMAP journal first. Drop ctl->lock before
+     * entering the host, then let its optimized memset scrub bitmap runs. */
+    bl fast_mmap_unlock
+    cbz x22, .Lfast_munmap_no_scrub
+    mov x0, x20
+    mov x1, x21
+    hvc #14
+    mov x0, #0
+    b svc_restore_eret
+.Lfast_munmap_no_scrub:
+    mov x0, #0
+    b svc_restore_eret
+
+.Lfast_munmap_bail:
+    bl fast_mmap_unlock
     b handle_svc_0
 
 identity_class_fast:
@@ -1110,6 +1535,15 @@ handle_inst_abort:
     cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
     b.eq 1f
 
+    /* A fetch from an untouched anonymous page translation-faults on the
+     * invalid COW-zero template; validate it into the shared-zero-page
+     * alias (executing zeros then raises SIGILL, matching Linux). */
+    cmp x11, #0x04            /* Translation fault? (0b0001xx) */
+    b.ne handle_el0_fault
+    mrs x0, far_el1
+    bl cow_try_validate
+    cbnz x0, restore_eret
+
     /* Non-permission fault (translation, access flag, etc.) from EL0.
      * Restore all GPRs and forward to host for SIGSEGV delivery.
      * x9 still holds ESR_EL1 for the host to decode fault type.
@@ -1121,6 +1555,416 @@ handle_inst_abort:
     hvc #9
     b tlbi_restore_eret
 
+/* Return the host-accessible EL1 VA of the L3 PTE covering x0, or zero when
+ * the TTBR0 walk is absent or terminates in a block. Page-table pages are
+ * identity-mapped EL1-only by the host page-table builder. */
+cow_find_l3_pte:
+    mov x16, #0x0000fffffffff000
+    mrs x12, ttbr0_el1
+    and x12, x12, x16
+
+    ubfx x13, x0, #39, #9
+    ldr x14, [x12, x13, lsl #3]
+    and x15, x14, #3
+    cmp x15, #3
+    b.ne 9f
+    and x12, x14, x16
+
+    ubfx x13, x0, #30, #9
+    ldr x14, [x12, x13, lsl #3]
+    and x15, x14, #3
+    cmp x15, #3
+    b.ne 9f
+    and x12, x14, x16
+
+    ubfx x13, x0, #21, #9
+    ldr x14, [x12, x13, lsl #3]
+    and x15, x14, #3
+    cmp x15, #3
+    b.ne 9f
+    and x12, x14, x16
+
+    ubfx x13, x0, #12, #9
+    add x0, x12, x13, lsl #3
+    ret
+9:  mov x0, #0
+    ret
+
+/* Try to resolve a COW_ZERO write fault entirely at EL1.
+ *
+ * Input:  x0 = FAR_EL1
+ * Output: x0 = 1 when COW was handled, 2 when a valid non-COW PTE was found,
+ *         0 when the caller must use the normal fault path
+ *
+ * PTE state is the synchronization primitive shared with host materializers:
+ *   invalid+COW_ZERO template           (installed by mmap)
+ *     -> valid+COW_ZERO read-only alias (first load/fetch, cow_try_validate)
+ *   either -> invalid+MATERIALIZING -> EL1-only+MATERIALIZING
+ *     -> valid private page.
+ * A write-first touch claims the invalid template, which no PE can have
+ * cached, so it resolves with no TLB maintenance at all. Only breaking out
+ * of a live zero alias (read-then-write) needs a broadcast TLBI: the
+ * EL1-only install is invalid->valid and the final publish only relaxes
+ * access permissions, so neither needs break-before-make. A PE that still
+ * holds the EL1-only descriptor recovers via the stale-PTE retry at 4:
+ * below (writes), the read-permission wait in handle_data_abort, or the
+ * host's bounded stale-TLB retry (instruction fetches).
+ */
+cow_try_materialize:
+    mov x10, x30
+    mov x11, #0                    /* saw MATERIALIZING */
+    mov x17, x0
+    bl cow_find_l3_pte
+    cbz x0, 8f
+    mov x18, x0                    /* user PTE */
+
+1:  ldar x24, [x18]
+    tbnz x24, #PTE_SW_COW_MAT_BIT, 7f
+    tbz x24, #PTE_SW_COW_ZERO_BIT, 5f
+
+    bic x25, x24, #1              /* break: clear VALID */
+    bic x25, x25, #(1 << PTE_SW_COW_ZERO_BIT)
+    orr x25, x25, #(1 << PTE_SW_COW_MAT_BIT)
+2:  ldaxr x26, [x18]
+    cmp x26, x24
+    b.ne 6f
+    stlxr w27, x25, [x18]
+    cbnz w27, 2b
+
+    /* A claimed invalid template cannot be in any TLB, so a write-first
+     * touch needs no break-before-make and takes the batched fault-around
+     * path below. Only a live zero alias (read-then-write) must break its
+     * translation with a broadcast before the page can go private. */
+    tbz x24, #0, .Lcow_fault_around
+    dsb ishst
+    ubfx x12, x17, #12, #44
+    tlbi vae1is, x12
+    dsb ish
+    isb
+
+    /* Remap the faulting page in place as EL1-only (AP=00) at its identity
+     * GPA and zero it through the user VA itself. MATERIALIZING stays set
+     * in the descriptor so racing vCPUs and host materializers keep waiting
+     * on the PTE word, and EL0 cannot observe the page before it is zeroed.
+     * The invalid->valid install needs no TLB maintenance. */
+    mov x28, #0x0000fffffffff000
+    and x29, x17, x28             /* identity GPA == page-aligned VA */
+    mov x26, #0x727               /* AF|ISH|NS|Attr1|L3 page */
+    orr x25, x29, x26
+    mov x26, #3
+    lsl x26, x26, #53             /* UXN|PXN, AP=EL1 RW */
+    orr x25, x25, x26
+    orr x25, x25, #(1 << PTE_SW_COW_MAT_BIT)
+    stlr x25, [x18]
+    dsb ishst
+    isb
+
+    /* Clear exactly one guest page. 64 bytes per iteration, mirroring the
+     * DC ZVA emulation above (HCR_EL2.TDZ also traps EL1 DC ZVA, so the
+     * real instruction would exit to the host once per block). */
+    mov x26, #64
+    mov x27, x29
+3:  stp xzr, xzr, [x27]
+    stp xzr, xzr, [x27, #16]
+    stp xzr, xzr, [x27, #32]
+    stp xzr, xzr, [x27, #48]
+    add x27, x27, #64
+    subs x26, x26, #1
+    b.ne 3b
+    dsb ishst
+
+    /* Make the private user mapping writable. Preserve the original memory
+     * attributes/XN bits, replace output PA, clear software state and AP[2:1],
+     * then select RW at EL0 (AP=01). Only the access permissions change, so
+     * no break-before-make is required; a PE that still holds the EL1-only
+     * descriptor takes a spurious fault and recovers without help. The local
+     * walker cached that descriptor while zeroing, so drop it with a
+     * non-broadcast TLBI before the retry. */
+    bic x25, x24, x28
+    bic x25, x25, #(3 << 6)
+    bic x25, x25, #(1 << PTE_SW_COW_ZERO_BIT)
+    bic x25, x25, #(1 << PTE_SW_COW_MAT_BIT)
+    orr x25, x25, x29
+    orr x25, x25, #(1 << 6)
+    stlr x25, [x18]
+    dsb ishst
+    ubfx x12, x17, #12, #44
+    tlbi vae1, x12
+    dsb nsh
+    isb
+    mov x0, #1
+    mov x30, x10
+    ret
+
+.Lcow_fault_around:
+    /* Batched write-first materialization. A sequential first-write streak
+     * doubles a per-vCPU window (capped at COW_FAULT_AROUND_MAX pages), so
+     * dense forward touches amortize the trap cost across the window while
+     * random touches stay at one page. Every transition here is
+     * invalid->valid, so the batch needs no TLB maintenance beyond
+     * dropping the EL1-only descriptors our own zeroing walk cached
+     * (non-broadcast, batched at the end).
+     *
+     * Locate this vCPU's cursor from its EL1 stack slot; the exception
+     * frame lives in the page below that slot's initial SP. */
+    mrs x12, tpidr_el1             /* shim_data base */
+    add x13, x12, #(SHIM_DATA_SIZE >> 12), lsl #12
+    mov x14, sp
+    and x14, x14, #0xfffffffffffff000
+    sub x13, x13, x14              /* (slot + 1) * 4 KiB */
+    lsr x13, x13, #12
+    sub x13, x13, #1               /* slot index */
+    add x21, x12, #(SHIM_COW_SCRATCH_OFF >> 12), lsl #12
+    add x21, x21, x13, lsl #6      /* 64-byte state slot: writes at +0 */
+    ldp x15, x16, [x21]            /* expected next VA, window */
+
+    mov x28, #0x0000fffffffff000
+    and x14, x17, x28              /* faulting page VA == identity GPA */
+    mov x22, #1
+    cmp x15, x14
+    b.ne .Lcow_fa_sized
+    lsl x22, x16, #1
+    mov x16, #COW_FAULT_AROUND_MAX
+    cmp x22, x16
+    csel x22, x22, x16, ls
+    cmp x22, #0
+    csinc x22, x22, xzr, ne        /* stale zero window -> 1 */
+.Lcow_fa_sized:
+    add x20, x14, x22, lsl #12     /* window end */
+    add x16, x14, #(1 << 21)
+    and x16, x16, #0xffffffffffe00000
+    cmp x20, x16
+    csel x20, x20, x16, lo         /* clamp at the L3 table boundary */
+
+    /* Descriptor bases, derived once from the claimed template (x24): the
+     * EL1-only+MATERIALIZING value for the zeroing window and the private
+     * EL0-RW publish value. The per-page identity PA is OR'd in below. */
+    mov x23, #0x727                /* AF|ISH|NS|Attr1|L3, AP=EL1 RW */
+    mov x25, #3
+    lsl x25, x25, #53              /* UXN|PXN */
+    orr x23, x23, x25
+    orr x23, x23, #(1 << PTE_SW_COW_MAT_BIT)
+    bic x11, x24, x28
+    bic x11, x11, #(3 << 6)
+    bic x11, x11, #(1 << PTE_SW_COW_ZERO_BIT)
+    bic x11, x11, #(1 << PTE_SW_COW_MAT_BIT)
+    orr x11, x11, #(1 << 6)        /* AP=01: RW at EL0 */
+    orr x11, x11, #1
+
+    /* Claim-and-install pass. The faulting page is already claimed; write
+     * its EL1-only descriptor, then extend over pages that still hold the
+     * exact same invalid template (which guarantees identical attributes),
+     * stopping at the first mismatch: validated, materializing, another
+     * region's template, or unmapped. */
+    mov x15, x18                   /* start PTE */
+    orr x25, x23, x14
+    stlr x25, [x18]
+    add x29, x14, #0x1000
+    add x18, x18, #8
+.Lcow_fa_claim:
+    cmp x29, x20
+    b.hs .Lcow_fa_claimed
+    ldaxr x25, [x18]
+    cmp x25, x24
+    b.ne .Lcow_fa_claim_stop
+    orr x26, x23, x29
+    stlxr w27, x26, [x18]
+    cbnz w27, .Lcow_fa_claim
+    add x29, x29, #0x1000
+    add x18, x18, #8
+    b .Lcow_fa_claim
+.Lcow_fa_claim_stop:
+    clrex
+.Lcow_fa_claimed:
+    mov x20, x29                   /* end of the claimed run */
+    dsb ishst
+    isb
+
+    /* Zero the whole run through the user VAs; 64 bytes per iteration,
+     * mirroring the single-page loop above. */
+    sub x26, x20, x14
+    lsr x26, x26, #6
+    mov x27, x14
+.Lcow_fa_zero:
+    stp xzr, xzr, [x27]
+    stp xzr, xzr, [x27, #16]
+    stp xzr, xzr, [x27, #32]
+    stp xzr, xzr, [x27, #48]
+    add x27, x27, #64
+    subs x26, x26, #1
+    b.ne .Lcow_fa_zero
+    dsb ishst
+
+    /* Publish every page in the run as a private EL0-RW mapping. */
+    mov x29, x14
+    mov x18, x15
+.Lcow_fa_publish:
+    orr x25, x11, x29
+    stlr x25, [x18]
+    add x29, x29, #0x1000
+    add x18, x18, #8
+    cmp x29, x20
+    b.lo .Lcow_fa_publish
+
+    stp x20, x22, [x21]            /* cursor: next expected VA, window */
+
+    /* Drop the EL1-only descriptors our zeroing walk cached. The publish
+     * stores are walker-visible after the barrier, so nothing stale can be
+     * refetched; non-broadcast is enough because other PEs recover through
+     * the stale-PTE retries. */
+    dsb ishst
+    ubfx x12, x14, #12, #44
+    sub x13, x20, x14
+    lsr x13, x13, #12
+.Lcow_fa_tlbi:
+    tlbi vae1, x12
+    add x12, x12, #1
+    subs x13, x13, #1
+    b.ne .Lcow_fa_tlbi
+    dsb nsh
+    isb
+    mov x0, #1
+    mov x30, x10
+    ret
+
+6:  clrex
+    b 1b
+7:  mov x11, #1
+    yield
+    b 1b
+5:  tbz x24, #0, 8f               /* raced munmap/PROT_NONE, not COW */
+    cbz x11, 4f
+    ubfx x12, x17, #12, #44
+    tlbi vae1is, x12
+    dsb ish
+    isb
+    mov x0, #1
+    mov x30, x10
+    ret
+4:  /* Live non-COW PTE with no MATERIALIZING sighting. When it grants EL0
+     * write (AP=01), the fault can only come from a stale TLB entry -- e.g.
+     * the EL1-only window descriptor published without a broadcast -- so
+     * drop the local copy and retry. Anything else is a genuine fault. */
+    and x25, x24, #(3 << 6)
+    cmp x25, #(1 << 6)
+    b.ne 9f
+    ubfx x12, x17, #12, #44
+    tlbi vae1, x12
+    dsb nsh
+    isb
+    mov x0, #1
+    mov x30, x10
+    ret
+9:  mov x0, #2                    /* live PTE after stale translation fault */
+    mov x30, x10
+    ret
+8:  mov x0, #0
+    mov x30, x10
+    ret
+
+/* Try to validate an invalid COW_ZERO template for a load or fetch.
+ *
+ * Input:  x0 = FAR_EL1
+ * Output: x0 = 1 when the descriptor is live (retry the access),
+ *         0 when the caller must use the normal fault path
+ *
+ * The first read of an untouched anonymous page turns the invalid template
+ * installed by mmap into the valid read-only shared-zero-page alias by
+ * setting only the VALID bit. invalid->valid needs no TLB maintenance; a
+ * later write takes the permission-fault COW path above.
+ */
+cow_try_validate:
+    mov x10, x30
+    mov x17, x0
+    bl cow_find_l3_pte
+    cbz x0, 4f
+    mov x18, x0                    /* user PTE */
+
+1:  ldar x24, [x18]
+    tbnz x24, #PTE_SW_COW_MAT_BIT, 3f
+    tbnz x24, #0, 2f              /* raced validate/materialize: local retry */
+    tbz x24, #PTE_SW_COW_ZERO_BIT, 4f
+
+    orr x11, x24, #1               /* the alias value for the whole run */
+5:  ldaxr x26, [x18]
+    cmp x26, x24
+    b.ne 6f
+    stlxr w27, x11, [x18]
+    cbnz w27, 5b
+
+    /* Fault-around for sequential reads: the same doubling-window cursor
+     * scheme as the write path (see cow_try_materialize), kept in the
+     * second half of the 32-byte per-vCPU slot. Validation only sets the
+     * VALID bit on the template, so batching costs one compare-and-swap
+     * per page -- no zeroing and no TLB maintenance at all. */
+    mrs x12, tpidr_el1             /* shim_data base */
+    add x13, x12, #(SHIM_DATA_SIZE >> 12), lsl #12
+    mov x14, sp
+    and x14, x14, #0xfffffffffffff000
+    sub x13, x13, x14              /* (slot + 1) * 4 KiB */
+    lsr x13, x13, #12
+    sub x13, x13, #1               /* slot index */
+    add x21, x12, #(SHIM_COW_SCRATCH_OFF >> 12), lsl #12
+    add x21, x21, x13, lsl #6      /* 64-byte state slot: reads at +16 */
+    ldp x15, x16, [x21, #16]       /* expected next VA, window */
+
+    mov x28, #0x0000fffffffff000
+    and x14, x17, x28              /* faulting page VA */
+    mov x22, #1
+    cmp x15, x14
+    b.ne .Lcv_sized
+    lsl x22, x16, #1
+    mov x16, #COW_FAULT_AROUND_MAX
+    cmp x22, x16
+    csel x22, x22, x16, ls
+    cmp x22, #0
+    csinc x22, x22, xzr, ne        /* stale zero window -> 1 */
+.Lcv_sized:
+    add x20, x14, x22, lsl #12     /* window end */
+    add x16, x14, #(1 << 21)
+    and x16, x16, #0xffffffffffe00000
+    cmp x20, x16
+    csel x20, x20, x16, lo         /* clamp at the L3 table boundary */
+
+    add x29, x14, #0x1000
+    add x18, x18, #8
+.Lcv_claim:
+    cmp x29, x20
+    b.hs .Lcv_done
+    ldaxr x25, [x18]
+    cmp x25, x24                   /* exact same invalid template only */
+    b.ne .Lcv_stop
+    stlxr w27, x11, [x18]
+    cbnz w27, .Lcv_claim
+    add x29, x29, #0x1000
+    add x18, x18, #8
+    b .Lcv_claim
+.Lcv_stop:
+    clrex
+.Lcv_done:
+    stp x29, x22, [x21, #16]       /* cursor: next expected VA, window */
+    dsb ishst
+    isb
+    b 7f
+2:  /* A valid descriptor can still fault through this PE's stale-negative
+     * translation. Unlike the host resolver, this EL1 retry path has no
+     * bounded stale-cache fallback, so invalidate locally before retrying. */
+    ubfx x12, x17, #12, #44
+    tlbi vae1, x12
+    dsb nsh
+    isb
+7:  mov x0, #1
+    mov x30, x10
+    ret
+
+3:  yield                          /* a materializer owns the word */
+    b 1b
+6:  clrex
+    b 1b
+4:  mov x0, #0
+    mov x30, x10
+    ret
+
 /* handle_data_abort: EC=0x24: Data abort from lower EL
  *
  * Three cases:
@@ -1129,18 +1973,56 @@ handle_inst_abort:
  * 2. Read/write translation fault (DFSC[5:2]=0x01): Address not mapped.
  *    Deliver SIGSEGV (SEGV_MAPERR) via host. Programs may use SIGSEGV
  *    handlers for lazy allocation or guard pages.
- * 3. Read permission fault (WnR=0, DFSC[5:2]=0x03): Permission denied.
- *    Deliver SIGSEGV (SEGV_ACCERR) via host.
+ * 3. Read permission fault (WnR=0, DFSC[5:2]=0x03): wait out a transient
+ *    fault-around MATERIALIZING descriptor, otherwise deliver SIGSEGV
+ *    (SEGV_ACCERR) via host.
  */
 handle_data_abort:
     and x11, x9, #0x3C       /* DFSC[5:2] */
     cmp x11, #0x0C            /* Permission fault? (0b0011xx) */
-    b.ne handle_el0_fault     /* Translation/other fault -> SIGSEGV */
+    b.eq 1f
 
+    /* Translation faults are the COW-zero fast paths now: a write-first
+     * touch of the invalid template materializes the private page, a read
+     * validates the template into the shared-zero-page alias, and a sibling
+     * that observes the transient invalid MATERIALIZING PTE waits for the
+     * winner. Anything else falls through to SIGSEGV via the host. */
+    cmp x11, #0x04            /* Translation fault? (0b0001xx) */
+    b.ne handle_el0_fault
+    mrs x0, far_el1
+    tst x9, #(1 << 6)         /* WnR: 1=write, 0=read */
+    b.eq .Lda_tfault_read
+    bl cow_try_materialize
+    cbnz x0, restore_eret
+    b handle_el0_fault
+.Lda_tfault_read:
+    bl cow_try_validate
+    cbnz x0, restore_eret
+    b handle_el0_fault
+
+1:
     tst x9, #(1 << 6)        /* WnR bit: 1=write, 0=read */
-    b.eq handle_el0_fault     /* Read permission fault -> SIGSEGV */
+    b.ne .Lda_pfault_write
 
+    /* Fault-around temporarily publishes valid EL1-only descriptors while
+     * zeroing a claimed run. A sibling EL0 reader sees those as permission
+     * faults, not translation faults. cow_try_materialize returns 1 only
+     * after observing MATERIALIZING and waiting for the private EL0 mapping;
+     * ordinary EL1-only/read-denied mappings return another value and retain
+     * the normal SIGSEGV behavior. */
+    mrs x0, far_el1
+    bl cow_try_materialize
+    cmp x0, #1
+    b.eq restore_eret
+    b handle_el0_fault
+
+.Lda_pfault_write:
     mrs x0, far_el1           /* Faulting address */
+    bl cow_try_materialize
+    cmp x0, #1
+    b.eq restore_eret          /* COW handled locally; retry original store */
+
+    mrs x0, far_el1           /* Non-COW write permission fault */
     mov x1, #1                /* Type 1 = write fault -> flip to RW */
     hvc #9
     b tlbi_restore_eret
@@ -1282,7 +2164,28 @@ tlbi_restore_eret:
     /* Fall through to restore_eret */
 
 restore_eret:
-    /* Restore all GPRs from saved frame and return to EL0 */
+    /* hv_vcpus_exit may have canceled this vCPU in the middle of a COW
+     * transaction. The host sets a per-vCPU rendezvous flag and resumes EL1;
+     * only after the transaction reaches this common tail do we restore the
+     * original EL0 registers and exit through HVC #13 for safe signal/ptrace
+     * handling. The flag is indexed from this exception frame's stack slot. */
+    mrs x12, tpidr_el1
+    add x13, x12, #(SHIM_DATA_SIZE >> 12), lsl #12
+    mov x14, sp
+    and x14, x14, #0xfffffffffffff000
+    sub x13, x13, x14
+    lsr x13, x13, #12
+    sub x13, x13, #1
+    add x12, x12, #(SHIM_COW_SCRATCH_OFF >> 12), lsl #12
+    add x12, x12, x13, lsl #6
+    add x12, x12, #SHIM_COW_PREEMPT_OFF
+    ldar w13, [x12]
+    cbz w13, .Lrestore_eret_direct
+    stlr wzr, [x12]
+    RESTORE_GPRS
+    hvc #13
+    eret
+.Lrestore_eret_direct:
     RESTORE_GPRS
     eret
 
@@ -1453,6 +2356,25 @@ svc_restore_eret:
      * Caught the hard way during the prior P2 attempt; keep the
      * named symbol to make the intent explicit.
      */
+    /* Same post-transaction rendezvous as restore_eret, but retain the host or
+     * EL1-fast syscall result in X0 while restoring every other EL0 register. */
+    mrs x12, tpidr_el1
+    add x13, x12, #(SHIM_DATA_SIZE >> 12), lsl #12
+    mov x14, sp
+    and x14, x14, #0xfffffffffffff000
+    sub x13, x13, x14
+    lsr x13, x13, #12
+    sub x13, x13, #1
+    add x12, x12, #(SHIM_COW_SCRATCH_OFF >> 12), lsl #12
+    add x12, x12, x13, lsl #6
+    add x12, x12, #SHIM_COW_PREEMPT_OFF
+    ldar w13, [x12]
+    cbz w13, .Lsvc_restore_direct
+    stlr wzr, [x12]
+    RESTORE_GPRS_KEEP_X0
+    hvc #13
+    eret
+.Lsvc_restore_direct:
     RESTORE_GPRS_KEEP_X0
 
     /* Return to EL0. X0 now holds the syscall return value,
@@ -1468,4 +2390,17 @@ exec_drop_frame:
     dsb ish
     isb
     add sp, sp, #256
+    eret
+
+/* A GDB memory write runs on the listener pthread, not a vCPU owner, so its
+ * lazy-zero materialization cannot use the normal HVC return protocol. The
+ * owner redirects here when leaving an all-stop pause. ELR_EL1/SPSR_EL1 hold
+ * the requested GDB resume state; no exception frame is live on this path. */
+.org 0x2500
+gdb_tlbi_resume:
+    tlbi vmalle1is
+    dsb ish
+    ic iallu
+    dsb ish
+    isb
     eret

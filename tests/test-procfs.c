@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -26,6 +27,35 @@ int passes = 0, fails = 0;
 
 #define AT_NULL 0
 #define AT_PAGESZ 6
+
+static uint64_t parse_status_kb(const char *buf, const char *field)
+{
+    const char *p = strstr(buf, field);
+    if (!p)
+        return UINT64_MAX;
+    p += strlen(field);
+    while (*p == ' ' || *p == '\t')
+        p++;
+    uint64_t value = 0;
+    while (*p >= '0' && *p <= '9')
+        value = value * 10 + (uint64_t) (*p++ - '0');
+    return value;
+}
+
+static uint64_t parse_statm_rss(const char *buf)
+{
+    const char *p = buf;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p < '0' || *p > '9')
+        return UINT64_MAX;
+    uint64_t value = 0;
+    while (*p >= '0' && *p <= '9')
+        value = value * 10 + (uint64_t) (*p++ - '0');
+    return value;
+}
 
 int main(void)
 {
@@ -134,6 +164,47 @@ int main(void)
             } else {
                 FAIL("empty status");
             }
+        }
+    }
+
+    TEST("procfs: lazy pages are absent from VmRSS and statm RSS");
+    {
+        n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+        uint64_t status_before =
+            n > 0 ? parse_status_kb(buf, "VmRSS:") : UINT64_MAX;
+        n = raw_read_file_nul("/proc/self/statm", buf, sizeof(buf));
+        uint64_t statm_before = n > 0 ? parse_statm_rss(buf) : UINT64_MAX;
+
+        const size_t lazy_len = 64ULL * 1024 * 1024;
+        volatile unsigned char *lazy =
+            mmap(NULL, lazy_len, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (lazy == MAP_FAILED || status_before == UINT64_MAX ||
+            statm_before == UINT64_MAX) {
+            FAIL("setup failed");
+        } else {
+            n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+            uint64_t status_lazy =
+                n > 0 ? parse_status_kb(buf, "VmRSS:") : UINT64_MAX;
+            n = raw_read_file_nul("/proc/self/statm", buf, sizeof(buf));
+            uint64_t statm_lazy = n > 0 ? parse_statm_rss(buf) : UINT64_MAX;
+
+            lazy[0] = 1;
+            n = raw_read_file_nul("/proc/self/status", buf, sizeof(buf));
+            uint64_t status_touched =
+                n > 0 ? parse_status_kb(buf, "VmRSS:") : UINT64_MAX;
+            n = raw_read_file_nul("/proc/self/statm", buf, sizeof(buf));
+            uint64_t statm_touched =
+                n > 0 ? parse_statm_rss(buf) : UINT64_MAX;
+
+            if (status_lazy == status_before &&
+                statm_lazy == statm_before &&
+                status_touched == status_lazy + 4 &&
+                statm_touched == statm_lazy + 1)
+                PASS();
+            else
+                FAIL("lazy RSS accounting mismatch");
+            munmap((void *) lazy, lazy_len);
         }
     }
 

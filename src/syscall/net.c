@@ -820,15 +820,12 @@ int64_t sys_sendto(guest_t *g,
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
 
-    uint64_t avail = 0;
-    void *buf =
-        len > 0 ? guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_R, len) : NULL;
-    if (!buf && len > 0) {
+    host_iov_buf_t source;
+    int64_t source_err = host_iov_prepare_read_range(g, buf_gva, len, &source);
+    if (source_err < 0) {
         host_fd_ref_close(&host_ref);
-        return -LINUX_EFAULT;
+        return source_err;
     }
-    if (len > avail)
-        len = avail;
 
     int mac_flags = translate_msg_flags(linux_flags);
     /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE. macOS has no
@@ -843,15 +840,18 @@ int64_t sys_sendto(guest_t *g,
     if (dest_gva && addrlen > 0) {
         uint8_t linux_sa[128];
         if (addrlen > sizeof(linux_sa)) {
+            host_iov_free(&source);
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
         if (guest_read(g, dest_gva, linux_sa, addrlen) < 0) {
+            host_iov_free(&source);
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
         int mac_len = linux_to_mac_sockaddr(linux_sa, addrlen, &mac_sa);
         if (mac_len < 0) {
+            host_iov_free(&source);
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
@@ -861,19 +861,27 @@ int64_t sys_sendto(guest_t *g,
 
     bool blocking = len > 0 && sock_op_should_block(host_ref.fd, linux_flags);
     int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
+    struct msghdr msg = {
+        .msg_name = dest,
+        .msg_namelen = dest_len,
+        .msg_iov = source.iov,
+        .msg_iovlen = source.iovcnt,
+    };
     ssize_t ret;
     for (;;) {
         if (blocking) {
             int64_t waited = io_wait_fd_or_interrupted(host_ref.fd, POLLOUT);
             if (waited < 0) {
+                host_iov_free(&source);
                 host_fd_ref_close(&host_ref);
                 return waited;
             }
         }
-        ret = sendto(host_ref.fd, buf, len, host_flags, dest, dest_len);
+        ret = sendmsg(host_ref.fd, &msg, host_flags);
         if (!(blocking && ret < 0 && errno == EAGAIN))
             break;
     }
+    host_iov_free(&source);
     host_fd_ref_close(&host_ref);
     if (ret < 0) {
         if (errno == EPIPE && !suppress_sigpipe)

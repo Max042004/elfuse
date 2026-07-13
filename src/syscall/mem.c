@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
+#include "core/shim-globals.h"
 #include "debug/log.h"
 #include "utils.h"
 
@@ -978,6 +979,15 @@ static int mremap_extend_range(guest_t *g,
         return 0;
     }
 
+    /* A MREMAP_FIXED destination may still hold live COW-zero aliases from a
+     * previous anonymous mapping. guest_update_perms below rewrites whatever
+     * output address a descriptor carries, which would turn such an alias
+     * into a plain writable mapping of the shared zero page. Materialize the
+     * range first, mirroring the mprotect path.
+     */
+    if (guest_materialize_lazy_zero_range(g, off, off + size) < 0)
+        return -1;
+
     int page_perms = prot_to_perms(prot);
     uint64_t ext_start = ALIGN_DOWN(off, BLOCK_2MIB);
     uint64_t ext_end = ALIGN_UP(off + size, BLOCK_2MIB);
@@ -1860,6 +1870,7 @@ int64_t sys_mmap(guest_t *g,
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
     bool is_prot_none = (prot == LINUX_PROT_NONE);
     bool is_noreserve = is_anon && (flags & LINUX_MAP_NORESERVE) != 0;
+    bool is_lazy_zero = false;
     host_fd_ref_t backing_ref = {.fd = -1, .owned = 0};
     int host_backing_fd = -1, track_backing_fd = -1;
     /* Tracks whether hvf_apply_file_overlay has installed a host
@@ -1931,6 +1942,9 @@ int64_t sys_mmap(guest_t *g,
     /* Linux kernel rejects MAP_FIXED with non-page-aligned address */
     bool is_fixed =
         (flags & LINUX_MAP_FIXED) || (flags & LINUX_MAP_FIXED_NOREPLACE);
+    is_lazy_zero = is_anon && (flags & LINUX_MAP_PRIVATE) && !is_fixed &&
+                   !is_noreserve && !is_prot_none &&
+                   !(flags & LINUX_MAP_POPULATE) && (prot & LINUX_PROT_WRITE);
     if (is_fixed && (addr & 4095))
         return -LINUX_EINVAL;
 
@@ -2082,6 +2096,23 @@ int64_t sys_mmap(guest_t *g,
 
             if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) <
                 0) {
+                (void) restore_snapshot_overlays_in_place(g, replaced_snaps,
+                                                          replaced_nsnaps);
+                if (track_backing_fd >= 0)
+                    close(track_backing_fd);
+                dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
+                host_fd_ref_close(&backing_ref);
+                return -LINUX_ENOMEM;
+            }
+
+            /* MAP_FIXED may replace an untouched lazy anonymous mapping whose
+             * live descriptor still points at the shared zero page. Rewriting
+             * that valid descriptor directly to a different output address is
+             * a valid->valid break-before-make violation. Materialize first;
+             * guest_update_perms below then only changes attributes on the
+             * already-private output page. */
+            if (guest_materialize_lazy_zero_range(g, result_off,
+                                                  result_off + length) < 0) {
                 (void) restore_snapshot_overlays_in_place(g, replaced_snaps,
                                                           replaced_nsnaps);
                 if (track_backing_fd >= 0)
@@ -2303,6 +2334,9 @@ int64_t sys_mmap(guest_t *g,
             if (addr != 0) {
                 uint64_t hint_off = addr - g->ipa_base;
                 if (hint_off >= ELF_DEFAULT_BASE && hint_off <= g->mmap_limit &&
+                    (!shim_fast_mmap_is_enabled(g) ||
+                     !(hint_off >= SHIM_FAST_MMAP_ARENA_BASE &&
+                       hint_off < SHIM_FAST_MMAP_ARENA_END)) &&
                     length <= g->mmap_limit - hint_off) {
                     /* Real Linux treats non-fixed mmap(addr!=0) as a strong
                      * hint, including low canonical addresses such as the
@@ -2333,11 +2367,11 @@ int64_t sys_mmap(guest_t *g,
                 }
             }
             if (result_off == UINT64_MAX)
-                result_off =
-                    find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
+                result_off = find_free_gap(g, length, SHIM_FAST_MMAP_ARENA_END,
+                                           g->mmap_limit, align);
             if (result_off == UINT64_MAX && align != fallback_align)
-                result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit,
-                                           fallback_align);
+                result_off = find_free_gap(g, length, SHIM_FAST_MMAP_ARENA_END,
+                                           g->mmap_limit, fallback_align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RW address space exhausted "
@@ -2435,8 +2469,18 @@ int64_t sys_mmap(guest_t *g,
                 g->mmap_end = ext_end;
         }
 
-        /* Zero the mapped region */
-        memset((uint8_t *) g->host_base + result_off, 0, length);
+        if (is_lazy_zero) {
+            int page_perms = prot_to_perms(prot);
+            if (guest_install_lazy_zero_pages(g, result_off, length,
+                                              page_perms) < 0) {
+                if (track_backing_fd >= 0)
+                    close(track_backing_fd);
+                host_fd_ref_close(&backing_ref);
+                return -LINUX_ENOMEM;
+            }
+        } else {
+            memset((uint8_t *) g->host_base + result_off, 0, length);
+        }
     }
 
     /* MAP_NORESERVE: invalidate any stale PTEs (like PROT_NONE path) but track
@@ -2557,9 +2601,16 @@ int64_t sys_mmap(guest_t *g,
     /* Record the new region. guest_region_add_ex derives shared from the
      * LINUX_MAP_SHARED bit in track_flags for msync write-back.
      */
-    if (guest_region_add_ex_owned(g, result_off, result_off + length, prot,
-                                  track_flags, is_anon ? 0 : (uint64_t) offset,
-                                  NULL, track_backing_fd) < 0) {
+    int region_rc = is_lazy_zero
+                        ? guest_region_add_ex_owned_lazy_zero(
+                              g, result_off, result_off + length, prot,
+                              track_flags, is_anon ? 0 : (uint64_t) offset,
+                              NULL, track_backing_fd)
+                        : guest_region_add_ex_owned(
+                              g, result_off, result_off + length, prot,
+                              track_flags, is_anon ? 0 : (uint64_t) offset,
+                              NULL, track_backing_fd);
+    if (region_rc < 0) {
         /* Region table was full: undo any host overlay we just installed so the
          * file is not left mmap'd at host_base+ipa with no tracking. Without
          * this, a later operation in that range would memset zeros directly
@@ -2821,6 +2872,21 @@ int64_t sys_mremap(guest_t *g,
             if (track_backing_fd >= 0)
                 close(track_backing_fd);
             return dest_nsnaps;
+        }
+
+        /* Untouched COW-zero source pages carry no bytes at their identity
+         * backing, so the raw memmove below would copy whatever the backing
+         * last held. Materialize the source range first so the copy reads
+         * its true zero contents; nothing has been mutated yet, so failure
+         * unwinds like the snapshot errors above.
+         */
+        if (guest_materialize_lazy_zero_range(g, old_off, old_off + old_size) <
+            0) {
+            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
+            dispose_region_snapshots(&source_snaps, &source_nsnaps);
+            if (track_backing_fd >= 0)
+                close(track_backing_fd);
+            return -LINUX_ENOMEM;
         }
 
         if (source_overlay) {
@@ -3094,8 +3160,8 @@ int64_t sys_mremap(guest_t *g,
             new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit,
                                     mremap_align);
         else
-            new_off = find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit,
-                                    mremap_align);
+            new_off = find_free_gap(g, new_size, SHIM_FAST_MMAP_ARENA_END,
+                                    g->mmap_limit, mremap_align);
 
         if (new_off == UINT64_MAX) {
             if (track_backing_fd >= 0)
@@ -3105,6 +3171,16 @@ int64_t sys_mremap(guest_t *g,
 
         remove_range_t removed = {old_off, old_off + old_size};
         if (!region_has_capacity_after_removes(g, &removed, 1, 1)) {
+            if (track_backing_fd >= 0)
+                close(track_backing_fd);
+            return -LINUX_ENOMEM;
+        }
+
+        /* See the MREMAP_FIXED path: give untouched COW-zero source pages
+         * their real zero backing before the raw copy below reads it.
+         */
+        if (guest_materialize_lazy_zero_range(g, old_off, old_off + old_size) <
+            0) {
             if (track_backing_fd >= 0)
                 close(track_backing_fd);
             return -LINUX_ENOMEM;
@@ -3238,6 +3314,42 @@ static bool madvise_range_mapped(const guest_t *g,
     return covered >= end;
 }
 
+static bool madvise_can_reinstall_lazy_zero(const guest_t *g,
+                                            const guest_region_t *r)
+{
+    return (r->flags & LINUX_MAP_ANONYMOUS) && !r->shared && !r->noreserve &&
+           (r->prot & LINUX_PROT_WRITE) && r->gpa_base == r->start &&
+           r->end <= g->guest_size;
+}
+
+/* Discard every complete host page inside [ptr, ptr+length), and explicitly
+ * zero the sub-page edges. Guest pages are 4 KiB while Apple Silicon host pages
+ * are normally 16 KiB; passing an unaligned guest range directly to madvise
+ * could discard live bytes belonging to an adjacent guest page. If the host
+ * refuses the advice, memset the aligned interior as the correctness fallback.
+ */
+static void madvise_discard_anon_backing(void *ptr, uint64_t length)
+{
+    uint8_t *start = ptr;
+    uint8_t *end = start + length;
+    uintptr_t hps = host_page_size_cached();
+    uint8_t *discard_start = (uint8_t *) ALIGN_UP((uintptr_t) start, hps);
+    uint8_t *discard_end = (uint8_t *) ALIGN_DOWN((uintptr_t) end, hps);
+
+    if (discard_start > end)
+        discard_start = end;
+    if (discard_end < start)
+        discard_end = start;
+    if (discard_start > start)
+        memset(start, 0, (size_t) (discard_start - start));
+    if (discard_end > discard_start &&
+        madvise(discard_start, (size_t) (discard_end - discard_start),
+                MADV_DONTNEED) < 0)
+        memset(discard_start, 0, (size_t) (discard_end - discard_start));
+    if (end > discard_end)
+        memset(discard_end, 0, (size_t) (end - discard_end));
+}
+
 int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
 {
     if (addr & 4095)
@@ -3295,6 +3407,21 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
             return -LINUX_ENOMEM;
 
         uint64_t end = off + length;
+        /* Finish every fallible block-to-table split before changing backing
+         * bytes. Once prepared, reinstalling templates cannot fail for page
+         * table allocation halfway through a multi-region request. */
+        for (int i = 0; i < g->nregions; i++) {
+            const guest_region_t *r = &g->regions[i];
+            if (r->start >= end)
+                break;
+            if (r->end <= off || !madvise_can_reinstall_lazy_zero(g, r))
+                continue;
+            uint64_t zstart = (r->start > off) ? r->start : off;
+            uint64_t zend = (r->end < end) ? r->end : end;
+            if (guest_prepare_lazy_zero_pages(g, zstart, zend - zstart) < 0)
+                return -LINUX_ENOMEM;
+        }
+
         for (int i = 0; i < g->nregions; i++) {
             const guest_region_t *r = &g->regions[i];
             if (r->start >= end)
@@ -3322,7 +3449,12 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
              * identity regions gpa_base == start, so this is unchanged.
              */
             uint64_t rgpa = r->gpa_base + (zstart - r->start);
-            memset(host_ptr_for_gpa(g, rgpa), 0, zend - zstart);
+            bool reinstall_lazy = madvise_can_reinstall_lazy_zero(g, r);
+            void *host_ptr = host_ptr_for_gpa(g, rgpa);
+            if (reinstall_lazy)
+                madvise_discard_anon_backing(host_ptr, zend - zstart);
+            else
+                memset(host_ptr, 0, zend - zstart);
             if (!(r->flags & LINUX_MAP_ANONYMOUS)) {
                 /* Restore file-backed pages from the current backing image.
                  * read_file_range_to_guest resolves the destination through
@@ -3336,6 +3468,10 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
                     zend - zstart);
                 if (err < 0)
                     return err;
+            } else if (reinstall_lazy && guest_install_lazy_zero_pages(
+                                             g, zstart, zend - zstart,
+                                             prot_to_perms(r->prot)) < 0) {
+                return -LINUX_ENOMEM;
             }
         }
         return 0;
@@ -3413,8 +3549,8 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
         return -LINUX_EINVAL;
 
     /* Restore slab backing under any active MAP_SHARED file overlay before
-     * zeroing the host VA. Without this, the memset below would write zeros
-     * directly into the file.
+     * clearing private backing below. Without this, the non-lazy memset would
+     * write zeros directly into the file.
      */
     int cleanup_err = cleanup_overlays_in_range(g, unmap_off, end);
     if (cleanup_err < 0)
@@ -3424,7 +3560,7 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
      * if the page table pool is exhausted. Failing before region removal keeps
      * metadata consistent.
      */
-    if (guest_invalidate_ptes(g, unmap_off, end) < 0)
+    if (guest_invalidate_ptes_for_munmap(g, unmap_off, end) < 0)
         return -LINUX_ENOMEM;
     for (int i = 0; i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
@@ -3433,6 +3569,9 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
         if (r->end <= unmap_off)
             continue;
         if (r->prot == LINUX_PROT_NONE)
+            continue;
+        /* The munmap PTE walk already zeroed only materialized pages. */
+        if (r->lazy_zero)
             continue;
         uint64_t zstart = (r->start > unmap_off) ? r->start : unmap_off;
         uint64_t zend = (r->end < end) ? r->end : end;
@@ -3605,10 +3744,14 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
              * short-circuiting on stale tracker state.
              */
             if (prot != LINUX_PROT_NONE) {
+                if (guest_materialize_lazy_zero_range(g, addr, mprot_end) < 0)
+                    return -LINUX_ENOMEM;
                 if (guest_update_perms(g, addr, mprot_end,
                                        prot_to_perms(prot)) < 0)
                     return -LINUX_ENOMEM;
             } else {
+                if (guest_materialize_lazy_zero_range(g, addr, mprot_end) < 0)
+                    return -LINUX_ENOMEM;
                 if (guest_invalidate_ptes(g, addr, mprot_end) < 0)
                     return -LINUX_ENOMEM;
             }
@@ -3641,12 +3784,18 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 
             if (prot != LINUX_PROT_NONE) {
                 int page_perms = prot_to_perms(prot);
+                if (guest_materialize_lazy_zero_range(g, mprot_off,
+                                                      mprot_end) < 0)
+                    return -LINUX_ENOMEM;
                 if (guest_extend_page_tables(g, mprot_off, mprot_end,
                                              page_perms) < 0)
                     return -LINUX_ENOMEM;
                 if (guest_update_perms(g, mprot_off, mprot_end, page_perms) < 0)
                     return -LINUX_ENOMEM;
             } else {
+                if (guest_materialize_lazy_zero_range(g, mprot_off,
+                                                      mprot_end) < 0)
+                    return -LINUX_ENOMEM;
                 if (guest_invalidate_ptes(g, mprot_off, mprot_end) < 0)
                     return -LINUX_ENOMEM;
             }

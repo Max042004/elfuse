@@ -15,8 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <stddef.h>
 
 #include "hvutil.h"
+#include "utils.h"
 #include "core/guest.h"
 #include "core/shim-globals.h"
 #include "core/vdso.h"
@@ -92,6 +94,42 @@ _Static_assert(SHIM_GLOBALS_SIZE >= SHIM_IDENTITY_OFF_SID + 8,
                "SHIM_GLOBALS_SIZE must cover the PGID/SID slots");
 _Static_assert(SHIM_GLOBALS_SIZE <= BLOCK_2MIB,
                "SHIM_GLOBALS_SIZE must fit inside the 2 MiB shim_data block");
+_Static_assert(SHIM_GLOBALS_SIZE <= SHIM_COW_SCRATCH_OFF,
+               "COW scratch window must not overlap shim globals");
+_Static_assert(SHIM_COW_SCRATCH_OFF + SHIM_COW_SCRATCH_SIZE <=
+                   BLOCK_2MIB - SHIM_COW_SCRATCH_SIZE,
+               "COW scratch window must not overlap EL1 stack slots");
+_Static_assert(GUEST_PTE_SW_COW_ZERO == (1ULL << 55),
+               "shim.S hard-codes COW_ZERO at PTE bit 55");
+_Static_assert(GUEST_PTE_SW_COW_MATERIALIZING == (1ULL << 56),
+               "shim.S hard-codes COW_MATERIALIZING at PTE bit 56");
+_Static_assert(offsetof(shim_fast_mmap_control_t, enabled) == 0x04,
+               "shim.S hard-codes fast mmap enabled offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, journal_head) == 0x08,
+               "shim.S hard-codes fast mmap journal head offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, bump) == 0x10,
+               "shim.S hard-codes fast mmap bump offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, zero_pte) == 0x18,
+               "shim.S hard-codes fast mmap zero PTE offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, bucket_head) == 0x20,
+               "shim.S hard-codes fast mmap bucket offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, node_freelist_head) == 0x820,
+               "shim.S hard-codes fast mmap node freelist head offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, free_nodes) == 0x828,
+               "shim.S hard-codes fast mmap free node offset");
+_Static_assert(sizeof(shim_fast_mmap_node_t) == 0x10,
+               "shim.S hard-codes fast mmap node size");
+_Static_assert(offsetof(shim_fast_mmap_control_t, live_len_pages) == 0xC28,
+               "shim.S hard-codes fast mmap live-length offset");
+_Static_assert(offsetof(shim_fast_mmap_control_t, journal) == 0x2C28,
+               "shim.S hard-codes fast mmap journal offset");
+_Static_assert(sizeof(shim_fast_mmap_journal_entry_t) == 0x18,
+               "shim.S hard-codes fast mmap journal entry size");
+_Static_assert(offsetof(shim_fast_mmap_control_t, scrub_bitmap) == 0x3828,
+               "shim.S hard-codes fast mmap scrub bitmap offset");
+_Static_assert(SHIM_FAST_MMAP_CTL_OFF + SHIM_FAST_MMAP_CTL_SIZE <=
+                   BLOCK_2MIB - SHIM_COW_SCRATCH_SIZE,
+               "fast mmap control must not overlap EL1 stacks");
 _Static_assert(SHIM_COUNTERS_OFF + SHIM_COUNTERS_N * 8 <=
                    SHIM_IDENTITY_OFF_PGID,
                "counter array must not overlap the PGID slot");
@@ -126,6 +164,153 @@ static void urandom_ring_unlock(uint32_t *lock_p)
 void shim_globals_init(guest_t *g)
 {
     memset(cache_base(g), 0, SHIM_GLOBALS_SIZE);
+}
+
+static shim_fast_mmap_control_t *fast_mmap_control(const guest_t *g)
+{
+    return (shim_fast_mmap_control_t *) (cache_base(g) +
+                                         SHIM_FAST_MMAP_CTL_OFF);
+}
+
+static void fast_mmap_lock(shim_fast_mmap_control_t *ctl)
+{
+    while (atomic_exchange_explicit(&ctl->lock, 1, memory_order_acquire) != 0)
+        sched_yield();
+}
+
+static void fast_mmap_unlock(shim_fast_mmap_control_t *ctl)
+{
+    atomic_store_explicit(&ctl->lock, 0, memory_order_release);
+}
+
+void shim_fast_mmap_init(guest_t *g)
+{
+    shim_fast_mmap_control_t *ctl = fast_mmap_control(g);
+    memset(ctl, 0, sizeof(*ctl));
+    ctl->bump = SHIM_FAST_MMAP_ARENA_BASE;
+    ctl->zero_pte = guest_lazy_zero_pte_template(g);
+    /* memset(0) is not the empty state for the reuse free-list: 0 is a valid
+     * node index, so every bucket and the node pool head must be explicitly
+     * set to the sentinel, and the node pool threaded into one chain. */
+    for (unsigned i = 0; i < SHIM_FAST_MMAP_MAX_LEN_PAGES; i++)
+        ctl->bucket_head[i] = SHIM_FAST_MMAP_SENTINEL;
+    for (unsigned i = 0; i < SHIM_FAST_MMAP_NODE_CAP - 1; i++)
+        ctl->free_nodes[i].next = i + 1;
+    ctl->free_nodes[SHIM_FAST_MMAP_NODE_CAP - 1].next = SHIM_FAST_MMAP_SENTINEL;
+    ctl->node_freelist_head = 0;
+    atomic_store_explicit(&ctl->enabled, g->is_rosetta ? 0 : 1,
+                          memory_order_release);
+}
+
+void shim_fast_mmap_disable(guest_t *g)
+{
+    shim_fast_mmap_control_t *ctl = fast_mmap_control(g);
+    atomic_store_explicit(&ctl->enabled, 0, memory_order_release);
+}
+
+bool shim_fast_mmap_is_enabled(const guest_t *g)
+{
+    const shim_fast_mmap_control_t *ctl = fast_mmap_control(g);
+    return atomic_load_explicit(&ctl->enabled, memory_order_acquire) != 0;
+}
+
+void shim_preempt_request(guest_t *g, int sp_el1_slot)
+{
+    if (!g || sp_el1_slot < 0 || sp_el1_slot >= SHIM_COW_SCRATCH_SLOTS)
+        return;
+    uint8_t *state = cache_base(g) + SHIM_COW_SCRATCH_OFF +
+                     (size_t) sp_el1_slot * SHIM_COW_STATE_STRIDE;
+    __atomic_store_n((uint32_t *) (state + SHIM_COW_PREEMPT_OFF), 1,
+                     __ATOMIC_RELEASE);
+}
+
+int shim_fast_mmap_sync(guest_t *g)
+{
+    shim_fast_mmap_control_t *ctl = fast_mmap_control(g);
+    if (atomic_load_explicit(&ctl->journal_head, memory_order_acquire) == 0)
+        return 0;
+    fast_mmap_lock(ctl);
+    uint32_t head =
+        atomic_load_explicit(&ctl->journal_head, memory_order_acquire);
+    if (head > SHIM_FAST_MMAP_JOURNAL_CAP) {
+        atomic_store_explicit(&ctl->enabled, 0, memory_order_release);
+        /* The fast path is disabled below, so this corrupt batch can never be
+         * replayed safely. Consume it now instead of retrying the same invalid
+         * head on every subsequent HVC. */
+        atomic_store_explicit(&ctl->journal_head, 0, memory_order_release);
+        fast_mmap_unlock(ctl);
+        return -1;
+    }
+
+    int rc = 0;
+    pthread_mutex_lock(&mmap_lock);
+    for (uint32_t i = 0; i < head; i++) {
+        const shim_fast_mmap_journal_entry_t *entry = &ctl->journal[i];
+        if (entry->op == SHIM_FAST_MMAP_OP_MAP) {
+            int flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+            if (guest_region_add_ex_owned_lazy_zero(
+                    g, entry->addr, entry->addr + entry->len,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE, flags, 0, NULL,
+                    -1) < 0) {
+                rc = -1;
+                atomic_store_explicit(&ctl->enabled, 0, memory_order_release);
+                break;
+            }
+        } else if (entry->op == SHIM_FAST_MMAP_OP_UNMAP) {
+            /* EL1 scrubbed each materialized page while it still had the old
+             * descriptor; COW_ZERO pages never exposed identity backing. */
+            guest_region_remove(g, entry->addr, entry->addr + entry->len);
+            if (entry->addr < g->mmap_rw_gap_hint)
+                g->mmap_rw_gap_hint = entry->addr;
+        } else {
+            rc = -1;
+            atomic_store_explicit(&ctl->enabled, 0, memory_order_release);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mmap_lock);
+
+    /* Consume the batch even on failure. Entries before the failing one have
+     * already changed regions[] and replaying them on the next HVC would add
+     * duplicate regions. The fast path is disabled on failure, so there can be
+     * no later producer whose entry would be lost by clearing this head. */
+    atomic_store_explicit(&ctl->journal_head, 0, memory_order_release);
+    /* EL1 fast mmap/munmap rewrites PTEs without going through the host page
+     * table helpers. Any host thread may still hold a gva_tlb entry from the
+     * previous lifetime of a recycled arena VA, so invalidate those software
+     * translations whenever a non-empty journal is observed. */
+    if (head > 0)
+        guest_pt_gen_bump(g);
+    fast_mmap_unlock(ctl);
+    return rc;
+}
+
+int shim_fast_mmap_scrub(guest_t *g, uint64_t addr, uint64_t len)
+{
+    if (!g || (addr | len) & (GUEST_PAGE_SIZE - 1) || len == 0 ||
+        len > BLOCK_2MIB || addr < SHIM_FAST_MMAP_ARENA_BASE ||
+        addr > SHIM_FAST_MMAP_ARENA_END - len)
+        return -1;
+
+    shim_fast_mmap_control_t *ctl = fast_mmap_control(g);
+    fast_mmap_lock(ctl);
+    uint64_t npages = len / GUEST_PAGE_SIZE;
+    for (uint64_t page = 0; page < npages;) {
+        uint64_t word = ctl->scrub_bitmap[page / 64];
+        if (!(word & (1ULL << (page % 64)))) {
+            page++;
+            continue;
+        }
+        uint64_t run_start = page++;
+        while (page < npages &&
+               (ctl->scrub_bitmap[page / 64] & (1ULL << (page % 64))))
+            page++;
+        memset((uint8_t *) g->host_base + addr + run_start * GUEST_PAGE_SIZE, 0,
+               (page - run_start) * GUEST_PAGE_SIZE);
+    }
+    memset(ctl->scrub_bitmap, 0, sizeof(ctl->scrub_bitmap));
+    fast_mmap_unlock(ctl);
+    return 0;
 }
 
 void shim_globals_publish_pid(guest_t *g, int64_t pid, int64_t ppid)

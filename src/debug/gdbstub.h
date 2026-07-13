@@ -61,6 +61,10 @@ int gdb_stub_is_active(void);
  */
 int gdb_stub_handle_stop(int stop_reason, uint64_t stop_addr);
 
+/* Variant for HVC #13, whose EL1 continuation is a frame-free ERET and may be
+ * replaced by the GDB TLBI trampoline. */
+int gdb_stub_handle_stop_framefree(int stop_reason, uint64_t stop_addr);
+
 /* Check if GDB has requested all vCPUs to stop (Ctrl+C or breakpoint on another
  * thread). Called from the vCPU loop after HV_EXIT_REASON_CANCELED.
  * Returns non-zero if this thread should enter gdb_stub_handle_stop.

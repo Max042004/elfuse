@@ -26,6 +26,11 @@
  *         set. Their resume normally depends on the forking thread's
  *         progress; the teardown broadcast frees them directly.
  *
+ * The tracee/spinner continuously first-writes fresh anonymous pages. Thus the
+ * ptrace interrupt and exit_group cancellation also race the EL1 lazy-zero
+ * materializer; a canceled owner must rendezvous and publish its claim before
+ * entering ptrace-stop or teardown.
+ *
  * All scenarios must exit with code 42, carried by exit_group from whichever
  * thread raced the park. PTRACE_SEIZE on a same-thread-group thread fails
  * with EPERM on real Linux (it works on elfuse, where ptrace is scoped to
@@ -34,7 +39,7 @@
  * expected exit code holds under differential testing.
  *
  * Syscalls: clone(220), ptrace(117), wait4(260), nanosleep(101),
- * sched_yield(124), exit(93), exit_group(94)
+ * sched_yield(124), munmap(215), mmap(222), exit(93), exit_group(94)
  */
 
 #include <string.h>
@@ -55,6 +60,13 @@ static char spinner_stack[16384] __attribute__((aligned(16)));
 
 static volatile int killer_armed = 0;
 
+#define COW_STREAM_LEN (8UL * 1024 * 1024)
+#define PAGE_SIZE 4096
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define MAP_PRIVATE 2
+#define MAP_ANONYMOUS 0x20
+
 static void msleep(long ms)
 {
     struct {
@@ -74,14 +86,28 @@ static int killer_fn(void)
     return 0;
 }
 
-/* Spins on sched_yield so the thread is always either inside hv_vcpu_run or
- * at a run-loop preemption point (where it can enter ptrace-stop or the fork
- * barrier). Never stops, never exits on its own.
+/* Stream first writes through fresh lazy-zero mappings. The thread alternates
+ * between EL0 and long EL1 fault-around transactions, making ptrace/exit-group
+ * cancellation exercise the MATERIALIZING-owner rendezvous. Never exits on
+ * its own.
  */
 static int spin_fn(void)
 {
-    for (;;)
-        raw_syscall0(124); /* sched_yield */
+    unsigned char value = 1;
+    for (;;) {
+        long addr = raw_syscall6(222, 0, COW_STREAM_LEN,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (addr < 0) {
+            raw_syscall0(124); /* sched_yield */
+            continue;
+        }
+        volatile unsigned char *p = (volatile unsigned char *) addr;
+        for (unsigned long off = 0; off < COW_STREAM_LEN; off += PAGE_SIZE)
+            p[off] = value;
+        raw_syscall2(215, addr, COW_STREAM_LEN); /* munmap */
+        value = value == 255 ? 1 : (unsigned char) (value + 1);
+    }
     return 0;
 }
 

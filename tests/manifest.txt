@@ -100,6 +100,7 @@ test-simd-clone                # diff=skip
 [section] Stress tests
 test-stress                    # diff=skip
 test-mprotect-mt               # diff=skip
+test-cow-zero                  # diff=skip
 
 [section] Negative / error-path tests
 test-negative                  # diff=skip
@@ -117,6 +118,8 @@ test-fork-lowbase
 
 [section] CoW fork isolation tests
 test-cow-fork
+test-fork-cow-mat              # diff=skip
+test-lazy-zero-critical        # diff=skip
 test-fork-synthetic-fd
 
 [section] O_CLOEXEC tests

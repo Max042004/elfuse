@@ -113,6 +113,10 @@
  */
 #define BLOCK_2MIB (2ULL * 1024 * 1024)
 
+/* Fixed shim entry used to return a GDB-stopped vCPU through an EL1 TLBI before
+ * resuming EL0. Keep in sync with the .org in core/shim.S. */
+#define SHIM_GDB_TLBI_TRAMPOLINE_OFF 0x2500ULL
+
 /* IPA base: guest memory is mapped at this IPA in the hypervisor. All guest
  * physical addresses = GUEST_IPA_BASE + offset. Must be 0 so that guest virtual
  * addresses match ELF link addresses (e.g. 0x400000). A non-zero IPA base would
@@ -159,6 +163,11 @@
 #define MEM_PERM_RX (MEM_PERM_R | MEM_PERM_X)
 #define MEM_PERM_RW (MEM_PERM_R | MEM_PERM_W)
 #define MEM_PERM_RW_EL1_ONLY (MEM_PERM_R | MEM_PERM_W | MEM_PERM_EL1_ONLY)
+
+/* Stage-1 software PTE states for anonymous zero-page COW. Bits [58:55] are
+ * ignored by AArch64 hardware and remain available to software. */
+#define GUEST_PTE_SW_COW_ZERO (1ULL << 55)
+#define GUEST_PTE_SW_COW_MATERIALIZING (1ULL << 56)
 
 /* A contiguous region of guest memory to be mapped in page tables.
  *
@@ -235,12 +244,13 @@ typedef struct {
     int backing_fd;    /* Duplicated host fd for file-backed mappings, or -1 */
     bool shared;       /* MAP_SHARED (writes should propagate) */
     bool noreserve;    /* MAP_NORESERVE: PTEs deferred until fault */
-    bool backing_ro;   /* MAP_SHARED region whose backing_fd was opened
-                        * without write access, so its Linux max_prot is
-                        * capped to PROT_READ. sys_mprotect must reject any
-                        * later PROT_WRITE request against it with EACCES,
-                        * matching a real kernel's VMA max_prot tracking.
-                        */
+    bool lazy_zero;  /* Anonymous pages initially alias the shared zero page */
+    bool backing_ro; /* MAP_SHARED region whose backing_fd was opened
+                      * without write access, so its Linux max_prot is
+                      * capped to PROT_READ. sys_mprotect must reject any
+                      * later PROT_WRITE request against it with EACCES,
+                      * matching a real kernel's VMA max_prot tracking.
+                      */
     bool overlay_active; /* Region has a live host MAP_FIXED|MAP_SHARED overlay
                           * of backing_fd at host_base+start. The kernel's page
                           * cache keeps it coherent with the file and with peer
@@ -418,6 +428,7 @@ typedef struct {
      */
     uint64_t pt_pool_base;   /* Page-table pool start (high IPA) */
     uint64_t pt_pool_end;    /* Page-table pool end (exclusive) */
+    uint64_t lazy_zero_gpa;  /* Shared read-only zero page for anonymous CoW */
     uint64_t shim_base;      /* Shim code (2MiB block, RX) */
     uint64_t shim_data_base; /* Shim stack/data (2MiB block, RW) */
 
@@ -978,8 +989,9 @@ static inline bool guest_kbuf_user_va_overlap(uint64_t va, uint64_t size)
  */
 void *guest_ptr(const guest_t *g, uint64_t gva);
 
-/* Get a host pointer for a guest virtual address (write access).
- * Returns NULL if gva is out of bounds or not writable.
+/* Get a host pointer for a guest virtual address (write access). COW-zero
+ * destinations are materialized before the pointer is returned.
+ * Returns NULL if gva is out of bounds or not logically writable.
  */
 void *guest_ptr_w(const guest_t *g, uint64_t gva);
 
@@ -988,7 +1000,8 @@ void *guest_ptr_w(const guest_t *g, uint64_t gva);
  * entries are valid and satisfy required_perms (MEM_PERM_R/W/X bitmask). The
  * function walks forward across adjacent L2 blocks and L3 pages until it hits
  * an invalid, permission-mismatched, or physically non-contiguous entry.
- * Returns NULL if the starting page is unmapped or lacks required_perms.
+ * A MEM_PERM_W request materializes a COW-zero starting page first. Returns
+ * NULL if the starting page is unmapped or lacks required_perms.
  */
 void *guest_ptr_avail(const guest_t *g,
                       uint64_t gva,
@@ -999,6 +1012,7 @@ void *guest_ptr_avail(const guest_t *g,
  * *avail receives the number of contiguous bytes available from gva, up to
  * len_limit.
  *
+ * A MEM_PERM_W request materializes COW-zero pages in the bounded range first.
  * Returns NULL if the starting address is unmapped or lacks perms.
  */
 void *guest_ptr_bound(const guest_t *g,
@@ -1006,6 +1020,12 @@ void *guest_ptr_bound(const guest_t *g,
                       uint64_t *avail,
                       int required_perms,
                       uint64_t len_limit);
+/* Probe an already-live translation without materializing lazy-zero pages. */
+void *guest_ptr_bound_existing(const guest_t *g,
+                               uint64_t gva,
+                               uint64_t *avail,
+                               int required_perms,
+                               uint64_t len_limit);
 
 /* Bounds-checked copy from guest memory to host buffer.
  * Returns 0 on success, -1 if out of bounds.
@@ -1089,6 +1109,13 @@ int guest_split_block(guest_t *g, uint64_t block_gpa);
  */
 int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
 
+/* munmap variant: while invalidating, zero identity backing only for
+ * materialized pages in lazy-zero regions. Untouched COW_ZERO templates and
+ * read-touched zero-page aliases need no backing cleanup. */
+int guest_invalidate_ptes_for_munmap(guest_t *g,
+                                     uint64_t start,
+                                     uint64_t end);
+
 /* Update page table permissions for the range [start, end). If a 2MiB block
  * needs mixed permissions (only part of it is being updated), the block is
  * automatically split into 4KiB L3 pages first. If the entire 2MiB block is
@@ -1098,6 +1125,31 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
  * Returns 0 on success, -1 on failure.
  */
 int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms);
+
+/* Replace the PTEs in an already-mapped anonymous range with read-only aliases
+ * of the guest's shared zero page. Caller holds mmap_lock. */
+int guest_prepare_lazy_zero_pages(guest_t *g, uint64_t va, uint64_t length);
+int guest_install_lazy_zero_pages(guest_t *g,
+                                  uint64_t va,
+                                  uint64_t length,
+                                  int perms);
+
+/* Return whether the stage-1 leaf for va is currently valid. Unlike a normal
+ * host-side resolve, this never validates an untouched lazy-zero template. */
+bool guest_page_is_resident(const guest_t *g, uint64_t va);
+
+/* Count valid stage-1 leaves covered by regions[]. Caller holds mmap_lock so
+ * the region list and page-table topology remain stable during the walk. */
+uint64_t guest_count_resident_pages(const guest_t *g);
+
+/* Pre-create invalid L3 slots for the EL1-local anonymous mmap arena. */
+int guest_prepare_fast_mmap_arena(guest_t *g, uint64_t start, uint64_t end);
+uint64_t guest_lazy_zero_pte_template(const guest_t *g);
+
+/* With every possible owner quiesced: reset MATERIALIZING PTEs back to invalid
+ * lazy-zero templates. Used by fork children and final teardown.
+ */
+void guest_reset_orphaned_cow_claims(guest_t *g);
 
 /* Reset guest memory for execve. Zeros ELF, brk, stack, mmap regions and resets
  * page table pool, brk, and mmap allocation state. Preserves the host_base
@@ -1165,6 +1217,14 @@ int guest_region_add_ex_owned(guest_t *g,
                               uint64_t offset,
                               const char *name,
                               int owned_backing_fd);
+int guest_region_add_ex_owned_lazy_zero(guest_t *g,
+                                        uint64_t start,
+                                        uint64_t end,
+                                        int prot,
+                                        int flags,
+                                        uint64_t offset,
+                                        const char *name,
+                                        int owned_backing_fd);
 int guest_region_add_ex_owned_gpa(guest_t *g,
                                   uint64_t start,
                                   uint64_t end,
@@ -1254,3 +1314,8 @@ bool guest_region_range_has_ro_shared_backing(const guest_t *g,
  * in a noreserve region.
  */
 int guest_materialize_lazy(guest_t *g, uint64_t fault_offset);
+
+/* Materialize COW-zero pages. The range variant is used before protection
+ * changes; both functions require mmap_lock. */
+int guest_materialize_lazy_zero(guest_t *g, uint64_t fault_offset);
+int guest_materialize_lazy_zero_range(guest_t *g, uint64_t start, uint64_t end);

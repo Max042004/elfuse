@@ -59,6 +59,11 @@ if [ ! -f "$GUEST" ]; then
     echo "error: $GUEST not found (run make test-hello)" >&2
     exit 1
 fi
+GDB_LAZY_GUEST="$TESTDIR/test-gdb-lazy"
+if [ ! -f "$GDB_LAZY_GUEST" ]; then
+    echo "error: $GDB_LAZY_GUEST not found (run make test-gdb-lazy)" >&2
+    exit 1
+fi
 
 # Colors
 if [ -t 1 ]; then
@@ -513,6 +518,24 @@ if echo "$RAW_RSP_OUT" | grep -q "qSupported_ack=+" \
     ok=1
 fi
 report "QStartNoAckMode: final ack then packet-only replies" $ok
+stop_elfuse
+
+# Test 18: GDB listener materializes a page after this vCPU cached its shared
+# zero-page alias. Resume must rendezvous through the EL1 TLBI trampoline.
+start_elfuse "$GDB_LAZY_GUEST"
+run_lldb \
+    -o "breakpoint set --address 0x400028" \
+    -o "continue" \
+    -o "script addr = lldb.frame.FindRegister('x19').GetValueAsUnsigned()" \
+    -o "script e = lldb.SBError(); n = lldb.process.WriteMemory(addr, b'Z', e); print('lazy-write:', n, e.Success())" \
+    -o "continue" \
+    -o "quit"
+ok=0
+if echo "$LLDB_OUT" | grep -q "lazy-write: 1 True" \
+    && echo "$LLDB_OUT" | grep -qi "exited\|exit.*status.*0\|Process.*exit"; then
+    ok=1
+fi
+report "lazy GDB write: TLBI before resuming EL0" $ok
 stop_elfuse
 
 # Summary

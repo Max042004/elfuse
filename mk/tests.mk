@@ -7,7 +7,7 @@
         test-rosetta-cli test-rosetta-statics test-rosetta-failure-modes \
         test-rosetta-alpine test-rosetta-audit test-rosetta-jit \
         test-rosetta-glibc test-rosetta-madvise test-rosetta-msync \
-        test-rosetta-mremap test-rosetta-all bench-rosetta \
+        test-rosetta-mremap test-rosetta-all bench-rosetta bench-mmap \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
@@ -341,7 +341,7 @@ test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@$(ELFUSE_BIN) --timeout 0 $(TEST_DIR)/test-hello > /dev/null
 
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
-test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello
+test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello $(TEST_DIR)/test-gdb-lazy
 	@bash tests/test-gdbstub.sh -e $(ELFUSE_BIN) -v
 
 ## Run Rosetta CLI gating regressions without requiring Rosetta runtime support
@@ -397,6 +397,29 @@ test-rosetta-all: test-rosetta-cli test-rosetta-failure-modes \
 BENCH_ITERS ?= 5
 bench-rosetta: $(ELFUSE_BIN)
 	$(call RUN_OPTIONAL_SKIP77,bash tests/bench-rosetta.sh $(ELFUSE_BIN) $(BENCH_ITERS),bench-rosetta)
+
+## Compare a static aarch64 mmap / munmap microbenchmark under elfuse and an
+## OrbStack Linux machine. Set ORBSTACK_MACHINE=<name>; BENCH_MMAP_RUNS,
+## BENCH_MMAP_ITERATIONS, BENCH_MMAP_WARMUP, BENCH_MMAP_SIZES, and
+## BENCH_MMAP_VARIANTS tune sampling and coverage.
+BENCH_MMAP_RUNS ?= 10
+BENCH_MMAP_ITERATIONS ?= 5000
+BENCH_MMAP_WARMUP ?= 100
+BENCH_MMAP_SIZES ?= 4096 16384 262144 2097152
+BENCH_MMAP_VARIANTS ?= private
+ORBSTACK_MACHINE ?=
+BENCH_MMAP_BIN ?= $(BUILD_DIR)/bench-mmap
+## Run the mmap / munmap comparison under elfuse and OrbStack.
+bench-mmap: $(ELFUSE_BIN) $(BENCH_MMAP_BIN)
+	@ELFUSE="$(abspath $(ELFUSE_BIN))" \
+	    BENCH_MMAP_BIN="$(abspath $(BENCH_MMAP_BIN))" \
+	    BENCH_MMAP_RUNS="$(BENCH_MMAP_RUNS)" \
+	    BENCH_MMAP_ITERATIONS="$(BENCH_MMAP_ITERATIONS)" \
+	    BENCH_MMAP_WARMUP="$(BENCH_MMAP_WARMUP)" \
+	    BENCH_MMAP_SIZES="$(BENCH_MMAP_SIZES)" \
+	    BENCH_MMAP_VARIANTS="$(BENCH_MMAP_VARIANTS)" \
+	    ORBSTACK_MACHINE="$(ORBSTACK_MACHINE)" \
+	    bash tests/bench-mmap.sh
 
 ## Alias for check (backward compat)
 test-all: check

@@ -137,12 +137,10 @@ typedef struct thread_entry {
     int ptrace_waiters;          /* Tracers currently blocked on ptrace_cond */
     bool ptrace_cleanup_pending; /* Destroy condvars after last waiter leaves */
     int ptrace_cont_sig;         /* Signal to inject on resume (0=none) */
-    bool ptrace_interrupt_pending;    /* PTRACE_INTERRUPT arrived while the vCPU
-                                       * was still in bring-up (t->vcpu == 0), so
-                                       * it could not be delivered via
-                                       * hv_vcpus_exit; the worker self-kicks at
-                                       * publish to deliver it. Under thread_lock.
-                                       */
+    bool ptrace_interrupt_pending; /* PTRACE_INTERRUPT needs a register-safe
+                                    * stop. Accessed with __atomic builtins;
+                                    * the thread lock separately protects the
+                                    * vCPU handle publication handshake. */
     linux_user_pt_regs_t ptrace_regs; /* snapshot for cross-thread access */
     bool ptrace_regs_dirty;           /* Tracer modified registers */
 
@@ -309,7 +307,9 @@ int thread_count_active_vm_clones(void);
  * (e.g. guest_destroy's internal join after main()'s) does not touch the same
  * handle twice.
  */
-void thread_join_workers(void);
+/* Returns false if any snapshotted worker is still active after the deadline;
+ * callers must not unmap guest memory in that case. */
+bool thread_join_workers(void);
 
 /* Destroy all active worker vCPUs. Called during guest_destroy to ensure no
  * vCPUs remain active before hv_vm_destroy().

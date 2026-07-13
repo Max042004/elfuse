@@ -78,6 +78,35 @@ static void test_dontneed_single(void)
     munmap(p, 4096);
 }
 
+static void test_dontneed_refault_residency(void)
+{
+    TEST("MADV_DONTNEED decommits and refaults");
+    unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        FAIL("mmap failed");
+        return;
+    }
+
+    p[0] = 0xA5;
+    unsigned char vec = 0;
+    bool ok = mincore(p, 4096, &vec) == 0 && (vec & 1);
+    ok = ok && madvise(p, 4096, MADV_DONTNEED) == 0;
+    vec = 1;
+    ok = ok && mincore(p, 4096, &vec) == 0 && !(vec & 1);
+
+    /* Repeated decommit of an already-cold page stays a successful no-op. */
+    ok = ok && madvise(p, 4096, MADV_DONTNEED) == 0;
+    vec = 1;
+    ok = ok && mincore(p, 4096, &vec) == 0 && !(vec & 1);
+
+    ok = ok && p[0] == 0;
+    vec = 0;
+    ok = ok && mincore(p, 4096, &vec) == 0 && (vec & 1);
+    EXPECT_TRUE(ok, "DONTNEED page did not decommit/refault");
+    munmap(p, 4096);
+}
+
 /* Test 2: MADV_DONTNEED multi-page span */
 
 static void test_dontneed_multi(void)
@@ -778,6 +807,7 @@ int main(void)
     printf("test-madvise: MADV_DONTNEED and parity tests\n");
 
     test_dontneed_single();
+    test_dontneed_refault_residency();
     test_dontneed_multi();
     test_dontneed_partial();
     test_dontneed_rewrite();

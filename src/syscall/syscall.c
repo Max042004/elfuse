@@ -661,7 +661,7 @@ SC_STUB(sc_sethostname,         -LINUX_EPERM)
  * - addr must be page-aligned (EINVAL otherwise);
  * - vec must be writable, one byte per page (EFAULT otherwise);
  * - any unmapped page in the range yields ENOMEM;
- * - the LSB of each vec byte is set when the page maps to a tracked region.
+ * - the LSB of each vec byte is set when the page has a resident PTE.
  * jemalloc, Go, and Rust's page recyclers probe this on startup.
  */
 static int64_t sc_mincore(guest_t *g,
@@ -719,7 +719,7 @@ static int64_t sc_mincore(guest_t *g,
             while (ri < g->nregions && g->regions[ri].end <= page)
                 ri++;
             bool mapped = ri < g->nregions && page >= g->regions[ri].start;
-            chunk[i] = mapped ? 1 : 0;
+            chunk[i] = mapped && guest_page_is_resident(g, page) ? 1 : 0;
             if (!mapped)
                 has_hole = true;
         }
@@ -2338,6 +2338,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
      * fd_lock to prevent TOCTOU races with CLONE_THREAD siblings.
      */
     int nr = (int) x8;
+    /* The fast mmap arena is deliberately single-vCPU. Disable it before
+     * clone can publish a second vCPU that would otherwise race host memory
+     * syscalls between journal synchronization points. */
+    if (nr == 215 || nr == 216 || nr == 222 || nr == 226 || nr == 220 ||
+        nr == 435) /* munmap/mremap/mmap/mprotect/clone/clone3 */
+        shim_fast_mmap_disable(g);
     const syscall_entry_t *entry = NULL;
 
     /* Per-syscall histogram for the dynamic-linker bring-up storm. Zero when
@@ -2413,7 +2419,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
              */
             int perms = (nr == SYS_read) ? MEM_PERM_W : MEM_PERM_R;
             uint64_t avail = 0;
-            void *buf = guest_ptr_bound(g, x1, &avail, perms, count);
+            void *buf =
+                nr == SYS_read
+                    ? guest_ptr_bound_existing(g, x1, &avail, perms, count)
+                    : guest_ptr_bound(g, x1, &avail, perms, count);
             if (!buf || avail < count) {
                 host_fd_ref_close(&host_ref);
                 goto slow_path;

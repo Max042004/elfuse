@@ -186,6 +186,12 @@ $(BUILD_DIR)/test-hello: tests/hello.S tests/simple.ld | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(BAREMETAL_CROSS)ld -T tests/simple.ld -o $@ $(BUILD_DIR)/test-hello.o
 
+$(BUILD_DIR)/test-gdb-lazy: tests/gdb-lazy.S tests/simple.ld | $(BUILD_DIR)
+	@echo "  AS      tests/gdb-lazy.S"
+	$(Q)$(BAREMETAL_CROSS)as -o $(BUILD_DIR)/test-gdb-lazy.o tests/gdb-lazy.S
+	@echo "  LD      $@"
+	$(Q)$(BAREMETAL_CROSS)ld -T tests/simple.ld -o $@ $(BUILD_DIR)/test-gdb-lazy.o
+
 # Pattern rule: cross-compile tests/*.c to static aarch64-linux binaries
 # -D_GNU_SOURCE exposes pipe2/dup3/O_DIRECT/etc. on glibc (musl exposes them by default)
 $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
@@ -245,6 +251,23 @@ $(BUILD_DIR)/test-shim-cred-race: tests/test-shim-cred-race.c | $(BUILD_DIR)
 # test-mprotect-mt stresses multi-vCPU mprotect under concurrent reader
 # threads to surface stale-TLB regressions.
 $(BUILD_DIR)/test-mprotect-mt: tests/test-mprotect-mt.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
+# test-cow-zero races first writes from multiple vCPUs against one untouched
+# anonymous page, then checks the host-to-guest syscall-write path.
+$(BUILD_DIR)/test-cow-zero: tests/test-cow-zero.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
+# test-fork-cow-mat forks while a sibling thread streams first writes, so
+# the snapshot can catch a COW materialization window mid-flight.
+$(BUILD_DIR)/test-fork-cow-mat: tests/test-fork-cow-mat.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
+# Lazy-zero regressions race futex wait/wake across pthreads.
+$(BUILD_DIR)/test-lazy-zero-critical: tests/test-lazy-zero-critical.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 

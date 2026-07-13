@@ -85,6 +85,22 @@ static char proc_tmpdir[128];
 static bool proc_tmpdir_ok;
 static pthread_mutex_t proc_tmpdir_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void proc_guest_memory_usage(const guest_t *g,
+                                    uint64_t *vsize,
+                                    uint64_t *rss_pages)
+{
+    uint64_t size = 0;
+
+    pthread_mutex_lock(&mmap_lock);
+    for (int i = 0; i < g->nregions; i++)
+        size += g->regions[i].end - g->regions[i].start;
+    uint64_t resident = guest_count_resident_pages(g);
+    pthread_mutex_unlock(&mmap_lock);
+
+    *vsize = size;
+    *rss_pages = resident;
+}
+
 typedef struct {
     uint64_t start, end;
     int prot, flags;
@@ -1202,6 +1218,7 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
     char piddir[128];
     str_copy_trunc(piddir, pidbuf, sizeof(piddir));
     populate_proc_snapshot(g, piddir, "stat", "/proc/self/stat");
+    populate_proc_snapshot(g, piddir, "statm", "/proc/self/statm");
     populate_proc_snapshot(g, piddir, "status", "/proc/self/status");
     populate_proc_snapshot(g, piddir, "cmdline", "/proc/self/cmdline");
     populate_proc_snapshot(g, piddir, "maps", "/proc/self/maps");
@@ -2918,21 +2935,10 @@ int proc_intercept_open(const guest_t *g,
 
     /* /proc/self/status -> synthetic process status */
     if (!strcmp(path, "/proc/self/status")) {
-        /* Compute VmSize from region tracking (total virtual memory) */
-        uint64_t vm_size_kb = 0;
-        for (int i = 0; i < g->nregions; i++)
-            vm_size_kb += (g->regions[i].end - g->regions[i].start);
-        vm_size_kb /= 1024;
-
-        /* VmRSS: approximate as non-PROT_NONE regions (HVF cannot query actual
-         * residency from HVF, but mapped != PROT_NONE is close)
-         */
-        uint64_t vm_rss_kb = 0;
-        for (int i = 0; i < g->nregions; i++) {
-            if (g->regions[i].prot != 0) /* PROT_NONE = 0 */
-                vm_rss_kb += (g->regions[i].end - g->regions[i].start);
-        }
-        vm_rss_kb /= 1024;
+        uint64_t vm_size, rss_pages;
+        proc_guest_memory_usage(g, &vm_size, &rss_pages);
+        uint64_t vm_size_kb = vm_size / 1024;
+        uint64_t vm_rss_kb = rss_pages * (GUEST_PAGE_SIZE / 1024);
 
         /* Linux uses the comm name (basename truncated to 15 chars). */
         const char *name = proc_comm_name();
@@ -2955,6 +2961,15 @@ int proc_intercept_open(const guest_t *g,
             proc_get_sgid(), proc_get_egid(), (unsigned long long) vm_size_kb,
             (unsigned long long) vm_size_kb, (unsigned long long) vm_rss_kb,
             threads);
+    }
+
+    /* /proc/self/statm fields are expressed in guest (Linux) pages. */
+    if (!strcmp(path, "/proc/self/statm")) {
+        uint64_t vsize, rss_pages;
+        proc_guest_memory_usage(g, &vsize, &rss_pages);
+        return proc_emit_fmt("%llu %llu 0 0 0 0 0\n",
+                             (unsigned long long) (vsize / GUEST_PAGE_SIZE),
+                             (unsigned long long) rss_pages);
     }
 
     /* /proc/self/limits -> resource limits from prlimit64 cache */
@@ -3321,17 +3336,8 @@ int proc_intercept_open(const guest_t *g,
         long stime_ticks =
             ru.ru_stime.tv_sec * 100 + ru.ru_stime.tv_usec / 10000;
 
-        /* Compute vsize and rss from guest region tracking */
-        uint64_t vsize = 0, rss_pages = 0;
-        long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0)
-            page_size = 4096;
-        for (int i = 0; i < g->nregions; i++) {
-            uint64_t sz = g->regions[i].end - g->regions[i].start;
-            vsize += sz;
-            if (g->regions[i].prot != 0) /* non-PROT_NONE = resident */
-                rss_pages += sz / (uint64_t) page_size;
-        }
+        uint64_t vsize, rss_pages;
+        proc_guest_memory_usage(g, &vsize, &rss_pages);
 
         /* Fields: pid(1) (comm)(2) state(3) ppid(4) pgrp(5) session(6)
          *   tty_nr(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12)
@@ -3631,6 +3637,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
     static const char *known_proc_files[] = {
         "/proc/self/io",
         "/proc/self/stat",
+        "/proc/self/statm",
         "/proc/self/status",
         "/proc/self/cmdline",
         "/proc/self/maps",
@@ -3891,6 +3898,13 @@ int proc_intercept_readv(int guest_fd,
 
     *read_out = total;
     return 1;
+}
+
+bool proc_intercept_write_candidate(int guest_fd)
+{
+    fd_entry_t snap;
+    return fd_snapshot(guest_fd, &snap) &&
+           proc_oom_path_kind(snap.proc_path) != OOM_PATH_NONE;
 }
 
 int proc_intercept_write(int guest_fd,

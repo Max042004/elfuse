@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -163,6 +164,7 @@ static int compute_infra_layout(guest_t *g)
     uint64_t infra_base = g->interp_base - INFRA_RESERVE;
     g->pt_pool_base = infra_base + INFRA_PT_POOL_OFF;
     g->pt_pool_end = infra_base + INFRA_PT_POOL_END_OFF;
+    g->lazy_zero_gpa = g->pt_pool_base;
     g->shim_base = infra_base + INFRA_SHIM_OFF;
     g->shim_data_base = infra_base + INFRA_SHIM_DATA_OFF;
     return 0;
@@ -250,6 +252,26 @@ static inline uint64_t pte_load_acquire(const uint64_t *entry)
 static inline void pte_store_release(uint64_t *entry, uint64_t desc)
 {
     __atomic_store_n(entry, desc, __ATOMIC_RELEASE);
+}
+
+/* Wait for a live COW owner without turning teardown into an unbounded host
+ * spin. During normal execution ownership cannot be stolen: the publisher may
+ * still be running and finishes with a blind release-store. exit_group first
+ * gives canceled EL1 owners a rendezvous pass in vcpu_run_loop; if teardown is
+ * already requested here, callers abort their operation and leave final claim
+ * cleanup to the quiesced teardown sweep. Periodic sched_yield avoids burning
+ * a full host core while a peer zeroes a fault-around batch. */
+static bool pte_wait_materializer(_Atomic uint64_t *pte, uint64_t *desc)
+{
+    unsigned spins = 0;
+    while (*desc & GUEST_PTE_SW_COW_MATERIALIZING) {
+        if (proc_exit_group_requested())
+            return false;
+        if ((++spins & 0xffu) == 0)
+            sched_yield();
+        *desc = atomic_load_explicit(pte, memory_order_acquire);
+    }
+    return true;
 }
 
 /* Public API */
@@ -398,7 +420,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
         g->overflow_ipa_next = try_size;
         if (compute_infra_layout(g) < 0)
             continue;
-        g->pt_pool_next = g->pt_pool_base;
+        g->pt_pool_next = g->pt_pool_base + PAGE_SIZE;
 
         /* Reserve primary address space via mmap(MAP_ANON). macOS demand-pages
          * this so an unused 1 TiB reservation costs no physical memory. Do NOT
@@ -510,7 +532,7 @@ int guest_init_from_shm(guest_t *g,
         close(shm_fd);
         return -1;
     }
-    g->pt_pool_next = g->pt_pool_base;
+    g->pt_pool_next = g->pt_pool_base + PAGE_SIZE;
 
     /* Two mapping modes:
      *   retain_shared: shm_fd is an independent APFS clone of the parent's
@@ -655,7 +677,7 @@ void guest_destroy(guest_t *g)
      * off the shared pipe, and thread_wake_exit_waiters broadcasts the internal
      * condvars (fork barrier, ptrace stop/wait). Without them, host-blocked
      * workers miss the hv_vcpus_exit kick (which only affects threads inside
-     * hv_vcpu_run) and the 100ms join cap in thread_join_workers detaches
+     * hv_vcpu_run) and the 500ms join cap in thread_join_workers detaches
      * them, leaving live pthreads to crash on the imminent munmap.
      */
     if (!proc_exit_group_requested())
@@ -664,7 +686,15 @@ void guest_destroy(guest_t *g)
     wakeup_pipe_signal();
     thread_interrupt_all();
     thread_wake_exit_waiters();
-    thread_join_workers();
+    if (!thread_join_workers()) {
+        /* A detached worker may still hold host pointers into the slab/page
+         * tables. The process is already exiting, so leave VM cleanup to the
+         * kernel rather than unmap underneath it and turn the bounded join
+         * timeout into a host UAF/SIGSEGV. */
+        log_error("guest: workers still active; skipping unsafe VM teardown");
+        return;
+    }
+    guest_reset_orphaned_cow_claims(g);
     /* Destroy all remaining worker vCPUs (thread table) before tearing down the
      * VM. This prevents hv_vm_destroy from racing with active vCPUs that may
      * still be running if thread join timed out during exit_group.
@@ -1248,7 +1278,8 @@ static void guest_tlb_flush(void)
 static int gva_translate_perm(const guest_t *g,
                               uint64_t gva,
                               int required_perms,
-                              gva_translation_t *out)
+                              gva_translation_t *out,
+                              bool validate_lazy)
 {
     /* Fast path: check per-thread TLB cache */
     uint64_t gen = atomic_load_explicit(&g->pt_gen, memory_order_acquire);
@@ -1300,8 +1331,36 @@ static int gva_translate_perm(const guest_t *g,
         const uint64_t *l3 = pt_at(g, l3_ipa - base);
         unsigned l3_idx = (unsigned) ((gva / PAGE_SIZE) % 512);
         uint64_t l3e = pte_load_acquire(&l3[l3_idx]);
-        if (!(l3e & PT_VALID))
-            return -1;
+        for (;;) {
+            /* A materializer owns the word; its publish is imminent. Check
+             * before PT_VALID: a single-page claim holds an invalid
+             * descriptor, but the batched fault-around zeroing window holds a
+             * valid EL1-only one, and falling through to the EL1-only check
+             * would fail the whole access with EFAULT instead of waiting. */
+            if (l3e & GUEST_PTE_SW_COW_MATERIALIZING) {
+                if (!pte_wait_materializer(
+                        (_Atomic uint64_t *) &l3[l3_idx], &l3e))
+                    return -1;
+                continue;
+            }
+            if (l3e & PT_VALID)
+                break;
+            if (!(l3e & GUEST_PTE_SW_COW_ZERO))
+                return -1;
+            if (!validate_lazy)
+                return -1;
+            /* Invalid lazy template: host reads of untouched anonymous pages
+             * validate it into the read-only zero alias in place, exactly
+             * like the guest's own first load (shim.S cow_try_validate). No
+             * TLB maintenance: invalid entries are never cached.
+             */
+            _Atomic uint64_t *lp = (_Atomic uint64_t *) &l3[l3_idx];
+            if (atomic_compare_exchange_strong_explicit(
+                    lp, &l3e, l3e | PT_VALID, memory_order_acq_rel,
+                    memory_order_acquire))
+                l3e |= PT_VALID;
+            /* On failure the CAS reloaded l3e; re-evaluate its state. */
+        }
 
         int perms = desc_to_perms(l3e);
         /* EL1-only pages (shim_data) are inaccessible to guest EL0 in the page
@@ -1331,13 +1390,17 @@ static int gva_translate_perm(const guest_t *g,
         out->gpa = gpa;
         out->chunk = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
 
-        /* Populate TLB cache for this 4KiB page */
-        gva_tlb.owner = g;
-        gva_tlb.base_gva = gva & ~(PAGE_SIZE - 1);
-        gva_tlb.base_gpa = page_ipa - base;
-        gva_tlb.size = PAGE_SIZE;
-        gva_tlb.perms = perms;
-        gva_tlb.gen = gen;
+        /* EL1 can replace a COW-zero descriptor without incrementing the
+         * host-only pt_gen. Do not cache that transient zero-page translation,
+         * or a later host read could keep observing zero after an EL0 write. */
+        if (!(l3e & GUEST_PTE_SW_COW_ZERO)) {
+            gva_tlb.owner = g;
+            gva_tlb.base_gva = gva & ~(PAGE_SIZE - 1);
+            gva_tlb.base_gpa = page_ipa - base;
+            gva_tlb.size = PAGE_SIZE;
+            gva_tlb.perms = perms;
+            gva_tlb.gen = gen;
+        }
         return 0;
     }
 
@@ -1424,7 +1487,7 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
             break;
         expect_gpa += chunk;
 
-        if (gva_translate_perm(g, next_gva, required_perms, &cur) < 0)
+        if (gva_translate_perm(g, next_gva, required_perms, &cur, true) < 0)
             break;
         if (cur.gpa != expect_gpa)
             break;
@@ -1445,7 +1508,8 @@ static void *gva_resolve_perm(const guest_t *g,
                               uint64_t gva,
                               uint64_t *avail,
                               int required_perms,
-                              uint64_t avail_limit)
+                              uint64_t avail_limit,
+                              bool validate_lazy)
 {
     /* Always walk page tables to enforce permissions. The guest slab is
      * identity-mapped (GVA == GPA == offset), but L2 block descriptors carry
@@ -1454,7 +1518,7 @@ static void *gva_resolve_perm(const guest_t *g,
      * normal guest addresses.
      */
     gva_translation_t first;
-    if (gva_translate_perm(g, gva, required_perms, &first) < 0)
+    if (gva_translate_perm(g, gva, required_perms, &first, validate_lazy) < 0)
         return NULL;
 
     if (avail) {
@@ -1493,12 +1557,34 @@ static void *gva_resolve_perm(const guest_t *g,
 
 void *guest_ptr(const guest_t *g, uint64_t gva)
 {
-    return gva_resolve_perm(g, gva, NULL, MEM_PERM_R, UINT64_MAX);
+    return gva_resolve_perm(g, gva, NULL, MEM_PERM_R, UINT64_MAX, true);
+}
+
+static void *guest_resolve_host_write(guest_t *g,
+                                      uint64_t gva,
+                                      uint64_t *avail,
+                                      int required_perms,
+                                      uint64_t len_limit)
+{
+    void *ptr =
+        gva_resolve_perm(g, gva, avail, required_perms, len_limit, true);
+    if (ptr || len_limit == 0)
+        return ptr;
+    if (len_limit > UINT64_MAX - gva)
+        return NULL;
+
+    /* Lock-free: callers may already hold mmap_lock (SC_LOCKED syscalls,
+     * sc_mincore's vec flush under the region sweep). */
+    if (guest_materialize_lazy_zero_range(g, gva, gva + len_limit) < 0)
+        return NULL;
+    return gva_resolve_perm(g, gva, avail, required_perms, len_limit, true);
 }
 
 void *guest_ptr_w(const guest_t *g, uint64_t gva)
 {
-    return gva_resolve_perm(g, gva, NULL, MEM_PERM_W, UINT64_MAX);
+    uint64_t page_left = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
+    return guest_resolve_host_write((guest_t *) g, gva, NULL, MEM_PERM_W,
+                                    page_left);
 }
 
 void *guest_ptr_avail(const guest_t *g,
@@ -1506,7 +1592,12 @@ void *guest_ptr_avail(const guest_t *g,
                       uint64_t *avail,
                       int required_perms)
 {
-    return gva_resolve_perm(g, gva, avail, required_perms, UINT64_MAX);
+    if (required_perms & MEM_PERM_W) {
+        uint64_t page_left = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
+        return guest_resolve_host_write((guest_t *) g, gva, avail,
+                                        required_perms, page_left);
+    }
+    return gva_resolve_perm(g, gva, avail, required_perms, UINT64_MAX, true);
 }
 
 void *guest_ptr_bound(const guest_t *g,
@@ -1515,7 +1606,19 @@ void *guest_ptr_bound(const guest_t *g,
                       int required_perms,
                       uint64_t len_limit)
 {
-    return gva_resolve_perm(g, gva, avail, required_perms, len_limit);
+    if (required_perms & MEM_PERM_W)
+        return guest_resolve_host_write((guest_t *) g, gva, avail,
+                                        required_perms, len_limit);
+    return gva_resolve_perm(g, gva, avail, required_perms, len_limit, true);
+}
+
+void *guest_ptr_bound_existing(const guest_t *g,
+                               uint64_t gva,
+                               uint64_t *avail,
+                               int required_perms,
+                               uint64_t len_limit)
+{
+    return gva_resolve_perm(g, gva, avail, required_perms, len_limit, false);
 }
 
 static inline int guest_copy(const guest_t *g,
@@ -1537,7 +1640,7 @@ static inline int guest_copy(const guest_t *g,
     while (copied < len) {
         uint64_t avail;
         void *ptr = gva_resolve_perm(g, gva + copied, &avail, required_perms,
-                                     (uint64_t) (len - copied));
+                                     (uint64_t) (len - copied), true);
         if (!ptr)
             return -1;
         size_t chunk = len - copied;
@@ -1571,7 +1674,40 @@ int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len)
 
 int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len)
 {
-    return guest_copy(g, gva, NULL, src, len, MEM_PERM_W);
+    if (len == 0)
+        return 0;
+    if (!src || len > UINT64_MAX - gva)
+        return -1;
+
+    /* A host syscall can be the first writer (read(2), getdents64, ptrace,
+     * etc.), so it cannot rely on an EL0 permission fault to allocate COW-zero
+     * pages. Materialize only the page that blocks forward progress: eagerly
+     * materializing the entire user buffer on the first miss turns a short or
+     * failing host I/O into an RSS/latency spike proportional to the requested
+     * length. Lock-free: sc_mincore and SC_LOCKED syscalls may hold mmap_lock.
+     */
+    size_t copied = 0;
+    while (copied < len) {
+        uint64_t cur = gva + copied;
+        uint64_t avail = 0;
+        void *ptr = gva_resolve_perm(g, cur, &avail, MEM_PERM_W,
+                                     (uint64_t) (len - copied), true);
+        if (!ptr) {
+            uint64_t page_end = (cur & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+            if (guest_materialize_lazy_zero_range(g, cur, page_end) < 0)
+                return -1;
+            ptr = gva_resolve_perm(g, cur, &avail, MEM_PERM_W,
+                                   (uint64_t) (len - copied), true);
+            if (!ptr)
+                return -1;
+        }
+        size_t chunk = len - copied;
+        if (chunk > avail)
+            chunk = avail;
+        memcpy(ptr, (const uint8_t *) src + copied, chunk);
+        copied += chunk;
+    }
+    return 0;
 }
 
 int guest_write_small(guest_t *g, uint64_t gva, const void *src, size_t len)
@@ -1597,7 +1733,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max)
             break;
         uint64_t avail;
         void *ptr = gva_resolve_perm(g, gva + copied, &avail, MEM_PERM_R,
-                                     (uint64_t) (limit - copied));
+                                     (uint64_t) (limit - copied), true);
         if (!ptr)
             break;
 
@@ -1694,7 +1830,7 @@ void guest_reset(guest_t *g)
     guest_pt_gen_bump(g);
     guest_tlb_flush();
     __atomic_store_n(&pt_pool_warned, false, __ATOMIC_RELAXED);
-    g->pt_pool_next = g->pt_pool_base;
+    g->pt_pool_next = g->pt_pool_base + PAGE_SIZE;
     g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = BRK_BASE_DEFAULT;
     g->mmap_next = MMAP_BASE;
@@ -1829,6 +1965,8 @@ static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
      * re-zeroing on faults).
      */
     if (a->noreserve != b->noreserve)
+        return false;
+    if (a->lazy_zero != b->lazy_zero)
         return false;
     if (a->backing_ro != b->backing_ro)
         return false;
@@ -1980,16 +2118,23 @@ int guest_region_add_ex_owned(guest_t *g,
                                          offset, name, owned_backing_fd);
 }
 
-int guest_region_add_ex_owned_gpa(guest_t *g,
-                                  uint64_t start,
-                                  uint64_t end,
-                                  uint64_t gpa_base,
-                                  int prot,
-                                  int flags,
-                                  uint64_t offset,
-                                  const char *name,
-                                  int owned_backing_fd)
+static int guest_region_add_ex_owned_gpa_impl(guest_t *g,
+                                              uint64_t start,
+                                              uint64_t end,
+                                              uint64_t gpa_base,
+                                              int prot,
+                                              int flags,
+                                              uint64_t offset,
+                                              const char *name,
+                                              int owned_backing_fd,
+                                              bool lazy_zero)
 {
+    if (start >= end) {
+        if (owned_backing_fd >= 0)
+            close(owned_backing_fd);
+        return -1;
+    }
+
     if (g->nregions >= GUEST_MAX_REGIONS) {
         log_error(
             "guest: region table full (%d/%d), "
@@ -2003,6 +2148,14 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
 
     /* Find insertion point (keep sorted by start address). */
     int i = region_lower_bound_start(g, start);
+    if ((i > 0 && g->regions[i - 1].end > start) ||
+        (i < g->nregions && g->regions[i].start < end)) {
+        log_error("guest: refusing overlapping region [0x%llx-0x%llx)",
+                  (unsigned long long) start, (unsigned long long) end);
+        if (owned_backing_fd >= 0)
+            close(owned_backing_fd);
+        return -1;
+    }
     memmove(&g->regions[i + 1], &g->regions[i],
             (g->nregions - i) * sizeof(guest_region_t));
 
@@ -2016,6 +2169,7 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     r->backing_fd = owned_backing_fd;
     r->shared = (flags & 0x01) != 0;      /* LINUX_MAP_SHARED = 0x01 */
     r->noreserve = (flags & 0x4000) != 0; /* LINUX_MAP_NORESERVE = 0x4000 */
+    r->lazy_zero = lazy_zero;
     r->backing_ro = false;
     guest_region_clear_overlay(r);
     if (name) {
@@ -2033,6 +2187,35 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     try_merge_left(g, i);
 
     return 0;
+}
+
+int guest_region_add_ex_owned_gpa(guest_t *g,
+                                  uint64_t start,
+                                  uint64_t end,
+                                  uint64_t gpa_base,
+                                  int prot,
+                                  int flags,
+                                  uint64_t offset,
+                                  const char *name,
+                                  int owned_backing_fd)
+{
+    return guest_region_add_ex_owned_gpa_impl(g, start, end, gpa_base, prot,
+                                              flags, offset, name,
+                                              owned_backing_fd, false);
+}
+
+int guest_region_add_ex_owned_lazy_zero(guest_t *g,
+                                        uint64_t start,
+                                        uint64_t end,
+                                        int prot,
+                                        int flags,
+                                        uint64_t offset,
+                                        const char *name,
+                                        int owned_backing_fd)
+{
+    return guest_region_add_ex_owned_gpa_impl(g, start, end, start, prot, flags,
+                                              offset, name, owned_backing_fd,
+                                              true);
 }
 
 int guest_preannounce(guest_t *g,
@@ -2921,17 +3104,23 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t va)
      * entries above the primary buffer (rosetta at 128 TiB, etc.).
      */
     unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
-    if (l0_idx >= 512 || !(l0[l0_idx] & PT_VALID))
+    if (l0_idx >= 512)
+        return NULL;
+    uint64_t l0e = pte_load_acquire(&l0[l0_idx]);
+    if (!(l0e & PT_VALID))
         return NULL;
 
-    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t l1_ipa = l0e & 0xFFFFFFFFF000ULL;
     uint64_t *l1 = pt_at(g, l1_ipa - base);
 
     unsigned l1_idx = (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
-    if (l1_idx >= 512 || !(l1[l1_idx] & PT_VALID))
+    if (l1_idx >= 512)
+        return NULL;
+    uint64_t l1e = pte_load_acquire(&l1[l1_idx]);
+    if (!(l1e & PT_VALID))
         return NULL;
 
-    uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+    uint64_t l2_ipa = l1e & 0xFFFFFFFFF000ULL;
     uint64_t *l2 = pt_at(g, l2_ipa - base);
 
     unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GIB) / BLOCK_2MIB);
@@ -3001,7 +3190,27 @@ int guest_split_block(guest_t *g, uint64_t block_gpa)
     return 0;
 }
 
-int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
+static void zero_materialized_lazy_range(guest_t *g,
+                                         uint64_t start,
+                                         uint64_t end)
+{
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (!r->lazy_zero || r->end <= start)
+            continue;
+        uint64_t zstart = r->start > start ? r->start : start;
+        uint64_t zend = r->end < end ? r->end : end;
+        uint64_t gpa = r->gpa_base + (zstart - r->start);
+        memset((uint8_t *) g->host_base + gpa, 0, zend - zstart);
+    }
+}
+
+static int guest_invalidate_ptes_impl(guest_t *g,
+                                      uint64_t start,
+                                      uint64_t end,
+                                      bool zero_materialized_lazy)
 {
     uint64_t base = g->ipa_base;
 
@@ -3043,6 +3252,10 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
                  * broadcast.
                  */
                 pte_store_release(l2_entry, 0);
+                /* A block descriptor cannot represent per-page COW_ZERO
+                 * templates, so any lazy-zero portion is fully materialized. */
+                if (zero_materialized_lazy)
+                    zero_materialized_lazy_range(g, block_start, block_end);
                 tlbi_request_range(base + block_start, base + block_end);
                 addr = block_end;
                 continue;
@@ -3072,14 +3285,41 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
                 (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
-            if (l3[l3_idx] != 0) {
-                pte_store_release(&l3[l3_idx], 0); /* Invalid descriptor */
+            /* A COW-zero materializer (EL1 shim or the lock-free host path)
+             * owns the descriptor while MATERIALIZING is set and publishes
+             * with a blind store, so zeroing must wait it out and claim the
+             * word with a compare-and-swap: a plain store could clobber a
+             * claim that slipped in after the wait, and the winner's publish
+             * would then resurrect the mapping after this invalidation. */
+            _Atomic uint64_t *lp = (_Atomic uint64_t *) &l3[l3_idx];
+            uint64_t desc = atomic_load_explicit(lp, memory_order_acquire);
+            for (;;) {
+                if (desc & GUEST_PTE_SW_COW_MATERIALIZING) {
+                    if (!pte_wait_materializer(lp, &desc))
+                        return -1;
+                    continue;
+                }
+                if (desc == 0)
+                    break;
+                if (!atomic_compare_exchange_strong_explicit(
+                        lp, &desc, 0, memory_order_acq_rel,
+                        memory_order_acquire))
+                    continue;
+                if (zero_materialized_lazy &&
+                    !(desc & GUEST_PTE_SW_COW_ZERO)) {
+                    const guest_region_t *r = guest_region_find(g, pa);
+                    if (r && r->lazy_zero) {
+                        uint64_t gpa = r->gpa_base + (pa - r->start);
+                        memset((uint8_t *) g->host_base + gpa, 0, PAGE_SIZE);
+                    }
+                }
                 if (!bcast) {
                     if (pa < changed_lo)
                         changed_lo = pa;
                     if (pa + PAGE_SIZE > changed_hi)
                         changed_hi = pa + PAGE_SIZE;
                 }
+                break;
             }
         }
 
@@ -3090,6 +3330,18 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 
     guest_pt_gen_bump(g);
     return 0;
+}
+
+int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
+{
+    return guest_invalidate_ptes_impl(g, start, end, false);
+}
+
+int guest_invalidate_ptes_for_munmap(guest_t *g,
+                                     uint64_t start,
+                                     uint64_t end)
+{
+    return guest_invalidate_ptes_impl(g, start, end, true);
 }
 
 int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
@@ -3206,32 +3458,55 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
              * must use the IPA already stored in the descriptor (set by
              * guest_split_block).
              *
-             * For invalidated entries (set to 0 by guest_invalidate_ptes), the
-             * stored IPA is gone. Recover it from region metadata when the VA
-             * range is non-identity mapped; otherwise fall back to the usual
-             * identity IPA (base + pa).
+             * For invalidated entries (set to 0 by guest_invalidate_ptes) the
+             * stored IPA is gone, and for COW-zero descriptors (valid alias or
+             * invalid template) it points at the shared zero page, which must
+             * never be re-permed writable. Recover the real backing IPA from
+             * region metadata when the VA range is non-identity mapped;
+             * otherwise fall back to the usual identity IPA (base + pa).
+             * Callers either materialized the range first (mprotect, mremap)
+             * or zero the backing afterwards (mmap MAP_FIXED), so no data is
+             * lost by dropping the alias here.
+             *
+             * The rewrite is a compare-and-swap loop: a COW materializer that
+             * owns the word (MATERIALIZING set) publishes with a blind store,
+             * so this path must wait it out and must not let a claim slip in
+             * between reading the descriptor and replacing it.
              */
-            uint64_t page_ipa;
-            if (l3[l3_idx] & PT_VALID) {
-                page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
-            } else {
-                const guest_region_t *r = guest_region_find(g, pa);
-                if (r) {
-                    uint64_t page_gpa = r->gpa_base + (pa - r->start);
-                    page_ipa = base + (page_gpa & ~(PAGE_SIZE - 1));
-                } else {
-                    page_ipa = base + (pa & ~(PAGE_SIZE - 1));
+            _Atomic uint64_t *lp = (_Atomic uint64_t *) &l3[l3_idx];
+            uint64_t cur = atomic_load_explicit(lp, memory_order_acquire);
+            for (;;) {
+                if (cur & GUEST_PTE_SW_COW_MATERIALIZING) {
+                    if (!pte_wait_materializer(lp, &cur))
+                        return -1;
+                    continue;
                 }
-            }
-            uint64_t new_desc = make_page_desc(page_ipa, perms);
-            if (l3[l3_idx] != new_desc) {
-                pte_store_release(&l3[l3_idx], new_desc);
+                uint64_t page_ipa;
+                if ((cur & PT_VALID) && !(cur & GUEST_PTE_SW_COW_ZERO)) {
+                    page_ipa = cur & 0xFFFFFFFFF000ULL;
+                } else {
+                    const guest_region_t *r = guest_region_find(g, pa);
+                    if (r) {
+                        uint64_t page_gpa = r->gpa_base + (pa - r->start);
+                        page_ipa = base + (page_gpa & ~(PAGE_SIZE - 1));
+                    } else {
+                        page_ipa = base + (pa & ~(PAGE_SIZE - 1));
+                    }
+                }
+                uint64_t new_desc = make_page_desc(page_ipa, perms);
+                if (cur == new_desc)
+                    break;
+                if (!atomic_compare_exchange_strong_explicit(
+                        lp, &cur, new_desc, memory_order_acq_rel,
+                        memory_order_acquire))
+                    continue;
                 if (!bcast) {
                     if (pa < changed_lo)
                         changed_lo = pa;
                     if (pa + PAGE_SIZE > changed_hi)
                         changed_hi = pa + PAGE_SIZE;
                 }
+                break;
             }
         }
 
@@ -3322,6 +3597,358 @@ int guest_install_va_pages(guest_t *g,
     if (!bcast && changed_hi > changed_lo)
         tlbi_request_range(changed_lo, changed_hi);
     guest_pt_gen_bump(g);
+    return 0;
+}
+
+int guest_prepare_lazy_zero_pages(guest_t *g, uint64_t va, uint64_t length)
+{
+    if (!g || length == 0 || ((va | length) & (PAGE_SIZE - 1)))
+        return -1;
+    if (va > UINT64_MAX - length)
+        return -1;
+
+    uint64_t end = va + length;
+    for (uint64_t v = va; v < end;) {
+        uint64_t *l2_entry = find_l2_entry(g, v);
+        if (!l2_entry || !(*l2_entry & PT_VALID))
+            return -1;
+        if ((*l2_entry & 3) == PT_BLOCK &&
+            guest_split_block(g, ALIGN_2MIB_DOWN(v)) < 0)
+            return -1;
+        uint64_t next = ALIGN_2MIB_UP(v + 1);
+        v = next < end ? next : end;
+    }
+    return 0;
+}
+
+int guest_install_lazy_zero_pages(guest_t *g,
+                                  uint64_t va,
+                                  uint64_t length,
+                                  int perms)
+{
+    if (guest_prepare_lazy_zero_pages(g, va, length) < 0)
+        return -1;
+
+    /* Keep the zero alias readable. Existing writable mappings are readable
+     * too, so this also preserves their current PROT_WRITE behavior. */
+    int zero_perms = (perms & ~MEM_PERM_W) | MEM_PERM_R;
+    uint64_t base = g->ipa_base;
+    uint64_t zero_pa = base + g->lazy_zero_gpa;
+    uint64_t end = va + length;
+    uint64_t changed_lo = UINT64_MAX, changed_hi = 0;
+    bool bcast = tlbi_request_is_broadcast();
+
+    for (uint64_t v = va; v < end; v += PAGE_SIZE) {
+        uint64_t *l2_entry = find_l2_entry(g, v);
+        uint64_t *l3 = pt_at(g, (*l2_entry & 0xFFFFFFFFF000ULL) - base);
+        unsigned l3_idx = (unsigned) (((base + v) % BLOCK_2MIB) / PAGE_SIZE);
+        /* Installed invalid: a write-first touch then claims the descriptor
+         * with no live translation anywhere, so the COW path skips its
+         * break-before-make broadcast entirely. The first read or fetch
+         * validates the template into this read-only zero alias in place
+         * (cow_try_validate / gva_resolve_perm), also without TLB
+         * maintenance.
+         */
+        uint64_t new_desc =
+            (make_page_desc(zero_pa, zero_perms) | GUEST_PTE_SW_COW_ZERO) &
+            ~PT_VALID;
+        _Atomic uint64_t *lp = (_Atomic uint64_t *) &l3[l3_idx];
+        uint64_t cur = atomic_load_explicit(lp, memory_order_acquire);
+        for (;;) {
+            if (cur & GUEST_PTE_SW_COW_MATERIALIZING) {
+                if (!pte_wait_materializer(lp, &cur))
+                    return -1;
+                continue;
+            }
+            if (cur == new_desc)
+                break;
+            if (!atomic_compare_exchange_weak_explicit(lp, &cur, new_desc,
+                                                       memory_order_acq_rel,
+                                                       memory_order_acquire))
+                continue;
+            if (!bcast) {
+                if (v < changed_lo)
+                    changed_lo = v;
+                if (v + PAGE_SIZE > changed_hi)
+                    changed_hi = v + PAGE_SIZE;
+            }
+            break;
+        }
+    }
+
+    if (!bcast && changed_hi > changed_lo)
+        tlbi_request_range(changed_lo, changed_hi);
+    guest_pt_gen_bump(g);
+    return 0;
+}
+
+bool guest_page_is_resident(const guest_t *g, uint64_t va)
+{
+    uint64_t *l2_entry = find_l2_entry((guest_t *) g, va);
+    if (!l2_entry)
+        return false;
+    uint64_t l2 = pte_load_acquire(l2_entry);
+    if (!(l2 & PT_VALID))
+        return false;
+    if ((l2 & (PT_VALID | PT_TABLE)) != (PT_VALID | PT_TABLE))
+        return true;
+
+    uint64_t base = g->ipa_base;
+    uint64_t l3_ipa = l2 & 0xFFFFFFFFF000ULL;
+    if (l3_ipa < base || l3_ipa - base >= g->guest_size)
+        return false;
+    uint64_t *l3 = pt_at(g, l3_ipa - base);
+    unsigned l3_idx = (unsigned) (((base + va) % BLOCK_2MIB) / PAGE_SIZE);
+    return (pte_load_acquire(&l3[l3_idx]) & PT_VALID) != 0;
+}
+
+uint64_t guest_count_resident_pages(const guest_t *g)
+{
+    uint64_t pages = 0;
+    uint64_t base = g->ipa_base;
+
+    for (int i = 0; i < g->nregions; i++) {
+        uint64_t va = g->regions[i].start;
+        uint64_t end = g->regions[i].end;
+
+        while (va < end) {
+            uint64_t block_start = ALIGN_2MIB_DOWN(va);
+            uint64_t block_end = block_start + BLOCK_2MIB;
+            uint64_t span_end = end < block_end ? end : block_end;
+            uint64_t *l2_entry = find_l2_entry((guest_t *) g, va);
+
+            if (!l2_entry) {
+                va = span_end;
+                continue;
+            }
+
+            uint64_t l2 = pte_load_acquire(l2_entry);
+            if (!(l2 & PT_VALID)) {
+                va = span_end;
+                continue;
+            }
+            if ((l2 & (PT_VALID | PT_TABLE)) != (PT_VALID | PT_TABLE)) {
+                pages += (span_end - va) / PAGE_SIZE;
+                va = span_end;
+                continue;
+            }
+
+            uint64_t l3_ipa = l2 & 0xFFFFFFFFF000ULL;
+            if (l3_ipa < base || l3_ipa - base >= g->guest_size) {
+                va = span_end;
+                continue;
+            }
+            uint64_t *l3 = pt_at(g, l3_ipa - base);
+            for (; va < span_end; va += PAGE_SIZE) {
+                unsigned l3_idx =
+                    (unsigned) (((base + va) % BLOCK_2MIB) / PAGE_SIZE);
+                if (pte_load_acquire(&l3[l3_idx]) & PT_VALID)
+                    pages++;
+            }
+        }
+    }
+    return pages;
+}
+
+uint64_t guest_lazy_zero_pte_template(const guest_t *g)
+{
+    /* Invalid on purpose; see guest_install_lazy_zero_pages. */
+    return (make_page_desc(g->ipa_base + g->lazy_zero_gpa, MEM_PERM_R) |
+            GUEST_PTE_SW_COW_ZERO) &
+           ~PT_VALID;
+}
+
+/* Reset PTEs left mid-materialization after every possible owner is quiesced.
+ *
+ * The fork quiesce parks sibling vCPUs wherever hv_vcpus_exit cancels them
+ * -- including inside shim.S cow_try_materialize -- and its bounded wait can
+ * also give up on a host thread inside materialize_lazy_zero_page, so the
+ * memory snapshot may carry claimed-but-unpublished COW descriptors. No
+ * owner exists in the child to finish those claims: the child's first touch
+ * would spin forever at EL1, and the host accessors would spin in
+ * gva_translate_perm. A claimed page's logical content is still zero -- the
+ * owner zeroes it before publishing, and EL0 cannot observe the page before
+ * that -- so resetting the descriptor to the invalid lazy-zero template is
+ * exact. A claimed template still carries its original attributes and
+ * zero-page output address; the valid EL1-only descriptor of a fault-around
+ * zeroing window does not, so its attributes are rebuilt from the owning
+ * region's prot.
+ *
+ * Fork children call this after restoring the region table and before creating
+ * a vCPU. Final teardown calls it after joining every worker. Both contexts
+ * have no possible publisher, so plain stores suffice.
+ */
+void guest_reset_orphaned_cow_claims(guest_t *g)
+{
+    const uint64_t addr_mask = 0xFFFFFFFFF000ULL;
+    uint64_t base = g->ipa_base;
+    uint64_t zero_pa = base + g->lazy_zero_gpa;
+    long reset = 0;
+
+    uint64_t *l0 = pt_at(g, g->ttbr0 - base);
+    if (!l0)
+        return;
+    for (unsigned i0 = 0; i0 < 512; i0++) {
+        if ((l0[i0] & (PT_VALID | PT_TABLE)) != (PT_VALID | PT_TABLE))
+            continue;
+        uint64_t l1_ipa = l0[i0] & addr_mask;
+        if (l1_ipa < base || l1_ipa - base >= g->guest_size)
+            continue;
+        uint64_t *l1 = pt_at(g, l1_ipa - base);
+        if (!l1)
+            continue;
+        for (unsigned i1 = 0; i1 < 512; i1++) {
+            if ((l1[i1] & (PT_VALID | PT_TABLE)) != (PT_VALID | PT_TABLE))
+                continue;
+            uint64_t l2_ipa = l1[i1] & addr_mask;
+            if (l2_ipa < base || l2_ipa - base >= g->guest_size)
+                continue;
+            uint64_t *l2 = pt_at(g, l2_ipa - base);
+            if (!l2)
+                continue;
+            for (unsigned i2 = 0; i2 < 512; i2++) {
+                if ((l2[i2] & (PT_VALID | PT_TABLE)) != (PT_VALID | PT_TABLE))
+                    continue;
+                uint64_t l3_ipa = l2[i2] & addr_mask;
+                if (l3_ipa < base || l3_ipa - base >= g->guest_size)
+                    continue;
+                uint64_t *l3 = pt_at(g, l3_ipa - base);
+                if (!l3)
+                    continue;
+                for (unsigned i3 = 0; i3 < 512; i3++) {
+                    uint64_t desc = l3[i3];
+                    if (!(desc & GUEST_PTE_SW_COW_MATERIALIZING))
+                        continue;
+                    uint64_t next;
+                    if ((desc & addr_mask) == zero_pa) {
+                        next = (desc & ~(uint64_t) PT_VALID &
+                                ~GUEST_PTE_SW_COW_MATERIALIZING) |
+                               GUEST_PTE_SW_COW_ZERO;
+                    } else {
+                        uint64_t va = (uint64_t) i0 * (512ULL * BLOCK_1GIB) +
+                                      (uint64_t) i1 * BLOCK_1GIB +
+                                      (uint64_t) i2 * BLOCK_2MIB +
+                                      (uint64_t) i3 * PAGE_SIZE;
+                        int perms = MEM_PERM_R;
+                        const guest_region_t *r = guest_region_find(g, va);
+                        if (r && (r->prot & LINUX_PROT_EXEC))
+                            perms |= MEM_PERM_X;
+                        next = (make_page_desc(zero_pa, perms) |
+                                GUEST_PTE_SW_COW_ZERO) &
+                               ~(uint64_t) PT_VALID;
+                    }
+                    l3[i3] = next;
+                    reset++;
+                }
+            }
+        }
+    }
+    if (reset) {
+        log_debug("guest: reset %ld orphaned COW materialization claims",
+                  reset);
+        guest_pt_gen_bump(g);
+    }
+}
+
+int guest_prepare_fast_mmap_arena(guest_t *g, uint64_t start, uint64_t end)
+{
+    if (!g || start >= end || (start | end) & (BLOCK_2MIB - 1))
+        return -1;
+    if (guest_extend_page_tables(g, start, end, MEM_PERM_RW) < 0)
+        return -1;
+    for (uint64_t block = start; block < end; block += BLOCK_2MIB)
+        if (guest_split_block(g, block) < 0)
+            return -1;
+    if (guest_invalidate_ptes(g, start, end) < 0)
+        return -1;
+    if (end > g->mmap_end)
+        g->mmap_end = end;
+    if (end > g->mmap_next)
+        g->mmap_next = end;
+    return 0;
+}
+
+/* Materialize one COW-zero page. Lock-free by design: the PTE word is the
+ * synchronization primitive shared with the EL1 fast path in shim.S, so the
+ * guest memory accessors (guest_write, guest_ptr_w, ...) may call this from
+ * any context, including syscall handlers that already hold mmap_lock
+ * (sc_mincore's vec flush, sys_shmat's segment copy). Region state is
+ * deliberately not consulted: a COW_ZERO descriptor exists only on writable
+ * identity-mapped anonymous pages (mprotect materializes a range before
+ * changing its protection), so the descriptor alone carries everything the
+ * private page needs -- attributes and XN are preserved, only the output
+ * address and EL0 write permission change, exactly like the shim's
+ * cow_try_materialize publish.
+ */
+static int materialize_lazy_zero_page(guest_t *g, uint64_t offset)
+{
+    uint64_t page = offset & ~(PAGE_SIZE - 1);
+    if (page > g->guest_size - PAGE_SIZE)
+        return 1;
+
+    uint64_t *l2_entry = find_l2_entry(g, page);
+    if (!l2_entry)
+        return 1;
+    uint64_t l2e = pte_load_acquire(l2_entry);
+    if ((l2e & 3) != (PT_VALID | PT_TABLE))
+        return 1;
+    uint64_t base = g->ipa_base;
+    uint64_t *l3 = pt_at(g, (l2e & 0xFFFFFFFFF000ULL) - base);
+    unsigned l3_idx = (unsigned) (((base + page) % BLOCK_2MIB) / PAGE_SIZE);
+    _Atomic uint64_t *pte = (_Atomic uint64_t *) &l3[l3_idx];
+    uint64_t old_desc = atomic_load_explicit(pte, memory_order_acquire);
+    for (;;) {
+        if (old_desc & GUEST_PTE_SW_COW_MATERIALIZING) {
+            if (!pte_wait_materializer(pte, &old_desc))
+                return -1;
+            continue;
+        }
+        if (!(old_desc & GUEST_PTE_SW_COW_ZERO))
+            return 1;
+
+        uint64_t materializing =
+            (old_desc & ~(PT_VALID | GUEST_PTE_SW_COW_ZERO)) |
+            GUEST_PTE_SW_COW_MATERIALIZING;
+        if (atomic_compare_exchange_weak_explicit(pte, &old_desc, materializing,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire))
+            break;
+    }
+
+    memset((uint8_t *) g->host_base + page, 0, PAGE_SIZE);
+
+    uint64_t addr_mask = 0xFFFFFFFFF000ULL;
+    uint64_t desc =
+        old_desc & ~(addr_mask | (3ULL << 6) | GUEST_PTE_SW_COW_ZERO |
+                     GUEST_PTE_SW_COW_MATERIALIZING);
+    desc |= (base + page) & addr_mask;
+    desc |= 1ULL << 6; /* AP[2:1]=01: RW at EL0 */
+    desc |= PT_VALID;  /* the claimed template may have been invalid */
+    atomic_store_explicit(pte, desc, memory_order_release);
+    /* A write-first touch claims the invalid template, which no PE can have
+     * cached, so only a previously valid zero alias needs invalidating. */
+    if (old_desc & PT_VALID)
+        tlbi_request_range(page, page + PAGE_SIZE);
+    guest_pt_gen_bump(g);
+    return 0;
+}
+
+int guest_materialize_lazy_zero(guest_t *g, uint64_t fault_offset)
+{
+    return materialize_lazy_zero_page(g, fault_offset);
+}
+
+int guest_materialize_lazy_zero_range(guest_t *g, uint64_t start, uint64_t end)
+{
+    if (end < start || end > UINT64_MAX - (PAGE_SIZE - 1))
+        return -1;
+    start &= ~(PAGE_SIZE - 1);
+    end = ALIGN_UP(end, PAGE_SIZE);
+    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
+        int rc = materialize_lazy_zero_page(g, page);
+        if (rc < 0)
+            return -1;
+    }
     return 0;
 }
 

@@ -711,7 +711,7 @@ int main(int argc, char **argv)
      * exit-group flag and terminate before the join below gives up on them.
      */
     thread_wake_exit_waiters();
-    thread_join_workers();
+    (void) thread_join_workers();
 
     /* Diagnostic counter dump runs before guest_destroy so the shim_data
      * mapping is still valid. ELFUSE_SHIM_STATS is the gate; an unset variable
