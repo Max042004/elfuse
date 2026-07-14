@@ -7,7 +7,9 @@
 #   scan-macos    : LLVM scan-build via `make analyze`
 #   infer-macos   : Facebook Infer capture + analyze over the full build
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
-#                   including release, ASAN, UBSAN, and TSAN variants
+#                   including release, ASAN, UBSAN, and TSAN variants,
+#                   plus a Benchmark leg (tests/bench-suite.sh) that
+#                   compares against tests/bench-baseline.json
 #
 # Runtime and sanitizer tests require Hypervisor.framework, which
 # GitHub-hosted macOS runners do not expose. Those tests run on self-hosted
@@ -396,6 +398,28 @@ jobs:
             run_matrix: false
             check_target: check-sanitizer
             brew_pkgs: binutils
+          # Benchmark leg (issue #195): release build, two-tier suite via
+          # `make bench-ci` (elfuse column) and `BENCH_ENV=qemu-aarch64
+          # make bench-ci` (the qemu-aarch64 Linux-kernel reference
+          # column on the same silicon, via HVF), baseline comparison,
+          # artifact upload.
+          # Stays off the sanitizer legs (a sanitized guest measures the
+          # sanitizer, not elfuse) and off GitHub-hosted runners (no
+          # Hypervisor.framework there). An empty check_target skips the
+          # `make check` step; the fixture cache restore is shared with
+          # the release leg via run_bench.
+          - name: Benchmark
+            sanitizer: bench
+            extra_cflags: ''
+            asan_options: ''
+            ubsan_options: ''
+            tsan_options: ''
+            test_timeout: ''
+            job_timeout: 25
+            run_matrix: false
+            run_bench: true
+            check_target: ''
+            brew_pkgs: binutils qemu
 
     # contents: read for the checkout; pull-requests: read so the guard can
     # query the PR's current HEAD. (actions: write would let the guard
@@ -468,9 +492,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Restore cached test fixtures
-        # Only the release leg needs fixtures: the sanitizer legs run the
-        # fixture-free check-sanitizer subset.
-        if: ${{ matrix.run_matrix }}
+        # Only the release and benchmark legs need fixtures: the
+        # sanitizer legs run the fixture-free check-sanitizer subset.
+        if: ${{ matrix.run_matrix || matrix.run_bench }}
         # actions/checkout's default clean:true runs `git clean -ffdx`, which
         # wipes externals/test-fixtures (gitignored) on this self-hosted
         # runner even though its disk otherwise persists across runs.
@@ -576,7 +600,9 @@ jobs:
       - name: make check
         # Release runs the full check suite; sanitizer legs run check-sanitizer,
         # a representative internal-implementation subset (the release lane plus
-        # test-matrix already cover Linux syscall compatibility).
+        # test-matrix already cover Linux syscall compatibility). The benchmark
+        # leg sets an empty check_target and skips this step entirely.
+        if: ${{ matrix.check_target != '' }}
         run: |
           make EXTRA_CFLAGS="$EXTRA_CFLAGS" ${{ matrix.check_target }}
 
@@ -584,6 +610,45 @@ jobs:
         if: ${{ matrix.run_matrix }}
         run: |
           bash tests/test-matrix.sh all
+
+      - name: Benchmark suite (make bench-ci)
+        if: ${{ matrix.run_bench }}
+        run: |
+          make bench-ci
+
+      - name: Benchmark suite, QEMU reference column (BENCH_ENV=qemu-aarch64 make bench-ci)
+        # Same workloads inside the fixture Alpine VM (HVF, -cpu host):
+        # the Linux-kernel-on-same-silicon reference column of the
+        # issue #195 comparison table. No separate Makefile target --
+        # BENCH_ENV picks the column like any other, and a non-default
+        # BENCH_ENV writes build/bench-results-$BENCH_ENV.json so this
+        # doesn't clobber the elfuse-aarch64 leg above.
+        if: ${{ matrix.run_bench }}
+        run: |
+          BENCH_ENV=qemu-aarch64 make bench-ci
+
+      - name: Compare against baseline (report-only)
+        # Soft signal for now: the self-hosted runner's run-to-run variance
+        # is not yet characterized, so a regression prints loudly in the log
+        # but does not fail the leg. Flip criterion: once the leg has run
+        # for ~2 weeks / ~20 runs with every ratio inside the +20% threshold,
+        # drop BENCH_REPORT_ONLY=1 so regressions hard-fail.
+        if: ${{ matrix.run_bench }}
+        run: |
+          BENCH_REPORT_ONLY=1 python3 scripts/bench-compare.py
+          BENCH_REPORT_ONLY=1 python3 scripts/bench-compare.py \
+            --results build/bench-results-qemu-aarch64.json
+
+      - name: Upload benchmark results
+        if: ${{ matrix.run_bench && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            build/bench-results.json
+            build/bench-results-qemu-aarch64.json
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Upload runtime binary
         if: ${{ !cancelled() }}
