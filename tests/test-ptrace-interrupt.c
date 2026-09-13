@@ -32,6 +32,10 @@
  * x21, which the final snapshot verifies survived PTRACE_CONT. The tracee
  * signals itself throughout, so a share of the kicks are consumed on the
  * rt_sigreturn tail, which returns on host-rebuilt state.
+ *
+ * The run closes on a BRK stop. That tail reloads X8 from the shim's saved
+ * frame, so the stop has to report the guest's X8 and the X8 the tracer writes
+ * there has to be the one the tracee resumes with.
  */
 
 #include <stdint.h>
@@ -55,6 +59,13 @@
 #define CANARY 0x5ec0ffee5ec0ffeeULL
 #define SIGUSR1 10
 #define UPDATED_CANARY 0x1234567812345678ULL
+
+/* What the tracee holds in x8 at its BRK, and what the tracer writes over it.
+ * The written value is the drop-frame marker's own number, which is the one a
+ * reload keyed on the marker takes for it and replaces.
+ */
+#define BRK_X8 0xc3
+#define BRK_X8_WRITTEN 2
 
 /* Between the highest address this guest maps and the lowest the shim uses, so
  * a PC at or above it can only be shim state.
@@ -102,6 +113,24 @@ typedef struct {
 static volatile int tracee_nosig;
 static volatile int tracee_sigs;
 static volatile int tracee_quiet;
+
+static volatile int tracee_brk_done;
+volatile uint64_t brk_seen_x8;
+
+/* Take a BRK with a known x8 and record the x8 the instruction after it runs
+ * with. x21 is left alone: it is the canary the rounds above depend on.
+ */
+void brk_stub(void);
+__asm__(
+    ".text\n.globl brk_stub\n.type brk_stub, %function\n"
+    "brk_stub:\n"
+    "    mov x8, #0xc3\n"
+    "    brk #0\n"
+    "    adrp x9, brk_seen_x8\n"
+    "    add x9, x9, :lo12:brk_seen_x8\n"
+    "    str x8, [x9]\n"
+    "    ret\n"
+    ".size brk_stub, .-brk_stub\n");
 
 /* A stop can land inside this handler, and the canary check upstairs cannot
  * tell which frame it caught. Pin X21 to the value the loop holds so either
@@ -167,6 +196,9 @@ static int tracee_fn(void)
      * stop keeping the value there and the check above becomes a tautology.
      */
     __asm__ volatile("" : : "r"(canary));
+
+    brk_stub();
+    tracee_brk_done = 1;
     return 0;
 }
 
@@ -297,6 +329,54 @@ int main(void)
     }
 
     tracee_stop = 1;
+
+    /* The tracee leaves its loop and takes the BRK. */
+    int brk_status = 0;
+    long bw = -1;
+    for (int spin = 0; spin < 1500; spin++) {
+        bw = raw_syscall4(260, tracee, (long) &brk_status, 1 /* WNOHANG */, 0);
+        if (bw > 0)
+            break;
+        poll_backoff(spin);
+    }
+    if (bw <= 0) {
+        printf("FAIL: no ptrace-stop at the BRK\n");
+        return 1;
+    }
+
+    user_pt_regs_t brk_regs;
+    memset(&brk_regs, 0, sizeof(brk_regs));
+    if (getregs(tracee, &brk_regs) != 0) {
+        printf("FAIL: GETREGSET refused at the BRK stop\n");
+        return 1;
+    }
+    if (brk_regs.regs[8] != BRK_X8) {
+        printf("FAIL: the BRK stop reports x8 = 0x%llx, want 0x%x\n",
+               (unsigned long long) brk_regs.regs[8], BRK_X8);
+        return 1;
+    }
+
+    brk_regs.regs[8] = BRK_X8_WRITTEN;
+    brk_regs.pc += 4; /* past the BRK */
+    if (setregs(tracee, &brk_regs) != 0) {
+        printf("FAIL: SETREGSET refused at the BRK stop\n");
+        return 1;
+    }
+    raw_syscall4(117, PTRACE_CONT, tracee, 0, 0);
+
+    for (int spin = 0; spin < 1500 && !tracee_brk_done; spin++)
+        poll_backoff(spin);
+    if (!tracee_brk_done) {
+        printf("FAIL: the tracee never resumed past the BRK\n");
+        return 1;
+    }
+    if (brk_seen_x8 != BRK_X8_WRITTEN) {
+        printf(
+            "FAIL: resumed past the BRK with x8 = 0x%llx, want the 0x%x "
+            "the tracer wrote\n",
+            (unsigned long long) brk_seen_x8, BRK_X8_WRITTEN);
+        return 1;
+    }
 
     if (stops == 0) {
         printf("FAIL: no ptrace-stop was ever taken\n");

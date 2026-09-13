@@ -285,16 +285,15 @@ X8 == 1  TLBI_BROADCAST   TLBI VMALLE1IS + DSB ISH + ISB
                           -> restore GPRs (keep X0); ERET
 X8 == 2  drop-frame       discard the saved GPR frame
                           (`add sp, sp, #256`) and ERET on the rebuilt
-                          EL0 register state. Set by `execve` and
-                          `rt_sigreturn` (which write the whole frame
-                          directly into the vCPU) and by
-                          `signal_deliver()` on the syscall-return
-                          path (so handler PC/SP/LR/args installed by
-                          the host are not overwritten by the stale
-                          shim frame on ERET). `execve` additionally
-                          issues `IC IALLU` because the new program
-                          text may live in pages that previously held
-                          the old text.
+                          EL0 register state, reloading only `X8` from
+                          the frame's own slot (`[sp, #64]`), since the
+                          marker occupies that register. Set by
+                          `rt_sigreturn` (which writes the whole
+                          register set directly into the vCPU) and by
+                          signal delivery on the syscall-return path
+                          (so handler PC/SP/LR/args installed by the
+                          host are not overwritten by the stale shim
+                          frame on ERET). Always issues `IC IALLU`.
 X8 == 3  TLBI_RANGE       loop TLBI VAE1IS over `X9` (start VA),
                           `X10` (page count); 4 KiB granule. Used for
                           up to `TLBI_SELECTIVE_MAX_PAGES = 16` pages.
@@ -317,25 +316,40 @@ separate broadcast after the split lands.
 `X8 == 2` is the generic drop-saved-frame marker: the host has
 rebuilt EL0 register state directly into the vCPU and the saved
 syscall frame on the EL1 stack is stale, so the shim drops the frame
-and `ERET`s without restoring GPRs. Three call sites use it:
+and `ERET`s without restoring GPRs. Two call sites write it, both in
+`src/syscall/signal.c`:
 
-- `sys_execve` (`src/syscall/exec.c:785, 1093`) after the ELF reload.
-- `signal_rt_sigreturn` (`src/syscall/signal.c:1710`) after restoring
-  the saved sigframe.
-- `signal_deliver` (`src/syscall/signal.c:1594`) when a signal is
-  delivered on the syscall-return path; without the marker the shim
-  would overwrite the handler PC, SP, LR, and arg-register state with
-  the stale syscall frame on `ERET`.
+- `signal_rt_sigreturn`, after restoring the saved sigframe.
+- `deliver_signal_locked`, when a signal is delivered on the
+  syscall-return path; without the marker the shim would overwrite the
+  handler PC, SP, LR, and arg-register state with the stale syscall
+  frame on `ERET`.
 
-`X8` (the syscall-number register) and `X9`/`X10` are already considered
-clobbered by the Linux syscall ABI, so callers never expect them to be
-preserved across SVC.
+`sys_execve` writes no marker: it re-enters through the shim's MMU-off
+`_start`, which pops no frame. The `HVC #5` epilogue and both `HVC #9`
+W^X tails branch to `exec_drop_frame` on the marker; `handle_brk`
+(`HVC #10`) drops its frame on every return.
 
-Important: the first two paths (`sys_execve` and
-`signal_rt_sigreturn`) return `SYSCALL_EXEC_HAPPENED` to bypass the
-normal syscall dispatch epilogue. `signal_deliver` runs from inside
-the epilogue. Any future code path that rebuilds EL0 register state
-on the syscall-return path must write `X8 = 2` the same way.
+Linux preserves `X1`-`X30` across `SVC #0`, so the marker must not reach
+EL0: a resumed `SVC` that has not executed yet would run as syscall 2
+(sysprog21/elfuse#379). Those tails therefore reload `X8` from the
+frame's `X8` slot before the pop. The slot holds the `X8` the exception
+was taken with unless the host published another there:
+`signal_rt_sigreturn` publishes the one it restored, and the `BRK`
+ptrace stop the one its tracer left. `signal_rt_sigreturn` also parks
+that value for a signal delivered later in the same epilogue, which
+would otherwise snapshot the marker as the guest's `X8`; the run loop
+drops the record before every `hv_vcpu_run()`, and an inline ptrace
+stop that moves the PC re-keys it. The TLBI kinds on the ordinary
+syscall-return tail are not covered: a signal delivered there still
+records the wire values as `X8`-`X11` (sysprog21/elfuse#384).
+
+Important: `signal_rt_sigreturn` returns `SYSCALL_EXEC_HAPPENED` to
+bypass the normal syscall dispatch epilogue, as `sys_execve` does.
+`deliver_signal_locked` runs from inside the epilogue. Any future code
+path that rebuilds EL0 register state on the syscall-return path must
+write `X8 = 2` the same way, and publish the guest's `X8` if it differs
+from the one the frame was entered with.
 
 ## EL1 Shim And HVC Protocol
 
@@ -348,10 +362,10 @@ aligned address from the `Rt` register); HVF traps DC ZVA via `HCR_EL2.TDZ=1`.
 | #0 | Normal exit | `X0` = exit code |
 | #2 | Bad exception | `X0`=ESR, `X1`=FAR, `X2`=ELR, `X3`=SPSR, `X5`=vector |
 | #4 | Set boot system register | `X0` = reg ID (0–8), `X1` = value (used by the shim during boot to install RES1 bits and enable the MMU) |
-| #5 | Syscall forward | `X0`–`X5` = args, `X8` = syscall number on entry; on return `X8` carries the TLBI kind (`0` = none, `1` = broadcast, `3` = selective range with `X9` = VA + `X10` = page count, `4` = single-shot `TLBI RVAE1IS` with encoded operand in `X9`). `X8 = 2` is the generic drop-saved-frame marker -- set when the host has rebuilt EL0 state directly (by `execve`, `rt_sigreturn`, and `signal_deliver()` on the syscall-return path) so the shim discards the saved syscall frame on ERET. `X11` is the icache-flush hint (set to `1` when the request transitions a page to executable, so the shim issues `IC` alongside the chosen TLBI) |
+| #5 | Syscall forward | `X0`–`X5` = args, `X8` = syscall number on entry; on return `X8` carries the TLBI kind (`0` = none, `1` = broadcast, `3` = selective range with `X9` = VA + `X10` = page count, `4` = single-shot `TLBI RVAE1IS` with encoded operand in `X9`). `X8 = 2` is the generic drop-saved-frame marker -- set when the host has rebuilt EL0 state directly (by `rt_sigreturn` and by signal delivery on the syscall-return path) so the shim discards the saved syscall frame on ERET, reloading only `X8` from it. `X11` is the icache-flush hint (set to `1` when the request transitions a page to executable, so the shim issues `IC` alongside the chosen TLBI) |
 | #6 | Embedder extension | `X8` = call number, `X0`–`X7` = args; routed to `g->hvc6_handler` if set, no-op otherwise. Handler may request a vCPU yield via `proc_request_hvc6_yield()` |
 | #7 | MRS trap (read sysreg) | host reads register from ESR ISS; returns value in `X0` |
-| #9 | W^X toggle | `X0` = FAR, `X1` = type (0 = exec→RX, 1 = write→RW) |
+| #9 | W^X toggle | `X0` = FAR, `X1` = type (0 = exec→RX, 1 = write→RW); on return `X8 = 2` when the host answered with a `SIGSEGV` delivery instead of a flip |
 | #10 | BRK from EL0 | SIGTRAP delivery / ptrace-stop; GPRs in frame |
 | #11 | EL0 fault | SIGSEGV/SIGILL delivery; GPRs in frame |
 | #12 | EL0 system-instruction trap | cache maintenance logging (DC CVAU, IC IVAU, …) and `MSR TPIDR_EL0` emulation |
@@ -797,7 +811,8 @@ In `src/syscall/proc.c`:
   `hv_vcpus_exit()`. A stop taken on a syscall return whose tail restores the
   saved SVC frame goes through HVC #13, so ptrace snapshots the architectural
   GPR set rather than shim scratch. The tails that rebuild EL0 state instead
-  (`X8 = 2`) already hold that set live, so the host stops on them directly;
+  (`X8 = 2`) already hold that set live, bar the `X8` the shim reloads from
+  the saved frame, so the host stops on them directly;
   an `execve` re-entry leaves the stop owed for the new image's first
   syscall.
 - `PTRACE_GETREGSET` / `PTRACE_SETREGSET` (`NT_PRSTATUS`) -- read or write
