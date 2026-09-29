@@ -212,10 +212,8 @@ Under `make check`:
 - `scripts/check-atomics.py` fails a C11 atomic operation written without the
   `_explicit` form, and bans the compiler builtins, so the order is written at
   the site. Its docstring names what it deliberately leaves out: plain-operator
-  access to an `_Atomic` object, which needs per-translation-unit declarations
-  and which the tree already carries a large set of. That half is a review
-  question, so it is the one memory-order case to spend budget on rather than
-  skip.
+  access to an `_Atomic` object. That half is a review question, so it is the
+  one memory-order case to spend budget on rather than skip.
 - `scripts/check-svc-tails.py` holds every return tail to the X7 ptrace test,
   bar the one exception its docstring names and allowlists.
 - `scripts/check-syscall-coverage.py` is a best-effort audit of `dispatch.tbl`

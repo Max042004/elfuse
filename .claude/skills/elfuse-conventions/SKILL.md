@@ -194,10 +194,8 @@ states no more about the ordering than the plain operator does.
 form. It reads these skill files too, under the banned-spelling half only, so
 prose may quote a bare `atomic_load` but not a concrete `__atomic_*` name or an
 `__ATOMIC_*` order constant; write either family with the star, as this
-paragraph does. The script does not check plain-operator access to an
-`_Atomic` object, because finding those needs the declarations resolved and the
-tree still carries a large pre-existing set of them; that half stays a review
-question.
+paragraph does. That script's module docstring carries the reasoning, and why
+plain-operator access to an `_Atomic` object is left a review question.
 
 State the order and name what it pairs with. Relaxed is right under a lock that
 already serializes the access. Release and acquire are for a publish a lock-free
@@ -424,3 +422,19 @@ would push one person's habit onto everybody.
 
 Build and toolchain requirements are in `docs/testing.md`, section "Build
 Requirements". They belong to a machine, not to this convention set.
+
+## Authoritative sources
+
+- `CONTRIBUTING.md` for C style, the formatter, and the commit-message rules;
+  it wins where both files speak.
+- `scripts/check-atomics.py`, its module docstring, for what the atomics gate
+  checks and what it deliberately leaves to review.
+- `scripts/check-ascii.py` for the character-set gate, which reads only `.c`,
+  `.h` and `.S` under `src`, `tests` and `frama-c-stubs`: the markdown half of
+  the em dash ban has no gate behind it and stays a review question.
+- `scripts/check-skill-refs.py` for how a path, target, or section named in
+  these files is resolved.
+- `scripts/install-git-hooks.sh` for the hooks a fresh clone installs. They
+  run `.ci/check-format.sh` and `.ci/check-commentflow.sh` at commit time and
+  the commit-log check at push time; none of the gates above is among them, so
+  those first fail at `make check` or in CI.
