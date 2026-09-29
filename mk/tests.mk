@@ -123,7 +123,7 @@ check-svc-tails:
 ## Verify every path, target, and section the skills name still resolves
 check-skill-refs:
 	@python3 scripts/check-skill-refs.py --self-test
-	@python3 scripts/check-skill-refs.py
+	@python3 scripts/check-skill-refs.py $(wildcard AGENTS.md)
 
 define RUN_OPTIONAL_SKIP77
 	@set -e; \

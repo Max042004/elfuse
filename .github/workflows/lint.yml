@@ -177,7 +177,9 @@ jobs:
         # current. This found two dead references to a workflow and a makefile
         # that the CI split had already removed.
         if: ${{ !cancelled() }}
-        run: python3 scripts/check-skill-refs.py
+        run: |
+          python3 scripts/check-skill-refs.py --self-test
+          python3 scripts/check-skill-refs.py
 
       - name: Atomic spelling
         # Reads src/ and the .claude/ skills, nothing built, so it belongs in
