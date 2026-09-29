@@ -46,10 +46,45 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen)
 #define SYSFS_PREFIX "/sys"
 #define DEV_USB_PREFIX "/dev/bus"
 
+static size_t bare_len(const char *path)
+{
+    size_t end = strlen(path);
+    for (;;) {
+        if (end >= 2 && path[end - 1] == '.' && path[end - 2] == '/')
+            end -= 1;
+        else if (end >= 2 && path[end - 1] == '/')
+            end -= 1;
+        else
+            break;
+    }
+    return end;
+}
+
+bool path_dir_required(const char *path)
+{
+    return bare_len(path) != strlen(path);
+}
+
+const char *path_bare_name(const char *path, char *buf, size_t bufsz)
+{
+    size_t end = bare_len(path);
+    if (end == strlen(path) || end + 1 > bufsz)
+        return path;
+    memcpy(buf, path, end);
+    buf[end] = '\0';
+    return buf;
+}
+
+/* Both gates read the name without its directory requirement, which the
+ * intercepts enforce for themselves: an exact-match test below would otherwise
+ * miss "/dev/fuse/" and hand a name the intercepts serve to the host.
+ */
 bool path_might_use_open_intercept(const char *path)
 {
     if (!path || path[0] != '/')
         return false;
+    char bare[LINUX_PATH_MAX];
+    path = path_bare_name(path, bare, sizeof(bare));
 
     if (!strncmp(path, "/proc", 5))
         return true;
@@ -186,6 +221,8 @@ bool path_might_use_stat_intercept(const char *path)
 {
     if (!path || path[0] != '/')
         return false;
+    char bare[LINUX_PATH_MAX];
+    path = path_bare_name(path, bare, sizeof(bare));
 
     if (!strncmp(path, "/proc", 5))
         return true;
@@ -208,7 +245,8 @@ bool path_might_use_stat_intercept(const char *path)
     if (path_prefix_match(path, DEV_USB_PREFIX, sizeof(DEV_USB_PREFIX) - 1))
         return true;
 
-    return false;
+    /* Synthesized on open, so it has to exist for stat too. */
+    return !strcmp(path, "/etc/mtab");
 }
 
 int path_check_intercept_access(const struct stat *st, int mode, int flags)
@@ -489,6 +527,62 @@ static bool resolve_fd_magiclink_host_path(const char *path,
     return true;
 }
 
+/* Whether an absolute name holds anything path_fold_components would remove: a
+ * "//" run, or a "." component with a slash after it.
+ */
+static bool path_has_foldable(const char *p)
+{
+    for (; *p; p++) {
+        if (p[0] == '/' && (p[1] == '/' || (p[1] == '.' && p[2] == '/')))
+            return true;
+    }
+    return false;
+}
+
+/* Fold "//" runs and "." components out of an absolute name, the way the Linux
+ * path walk steps over them.
+ *
+ * A "." that is the last component stays, with the slash after it if it has
+ * one, because the last component is where Linux gives it a meaning of its own:
+ * rmdir("d/.") is EINVAL where rmdir("d/") removes d. ".." is left alone,
+ * because Linux applies it to what the component before it resolved to, which
+ * is not a lexical question.
+ *
+ * @out may be @path: the result is never longer than what has been read.
+ */
+static void path_fold_components(const char *path, char *out)
+{
+    const char *p = path;
+    size_t w = 0;
+
+    for (;;) {
+        bool slash = *p == '/';
+        while (*p == '/')
+            p++;
+        if (!*p) {
+            if (slash)
+                out[w++] = '/';
+            break;
+        }
+
+        const char *seg = p;
+        while (*p && *p != '/')
+            p++;
+        size_t n = (size_t) (p - seg);
+
+        const char *next = p;
+        while (*next == '/')
+            next++;
+        if (n == 1 && seg[0] == '.' && *next)
+            continue;
+
+        out[w++] = '/';
+        memmove(out + w, seg, n);
+        w += n;
+    }
+    out[w] = '\0';
+}
+
 int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
@@ -534,6 +628,24 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
+    /* Linux folds "//" runs and "." components in the one walk every path
+     * syscall shares, so no filesystem is handed them. The intercepts match
+     * literal prefixes, here and behind this function, so the name is folded
+     * here once rather than by each of them. A relative name needs nothing: the
+     * two resolvers above fold what they join, and what they decline goes to
+     * the host as written.
+     */
+    if (tx->guest_path[0] == '/' && path_has_foldable(tx->guest_path)) {
+        char *folded =
+            tx->guest_path == tx->proc_path ? tx->proc_path : tx->guest_buf;
+        if (folded == tx->guest_path ||
+            strlen(tx->guest_path) < sizeof(tx->guest_buf)) {
+            path_fold_components(tx->guest_path, folded);
+            tx->guest_path = folded;
+            tx->intercept_path = folded;
+        }
+    }
+
     /* A /sys walk that passes through one of the synthetic USB `subsystem`
      * symlinks is rewritten to the canonical guest spelling of where it lands,
      * before anything decides whose name it is. The links exist only in the
@@ -573,13 +685,35 @@ int path_translate_at(guest_fd_t dirfd,
      * which must force nofollow on the host call; see dev_shm_resolve_path()
      * for that invariant.
      */
-    if (!strncmp(tx->guest_path, "/dev/shm/", 9) && tx->guest_path[9] != '\0') {
+    if (!strncmp(tx->guest_path, "/dev/shm/", 9) && tx->guest_path[9] != '\0' &&
+        !path_dir_required(tx->guest_path + 8)) {
         if (proc_dev_shm_resolve(tx->guest_path + 9, tx->host_buf,
                                  sizeof(tx->host_buf)) < 0)
             return -1;
         tx->host_path = tx->host_buf;
         tx->is_dev_shm = true;
         return 0;
+    }
+
+    /* "/dev/stdout/" names the directory the descriptor's file would be, which
+     * a pipe, a terminal or a regular file is not. The host walk applies that
+     * rule to every other name; a magic link it never sees, and on a pipe it
+     * has no path to see it by.
+     */
+    char link_bare[LINUX_PATH_MAX];
+    const char *link_name =
+        path_bare_name(tx->guest_path, link_bare, sizeof(link_bare));
+    if (link_name != tx->guest_path && tx->guest_path[0] == '/') {
+        host_fd_ref_t ref;
+        if (path_fd_magiclink_open(link_name, &ref) == 0) {
+            struct stat st;
+            bool is_dir = fstat(ref.fd, &st) == 0 && S_ISDIR(st.st_mode);
+            host_fd_ref_close(&ref);
+            if (!is_dir) {
+                errno = ENOTDIR;
+                return -1;
+            }
+        }
     }
 
     /* Only host_path moves; guest_path and intercept_path keep the /proc
@@ -609,7 +743,7 @@ int path_translate_at(guest_fd_t dirfd,
      */
     if (tx->guest_path[0] == '/' &&
         !(flags & (PATH_TR_NOFOLLOW | PATH_TR_CREATE)) &&
-        resolve_fd_magiclink_host_path(tx->guest_path, tx->host_buf,
+        resolve_fd_magiclink_host_path(link_name, tx->host_buf,
                                        sizeof(tx->host_buf))) {
         tx->host_path = tx->host_buf;
         return 0;

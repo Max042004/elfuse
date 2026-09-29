@@ -41,7 +41,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
-        test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
+        test-sysroot-root test-path-fold test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-usbdev-ioctl test-usbdev-faults \
         test-usbdev-urb-loopback test-usbdev-ioctl-loopback \
@@ -278,6 +278,7 @@ $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-usbdev-urb-host,usbdevfs URB bookkeeping unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-host-unit,test-gdbstub-host,buffered GDB session regression)
+$(call run-lane,test-path-fold,one answer per object however its path is spelled)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
@@ -1694,6 +1695,13 @@ test-casefold-host: $(BUILD_DIR)/test-casefold-host
 ## Run the case-exact path resolution unit tests
 test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 	$(BUILD_DIR)/test-casefold-walk-host
+
+## Hold every respelling of a name to the canonical spelling's answer
+# The matrix runs this against the reference kernel too. This lane adds the
+# fixture, so the synthetic USB names are present on a machine with no device
+# and do not agree merely by being absent under every spelling.
+test-path-fold: $(ELFUSE_BIN) $(TEST_DIR)/test-path-fold
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-path-fold
 
 ## Assert the synthetic USB tree's contract and its two agreeing views
 # The device-dependent half only runs against whatever is attached, so the lane

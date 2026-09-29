@@ -2707,7 +2707,8 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
             errno = saved_errno;
             return linux_errno();
         }
-        proc_cwd_set_virtual(virt);
+        char cwd_buf[LINUX_PATH_MAX];
+        proc_cwd_set_virtual(path_bare_name(virt, cwd_buf, sizeof(cwd_buf)));
         return 0;
     }
 
@@ -2723,7 +2724,9 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
             return -LINUX_ENOTDIR;
         if (chdir(tx.host_path) < 0)
             return linux_errno();
-        proc_cwd_set_virtual(tx.intercept_path);
+        char cwd_buf[LINUX_PATH_MAX];
+        proc_cwd_set_virtual(
+            path_bare_name(tx.intercept_path, cwd_buf, sizeof(cwd_buf)));
         return 0;
     }
 
@@ -2739,7 +2742,9 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
         close_keep_errno(fd);
         if (chdir_rc < 0)
             return linux_errno();
-        proc_cwd_set_virtual(tx.guest_path);
+        char cwd_buf[LINUX_PATH_MAX];
+        proc_cwd_set_virtual(
+            path_bare_name(tx.guest_path, cwd_buf, sizeof(cwd_buf)));
         return 0;
     }
 
@@ -2756,9 +2761,17 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
      * A name the intercept does not claim falls through to the host chdir
      * below, unchanged.
      */
-    if (tx.intercept_path &&
-        (path_prefix_match(tx.intercept_path, "/sys", 4) ||
-         path_prefix_match(tx.intercept_path, "/dev/bus", 8))) {
+    if (tx.intercept_path && path_might_use_stat_intercept(tx.intercept_path)) {
+        /* A name an intercept serves as something other than a directory is
+         * ENOTDIR, whatever the host holds under that spelling.
+         */
+        struct stat st;
+        int stat_rc = proc_intercept_stat_at(tx.intercept_path, &st, true);
+        if (stat_rc == -1)
+            return linux_errno();
+        if (stat_rc == 0 && !S_ISDIR(st.st_mode))
+            return -LINUX_ENOTDIR;
+
         int host_fd =
             proc_intercept_open(g, tx.intercept_path, LINUX_O_DIRECTORY, 0);
         if (host_fd >= 0) {
@@ -2774,7 +2787,9 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
                 errno = saved_errno;
                 return linux_errno();
             }
-            proc_cwd_set_virtual(virt_path);
+            char cwd_buf[LINUX_PATH_MAX];
+            proc_cwd_set_virtual(
+                path_bare_name(virt_path, cwd_buf, sizeof(cwd_buf)));
             return 0;
         }
         if (host_fd == -1)

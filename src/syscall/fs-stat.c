@@ -623,11 +623,23 @@ static int64_t sys_statfs_impl(guest_t *g,
     if (tx.fuse_path)
         return -LINUX_ENOSYS;
 
-    if (statfs_path_is_proc(tx.intercept_path)) {
-        if (proc_path_is_symlink(tx.intercept_path)) {
+    /* The directory requirement of a trailing slash or ".", applied before the
+     * classification below, which reads the bare name: a served file under it
+     * is ENOTDIR, and a served directory is classified as itself.
+     */
+    char bare[LINUX_PATH_MAX];
+    const char *name = path_bare_name(tx.intercept_path, bare, sizeof(bare));
+    if (name != tx.intercept_path &&
+        path_might_use_stat_intercept(tx.intercept_path)) {
+        struct stat st;
+        if (proc_intercept_stat_at(tx.intercept_path, &st, true) == -1)
+            return linux_errno();
+    }
+
+    if (statfs_path_is_proc(name)) {
+        if (proc_path_is_symlink(name)) {
             char link[LINUX_PATH_MAX];
-            int len = proc_intercept_readlink(tx.intercept_path, link,
-                                              sizeof(link) - 1);
+            int len = proc_intercept_readlink(name, link, sizeof(link) - 1);
             if (len < 0)
                 return linux_errno();
             link[len] = '\0';
@@ -635,8 +647,7 @@ static int64_t sys_statfs_impl(guest_t *g,
         }
 
         struct stat mac_st;
-        int intercepted =
-            proc_intercept_stat_at(tx.intercept_path, &mac_st, true);
+        int intercepted = proc_intercept_stat_at(name, &mac_st, true);
         if (intercepted == 0) {
             linux_statfs_t lin_st;
             fill_proc_statfs(&lin_st);
@@ -667,7 +678,7 @@ static int64_t sys_statfs_impl(guest_t *g,
      * report the same ENOENT a real Linux kernel would for the rest.
      */
     char sys_abs[LINUX_PATH_MAX];
-    if (statfs_path_is_sysfs(tx.intercept_path, sys_abs, sizeof(sys_abs))) {
+    if (statfs_path_is_sysfs(name, sys_abs, sizeof(sys_abs))) {
         /* Classifying the folded name and then probing the raw one asked two
          * different questions of two different spellings: "/sys/../sys" is
          * sysfs, but no intercept and no host backing carries that literal
@@ -676,7 +687,7 @@ static int64_t sys_statfs_impl(guest_t *g,
          * fallback and the answer all describe the same object. Folding is
          * idempotent, so this recurses at most once.
          */
-        if (strcmp(sys_abs, tx.intercept_path) != 0)
+        if (strcmp(sys_abs, name) != 0)
             return sys_statfs_impl(g, sys_abs, buf_gva, depth + 1);
 
         bool exists = sys_abs[4] == '\0'; /* "/sys" itself */
@@ -699,7 +710,7 @@ static int64_t sys_statfs_impl(guest_t *g,
         return 0;
     }
 
-    int dev_bus = statfs_dev_bus_class(tx.intercept_path);
+    int dev_bus = statfs_dev_bus_class(name);
     if (dev_bus == -1)
         return linux_errno();
     if (dev_bus == 0) {
@@ -716,7 +727,7 @@ static int64_t sys_statfs_impl(guest_t *g,
      * glibc closes a perfectly good master -- breaking Unix98 pty allocation
      * for every glibc program. Answer from the virtual filesystem instead.
      */
-    devpts_class_t devpts = statfs_devpts_class(tx.intercept_path);
+    devpts_class_t devpts = statfs_devpts_class(name);
     if (devpts == DEVPTS_ABSENT)
         return -LINUX_ENOENT;
     if (devpts == DEVPTS_MOUNT) {
@@ -731,8 +742,7 @@ static int64_t sys_statfs_impl(guest_t *g,
      * on the leaf would follow a symlink onto the host and leak the host fs
      * identity, so answer synthetically; lstat is the nofollow existence probe.
      */
-    bool shm_root = !strcmp(tx.intercept_path, "/dev/shm") ||
-                    !strcmp(tx.intercept_path, "/dev/shm/");
+    bool shm_root = !strcmp(name, "/dev/shm");
     if (tx.is_dev_shm || shm_root) {
         const char *shm_dir = proc_get_shm_dir();
         if (!shm_dir)
