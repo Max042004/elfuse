@@ -130,10 +130,9 @@ coverage. Both fail rather than skip when their tool is missing.
 
 `make indent` is a no-op on a clean tree, in both halves: every file clang-format
 selects already formats to itself, and every file commentflow selects already
-reflows to itself. That was not free. The tree's comments were wrapped by hand
-before the tool existed, and the one-time reflow rewrote 142 of the 353 C and
-header files, both assembly files, and 36 of the 41 shell scripts. It landed as
-its own commit, under the rule the commit section states.
+reflows to itself. The tree's comments were wrapped by hand before the tool
+existed, and the one-time reflow landed as its own commit, under the rule the
+commit section states.
 
 The gate is what keeps it a no-op. If `make indent` ever hands you a diff in a
 file you did not touch, something reintroduced hand-wrapping, or your
@@ -169,8 +168,8 @@ is a sequentially-consistent read-modify-write, and a site already holding the
 lock that serializes it pays for ordering it does not need while saying nothing
 about the ordering it does. Where a file has many such sites, name the
 discipline once in helpers rather than spelling the order out at each: the
-`pending_load` / `pending_or` / `pending_clear` group at the top of
-`src/syscall/signal.c` is the shape.
+`pending_load` / `pending_or` / `pending_clear` group in
+`src/syscall/signal.h` is the shape.
 
 Never hand an `_Atomic` object to `memcpy` or to a guest read/write helper. That
 copies the object representation, which is not an atomic read of it. Load into a
@@ -265,9 +264,13 @@ flag, or helper is named for its operation, not the manner.
 
 Not in `src/`: attribution, dates, commented-out code, issue-tracker numbers
 (barred from `docs/` and README prose too, PR#40, PR#223; they belong in a
-commit trailer), or `TODO`/`FIXME`; incomplete work belongs in the commit
-message or PR. Editing part of a comment re-opens all of it: re-read the
-block and rewrite what no longer reads cleanly.
+commit trailer), or a bare `TODO`/`FIXME`; incomplete work belongs in the
+commit message or PR. `CONTRIBUTING.md` carries the marker rule, which asks a
+`TODO` to say what remains and to carry an all-caps owner ahead of the word
+when one applies. What `src/` writes instead is the stage or the condition the
+work waits on, as a parenthesis (`grep -rn 'TODO(' src/`). Editing part of a
+comment re-opens all of it: re-read the block and rewrite what no longer reads
+cleanly.
 
 Mechanics: `/* */` only in `.c`, `.h`, and `.S`, no `//`, no Doxygen tags;
 multi-line blocks align on ` * `, close with `*/` on its own line, indented

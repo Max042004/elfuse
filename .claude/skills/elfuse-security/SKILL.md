@@ -25,7 +25,7 @@ which lanes prove it.
 
 ## Where the boundary runs
 
-Five surfaces, ordered by what one bad value reaches:
+The surfaces, ordered by what one bad value reaches:
 
 - Syscall arguments. X0-X5 and X8 arrive from EL0 with no host filter in
   front, so every wrapper reached from `src/syscall/dispatch.tbl` is on the
@@ -34,12 +34,17 @@ Five surfaces, ordered by what one bad value reaches:
   translator, and the permission half is the security half.
 - Formats the host parses for the guest: the ELF the loader reads, netlink
   messages, FUSE frames, control messages, sigframes, sockaddrs, iovecs,
-  dirents. Each carries lengths, offsets, or counts the guest supplies, but
-  what the guest owns differs per format, so answer that per format rather
-  than assuming it. The ELF is read by offset, a sockaddr length arrives as a
-  separate syscall argument, and a sigframe is built by the host and then left
-  where the guest can rewrite it before `rt_sigreturn` reads it back.
+  dirents, and the usbdevfs URB structures (`usbdevfs_urb`,
+  `usbdevfs_ctrltransfer`, `usbdevfs_bulktransfer`). Each carries lengths,
+  offsets, or counts the guest supplies, but what the guest owns differs per
+  format, so answer that per format rather than assuming it. The ELF is read
+  by offset, a sockaddr length arrives as a separate syscall argument, and a
+  sigframe is built by the host and then left where the guest can rewrite it
+  before `rt_sigreturn` reads it back.
 - Paths. Every name the guest supplies, absolute ones included.
+- Raw USB descriptor blobs, walked by `src/runtime/usb-desc.c`. The one
+  input here the guest does not author; the header comment in
+  `src/runtime/usb-desc.h` says why it is untrusted anyway.
 - Shared pages. The guest and the host see the same memory, so a structure
   validated in guest memory and then passed on by address was not validated.
 

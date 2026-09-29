@@ -23,20 +23,25 @@ a regression you can act on, and a serial re-run is the only thing that tells
 you whether it was real.
 
 The pure source scanners are the exception, and they are the cheap early
-signal while something long is in flight: `check-lock-order`,
-`check-eintr-contract`, `check-atomics`, `check-proof-targets`,
-`check-stub-shadow` and `check-syscall-coverage` read the tree, cost seconds,
-and fail long before a full lane would. Five of the six are on `make check`;
-`check-stub-shadow` is a prerequisite of every `verify-*` target instead, so it
-is not reached by `make check` alone. Running one directly with
-`python3 scripts/<name>.py` costs nothing and needs no arguments.
+signal while something long is in flight: they read the tree, cost seconds,
+and fail long before a full lane would. The `check:` prerequisite line in
+`mk/tests.mk` is the live roster; `check-stub-shadow` is the one that hangs
+off every `verify-*` target instead, so `make check` alone does not reach it.
+Beside a build in flight, run the script directly with the flags its recipe
+passes, not through its make target: any goal outside `print-%` evaluates the
+build-flavor guard (`mk/common.mk`), which can wipe a build made with other
+CFLAGS. Read the recipe first. `scripts/gen-usbdev-ioctl-departed.py`, behind
+`check-usbdev-departed`, is a generator that writes its header unless given
+`--check`, and `make check-usbdev-departed` rebuilds that header under
+`build/` when it is stale before comparing.
 
-Five of the six write nothing. `check-proof-targets` is the one that does:
-it shells out to `make print-verify-targets` rather than reading
-`mk/verify.mk`, and a sub-make evaluates the build-flavor guard while it reads
-the makefiles. `print-%` goals are skipped by that guard for exactly this
-reason (`mk/common.mk`), so the scanner is safe to run beside a build; if you
-add a scanner that invokes make on some other goal, it is not.
+None of them writes to the source tree. Three invoke make, each on a `print-%`
+goal: `check-proof-targets` and `check-skill-refs` ask
+`make print-verify-targets` for the proof list rather than reading
+`mk/verify.mk`, and `check-usb-fixture-bin` asks for the binary path of both
+build flavors. `print-%` goals skip the flavor guard, which is what keeps those
+sub-makes safe beside a build. A scanner that invoked make on some other goal
+would not be.
 
 ## Choosing what to run
 
@@ -128,18 +133,16 @@ Apple's 3.81.
 `MUTANT_SINCE=<rev>` for a changed-only run, and `MUTANT_ESCALATE=<seconds>`
 (see the exhaustion section below).
 
-Read past the "N mutations, N caught" line. It also prints the proved functions
-that have no mutation yet, and that list, not the caught count, is the honest
-measure of what the gate covers: all-caught alongside a handful of functions
-nobody has tried to break says the gate is green and that those proofs have
-never been asked whether they would reject a broken source. They are not
-failures, and they are not covered either.
+Read past the "N mutations, N caught" line. It also reports two coverage gaps:
+proved functions with no mutation under any target, and functions mutated
+under one target but not another target that proves them. The first asks
+whether a proved function has any mutation. The second asks whether each target
+that proves an already-mutated function has its own mutation. Both matter
+because targets can use different models and header environments, so a
+mutation under one does not exercise another target's proof. These reports are
+advisory, but each entry is uncovered under the metric that reports it.
 
-Recompute that list before quoting it, and read what it counts. It counts
-distinct functions now; it used to count `(target, function)` pairs, so a
-function proved by two targets showed up twice and read as uncovered under its
-second target even though the first mutates it. That inflated the gap fourfold
-the last time it was checked - twelve listings, three functions.
+Recompute both gaps before quoting them and name the denominator used.
 
 A function can also sit in a `_FCTS` list with no ACSL contract at all, proved
 only for absence of runtime errors. Nothing there can reject a mutation, so
@@ -245,8 +248,9 @@ honest.
 ### Adding to src/proved/
 
 Nothing lands there without a proof target -
-`scripts/check-proof-targets.py` (a CI job in `.github/workflows/lint.yml`)
-fails otherwise. Callers include the header as `proved/<name>.h`.
+`scripts/check-proof-targets.py`, run by `make check` and by
+`.github/workflows/lint.yml`, fails otherwise. Callers include the header as
+`proved/<name>.h`.
 
 The routine:
 
@@ -347,279 +351,53 @@ contract writing into a loop instead of a guess. Start with `self_check`,
 because the optional pieces degrade independently, then reload the target's
 sources plus `FRAMAC_STUB_DIR`, run WP one function at a time, and use
 `get_wp_goals` and `context` to find which obligation is unproved rather than
-rewriting a contract on suspicion. Retrying the unproved goals distinguishes
-"not proved" from "not proved yet", so check that before rewriting a contract
-that only needed a longer timeout. `create_sandbox` is the honest way to try a
+rewriting a contract on suspicion. `create_sandbox` is the honest way to try a
 strengthening without touching the real source.
 
-Read the `self_check` result rather than the absence of an error: a degraded
-server still answers, and the answer looks like a normal response.
-`frama_c.status: ok` says only that the binary runs. The fields that decide
-whether the interactive path works at all are `socket_spawn`, and
-`wp.available` / `eva.available` under `capabilities`.
+The MCP is an accelerator, never the gate. A change lands on `make verify`
+plus `make verify-mutants`, run from the Makefile, because that is what CI
+runs and what a contributor without the server can reproduce. Never report a
+proof as done on MCP evidence alone, and never add a workflow step, script, or
+CI job that depends on the server being connected.
 
-Do not read a failed `socket_spawn` as a missing `ast_utils` plugin without
-checking. Its probes are time-bounded, so on a loaded host they time out and
-report `error` or `unknown` for a plugin that is installed and works. Seen
-here at load 75 on 8 cores: `socket_spawn` reported "the probe process exited
-or never created one" and `ast_utils` came back `unknown`, while
-`frama-c -load-module ast_utils_plugin -print-libc` succeeded immediately and
-the plugin sat in Frama-C's plugin directory the whole time. `opam_switch_hint`
-timing out in the same report is the tell. Confirm with that one-line load
-before concluding anything, and re-run `self_check` on a quiet machine; only
-if the plugin is genuinely absent is the install
-`cd ast-utils && dune install` in the frama-c-mcp checkout.
-
-`reload_project` does not take a raw preprocessor string. It takes structured
-flags, and an unknown key is accepted and dropped rather than refused, so a
-call carrying `cpp_extra_args` parses with none of them and then fails on a
-header that is on the real include path. Mirror `FRAMAC_CPP_ARGS` field by
-field instead; for this tree that is
-
-```
-include_paths:  ["frama-c-stubs", "src", "build"]
-force_includes: ["prelude.h", "macos-libc.h"]
-machdep:        "gcc_x86_64"
-```
-
-Those three lines are `FRAMAC_INCLUDE_DIRS`, `FRAMAC_FORCE_INCLUDES` and
-`FRAMAC_DATA_MODEL` from `mk/verify.mk`, and they are reproduced here only to
-show the shape; take the live values from `make print-verify-profiles` below
-rather than from this block, which nothing gates.
-
-`nostdinc` and `isystem_paths` are fields, and they are not optional detail on
-this platform: without them the real macOS headers win over the modeled libc,
-and a file whose parse depends on that shadowing loads as a different program.
-Two measurements from when they could not be expressed, both worth knowing
-because they are what a load under the wrong headers looks like.
-`src/syscall/sys.c` parsed under the `mk/verify.mk` flags and failed without
-them, on a `_Static_assert` over `struct rusage` that only holds against the
-modeled header, which put it and six others in `parse_surface`'s blocked set:
-39 of 60 reported against 46 of 60 true.
-
-The flags are not the only way the two can differ, and the other way cost me a
-wrong diagnosis. On `src/syscall/net.c` the server reported `recv_at`'s
-`pointer_alignment` obligation unproved, surviving `retry_unproved` at double
-the budget, which is its own strongest test for a goal that is unprovable
-rather than slow. Under `mk/verify.mk` the same three functions discharge 6 of
-6 and that obligation is never generated. I recorded that here as a header
-artifact; it was not. The cause was RTE: the kernel's generator and WP's own
-are different analyses, the kernel emits `pointer_alignment` assertions and
-WP's does not, and the server was starting Frama-C with `-rte` where the recipe
-passes `-wp-rte`. Fixed upstream, but the shape is worth keeping: a
-`pointer_alignment` goal the build never generates is the signature of the
-wrong RTE generator, not of a hard proof.
-
-So the rule is not "distrust the server", it is "pass the flags". A profile
-from `make print-verify-profiles` carries both, and `nostdinc` must be stated
-for a profile to be proof evidence at all. When you load by hand instead, pass
-`nostdinc` and `isystem_paths` yourself, or you are measuring another program.
-
-Two rules about what any of that proves:
-
-- The MCP's default WP model is not what every target uses. A goal that
-  discharges under defaults says nothing about whether `make verify-<name>`
-  passes. Always mirror the target's own `VERIFY_<NAME>_MODEL`.
-- A prover budget is wall-clock, so on a saturated machine a goal can reach it
-  whatever its difficulty. Read `wp_timeout_triage` before believing a timeout
-  verdict: it carries `host_load_per_cpu` in its evidence and drops to
-  `confidence: low` above one runnable thread per CPU, and again when the
-  reading is `"unavailable"`, since an unread host is not a quiet one. Only a
-  measured quiet host earns `confidence: high`.
-- Re-running is not re-measuring, and this is the trap. WP's cache defaults to
-  `update`, so it stores timeout verdicts too and replays them. Measured here:
-  the same six functions, run under load (one-minute average 40 to 61 on 8
-  cores) and again at load 3.3, produced the identical `proof_receipt` sha256,
-  with every timeout goal carrying `from_cache: true`. The second run proved
-  nothing and looked exactly like the first.
-
-  The response says so now. `measurement` reports `replayed`, `unproved` and
-  `unproved_replayed`, and `every_unproved_goal_was_replayed` is the one to
-  read: when it is true the run attempted none of its own failures, and
-  `wp_timeout_triage` drops to `confidence: low` saying so. Pass
-  `cache: "None"` to prove everything in the run. It is the same distinction
-  `proof_coverage` draws between `fresh_valid` and `cached_valid`, and it
-  costs a re-prove, so spend it when a verdict is about to become a decision.
-- `retry_unproved` settles slow against unprovable, and nothing else. It
-  re-runs the timed-out goals at double the budget and reports which flip, so
-  an empty `flipped` means more time is not the fix. It does not check that the
-  program under it is the one you meant: on `src/syscall/net.c` a goal survived
-  it and was still an artifact of the wrong header environment. Rule out the
-  load, the cache, and the flags before reading it as a property of the code.
-- The connected server is whatever binary is installed, which can lag the
-  source tree. A behavior described here that the running server does not show
-  means the installed binary predates it, not that the description is wrong;
-  `self_check` reports the server version.
-- The MCP is an accelerator, never the gate. A change lands on `make verify`
-  plus `make verify-mutants`, run from the Makefile, because that is what CI
-  runs and what a contributor without the server can reproduce. Never report a
-  proof as done on MCP evidence alone, and never add a workflow step, script,
-  or CI job that depends on the server being connected.
-
-It also answers the coverage question rather than just the green/red one,
-which is how you find a target that passes because it is proving less than you
-thought. `proof_coverage` is the tool for that:
-
-```
-# denominator: every defined function of the loaded project
-proof_coverage {}
-
-# denominator: the function set that target declares
-proof_coverage {verify_profile: "<target>", detail: "full"}
-```
-
-It measures stored conclusions, not the last run, so it reports nothing until
-`store_function_conclusion` has filed a receipt from a `run_wp` on the real
-project. With nothing loaded and nothing stored it answers `0 of 0`,
-`incomplete`, and an empty function list rather than an error, which is easy to
-skim as a clean report. Check the denominator before reading the percent.
-
-Sandbox receipts are refused on purpose: a sandbox proves an extracted copy
-whose uncontracted callees are stubs. Merge the annotations back, re-run WP on
-the main project, and store that receipt.
-
-Read a row's `reason` as the instruction, and treat an empty one as the only
-thing that counts. Three of them come up here more than the others:
-
-- `stale_source` after a single edit. A receipt hashes the whole loaded file
-  set, not the one file its function lives in, so touching any source reds the
-  entire report. Expect it; it is not a signal about the function you edited.
-- `unverified_callee`, propagated through the call chain. Fix what
-  `blocking_callees` names first.
-- `proved_under_a_goal_filter`, meaning the run passed `prop` and left the
-  unselected obligations unattempted. That is the "proving less than you
-  thought" case caught by name.
-
-One limit on the number, on top of the two rules above. It reads WP only, so
-`complete` is a statement about proof obligations generated by the ACSL, RTE
-and WP configuration that produced those receipts. A requirement no contract
-states is not an uncovered row, it is absent from the denominator entirely, so
-coverage cannot tell you the property table is complete.
-
-### Calibrate the server before trusting a number from it
-
-Run one already-green target through it and compare the obligation count with
-what the matching `make verify-<name>` reports. Use `iov`: three functions, one
-header, and a known answer of 40 of 40.
-
-```
-make verify-<name>                  # the answer, for name=iov
-reload_project {verify_profiles: <make print-verify-profiles>,
-                verify_profile: "iov"}
-run_wp         {verify_profile: "iov", cache: "None"}
-```
-
-The counts must match exactly. Every wrong conclusion this file records came
-from skipping that check, and each was invisible without it:
-
-- The server refused 20 of the 21 targets outright with
-  `invalid WP model 'typed'`, comparing the name case-sensitively where
-  Frama-C does not care. A profile emitted faithfully from the recipe was
-  rejected by the tool whose whole purpose is to run that recipe's proof.
-- With that fixed it answered 42 obligations to the recipe's 40, both extras
-  `pointer_alignment` on one function, because it started Frama-C with kernel
-  `-rte` where the recipe passes `-wp-rte`. Those are different analyses and
-  the larger one is not the target's.
-- `caveat`, which one target is proved under, is accepted by Frama-C and named
-  nowhere in `-wp-h`, so a list built from that help text called it invalid.
-
-None of those announced themselves. Each produced a confident, well-formatted
-answer about a program the build system does not prove, and `retry_unproved`
-confirmed one of them. Two numbers side by side is the cheapest thing that
-catches the whole class, and it costs one target.
-
-### Making the MCP prove what the Makefile proves
-
-`make print-verify-profiles` emits the `verify_profiles` JSON for all of
-`mk/verify.mk`, one entry per target, carrying the sources, functions, model,
-machdep, include paths, defines, provers, timeout and a `reproduce` command.
-It comes from the same variables the `verify-<name>` recipe consumes, so a
-profile and a Makefile run cannot disagree about what a target proves. Emit
-it, never hand-write it: a hand-written function set is the drift the whole
-mechanism exists to prevent.
-
-That property is only as good as the sharing. The two lists the profile and the
-recipe both need, include directories and force-includes, live in
-`FRAMAC_INCLUDE_DIRS` and `FRAMAC_FORCE_INCLUDES`; `FRAMAC_CPP_ARGS` turns them
-into `-I` and `-include` flags with `patsubst`, and the emitter passes them
-through as the bare directories and headers the schema wants. Spelling either
-list twice is the bug this arrangement exists to prevent, and it is not
-hypothetical: they were duplicated at first, under a comment claiming they
-could not drift. If you add an include path, add it there and check both sides
-move:
-
-```
-make print-verify-profiles FRAMAC_INCLUDE_DIRS="... extra" | grep extra
-make -n verify-align       FRAMAC_INCLUDE_DIRS="... extra" | grep -- -Iextra
-```
-
-The emitter refuses rather than emitting a profile that cannot be used: no
-sources, no functions, an empty or blank model, no provers, a non-positive
-timeout, a `CPP_DEFS` token that is not a `-D`, or no targets at all. Each
-names the make variable to look at. That matters because the server's own
-refusal comes much later and names none of them: a profile missing one required
-field is accepted for loading and then rejected by every `run_wp` and every
-`store_function_conclusion` that names it, which reads as a broken target
-rather than as an empty variable on the command line that produced it.
-
-That closes the loop between the two tools:
-
-```
-make print-verify-profiles                      # from the build system
-reload_project {verify_profiles: <that JSON>, verify_profile: "<target>"}
-run_wp         {verify_profile: "<target>"}
-store_function_conclusion {function, status: "verified",
-                           proof_receipt_sha256, verify_profile: "<target>"}
-proof_coverage {verify_profile: "<target>", detail: "full"}
-```
-
-The JSON goes in as the object or as its text: the `verify_profiles` parameter
-is untyped, so a client that stringifies it is not making a mistake, and the
-server decodes either. Naming the profile is what makes each step mean the
-target rather than the server's defaults. A run that deviated from the profile
-is refused as that target's evidence rather than quietly accepted, and a
-conclusion stored without one records what was proved but not what it settles.
-
-Three things to know when feeding it in. The profile carries `nostdinc` and
-`isystem_paths` alongside the include paths, all four from the same
-`mk/verify.mk` variables the recipe uses, so the load the server makes is the
-one the recipe makes. The model strings are the
-Makefile's own spelling (`typed`, `caveat`, `Bytes`), which is the point:
-normalizing them here would make the profile prove something the recipe does
-not. And every profile carries `rte: true`, because every `verify-<name>`
-recipe passes `-wp-rte`: that flag decides which obligations exist at all, so a
-load without it gives a strictly smaller set. The server treats it as part of
-the load identity, so a non-RTE load is refused as that target's evidence
-rather than quietly accepted, and a profile that omits it can load sources but
-cannot be proof evidence.
-
-`rte: true` means WP's generator specifically, not Frama-C's kernel one. They
-are different analyses over the same code and the kernel's is larger: it emits
-`pointer_alignment` assertions WP's does not. The server used to start Frama-C
-with kernel `-rte` here, which is how a profiled `iov` run answered 42
-obligations to the recipe's 40 with both extras unproved. Worth knowing because
-the field cannot express the difference, so the only way to see it is the
-calibration above.
+The server reports more confidently than it measures, and the ways it can be
+wrong are specific: a verdict that rests on a filtered goal set, a cached
+replay read as a fresh run, a model or flag set that is not the target's, a
+timeout on a loaded host. `references/frama-c-mcp.md` carries the whole of it,
+including the shapes its `check` codes name, how to calibrate against a known
+target before trusting a number, and how to make the server prove what the
+Makefile proves. Read it before quoting anything the server prints.
 
 ### frama-c-stubs/
 
-Declarations the analyzer needs that the compiler or macOS supplies:
-`Hypervisor/Hypervisor.h` and `macos-libc.h` for Darwin constants the modeled
-libc omits, plus `prelude.h`, which declares nothing of its own and instead
-force-includes the two headers Frama-C ships but never reaches on its own: its
-gcc-builtins model, and its stdatomic.h for the `_Atomic` qualifier its front
-end cannot parse and for the C11 atomics vocabulary the tree calls.
+Declarations the analyzer needs that the compiler or macOS supplies.
+`ls -R frama-c-stubs/` is the list, and three kinds live there: whole Darwin
+headers Frama-C has no model of, constants the modeled libc omits, and Darwin
+structure shapes it declares in the Linux spelling. `prelude.h` is the odd
+one, declaring nothing of its own and instead force-including the two headers
+Frama-C ships but never reaches on its own: its gcc-builtins model, and its
+stdatomic.h for the `_Atomic` qualifier its front end cannot parse and for the
+C11 atomics vocabulary the tree calls.
+
+A stub of the third kind may take the modeled header whole through
+`#include_next` and rename one name inside it. `scripts/check-stub-shadow.py`,
+a prerequisite of every `verify-*` target, holds that to exactly one
+declaration, because a second would follow the rename into a prototype and
+change a signature the proofs reason about.
 
 It sits outside `src/` on purpose so a real compile, which resolves through
 `-Isrc`, cannot reach it. Only `FRAMAC_STUB_DIR` in `mk/verify.mk` does.
 It is tracked in git because every proof target needs it to parse.
 
 A missing declaration fails with "Cannot resolve variable" - that is how the
-next one gets found. Only a minority of `src/`'s `.c` files parse today; the
-rest stop on macOS headers Frama-C's libc genuinely does not model
-(`sys/mount.h`, `sys/event.h`, `sys/sysctl.h`, `sys/xattr.h`, `sys/attr.h`,
-`sys/spawn.h`). That is a real modeling gap. Do not paper over it with a fake
-stub, and do not quote a parse count without recomputing it.
+next one gets found. Most of `src/`'s `.c` files parse; the rest stop on macOS
+headers Frama-C's libc does not model (`sys/mount.h`, `sys/event.h`,
+`sys/xattr.h`, `sys/attr.h`, `sys/spawn.h`). That is a real modeling gap, and
+a stub that invents a body for one is how a proof comes to reason about a
+program nobody runs. A declarations-only stub is a different thing and is
+legitimate: `frama-c-stubs/sys/sysctl.h` is the worked case, and its own
+header comment argues why sysctl left the blocked list. Recompute the parse
+count before quoting it; the probe above is how.
 
 ## Other checks
 
@@ -652,12 +430,10 @@ which have shipped before:
   stops at the first failing step and the suites after it never print.
 - A count, a latency, or a coverage figure is recomputed before it is quoted,
   including from this file and from `CLAUDE.md`, whose counts drift because
-  nothing gates them. Measured in one session: 21 verify targets against its
-  20, 32 file-scope locks against its 31, 17 files under `src/proved/` against
-  the 15 it lists. The gates print the live number, so take it from
-  `make print-verify-targets` and from what `check-lock-order` and
-  `check-proof-targets` report. A number carried forward from a document reads
-  as measured and is not.
+  nothing gates them. The gates print the live number: take the target count
+  from `make print-verify-targets`, the lock split from `check-lock-order`,
+  and the `src/proved/` count from `check-proof-targets`. A number carried
+  forward from a document reads as measured and is not.
 - The `PROVED n of n` line is not in `build/verify-<name>.log`, which carries
   Frama-C's own `[wp] Proved goals: N / N` instead. It is check-wp-result.py's
   console output, colorized unconditionally, with the escape sitting between
