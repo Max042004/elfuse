@@ -21,6 +21,14 @@ so a gate for it would fail on landing rather than hold a line.
 `atomic_thread_fence` and `atomic_init` are exempt: the fence takes its order as
 its only argument, and `atomic_init` has no order to state.
 
+The skill files under `.claude/skills/` are read too, under the banned-spelling
+half only. The order constants are gated there rather than in C, where every
+real use sits inside a `__atomic_*` call the builtin rule already catches. Prose
+has to be able to quote a bare `atomic_load` to say why it is wrong, but naming
+the builtins' `__ATOMIC_*` order constants for an operation written in C11 hands
+the next reader the wrong spelling. Write either family with the star; a
+concrete builtin name or a literal order constant trips the gate.
+
 Usage:
     check-atomics.py [--self-test]
 """
@@ -33,6 +41,18 @@ import sys
 
 # Builtins the conventions ban outright.
 BUILTIN_RE = re.compile(r"\b(__atomic_\w+|__sync_\w+)\s*\(")
+
+# The builtins' order constants. A call is caught by BUILTIN_RE, but the
+# constants also travel alone, most often into prose describing what a C11
+# call does. That reading is what the conventions ban: naming the builtin
+# vocabulary for an operation written in C11 tells the next reader to use it.
+ORDER_CONST_RE = re.compile(r"\b__ATOMIC_[A-Z_]+\b")
+
+# The banned families named without a call. Prose states the rule as
+# `__atomic_*`, which stays legal because `*` is not a word character, but a
+# concrete builtin name teaches the spelling whether or not a paren follows it,
+# so the prose rule does not require one the way BUILTIN_RE does.
+PROSE_BUILTIN_RE = re.compile(r"\b(__atomic_\w+|__sync_\w+)\b")
 
 # A C11 atomic call whose name does not end in _explicit. The exempt names take
 # no order argument at all.
@@ -151,6 +171,21 @@ def scan(text):
         yield lines[m.start()], name, "implicit-order"
 
 
+def scan_prose(text):
+    """Yield (lineno, symbol, rule) for banned atomic spellings in prose.
+
+    Documentation is not C, so the implicit-order rule does not apply: a skill
+    explaining why `atomic_load` is wrong has to be able to write it. What
+    does apply is the banned vocabulary, because a reader copies the spelling
+    a document uses.
+    """
+    for lineno, line in enumerate(text.split("\n"), 1):
+        for m in PROSE_BUILTIN_RE.finditer(line):
+            yield lineno, m.group(1), "builtin"
+        for m in ORDER_CONST_RE.finditer(line):
+            yield lineno, m.group(0), "order-constant"
+
+
 def self_test():
     cases = [
         ("__atomic_load_n(&x, __ATOMIC_RELAXED);", 1, "builtin"),
@@ -202,10 +237,45 @@ def self_test():
                 % (src, got, want_line)
             )
             failures += 1
+    prose_cases = [
+        ("the clear is `__ATOMIC_RELEASE`", 1, "order-constant"),
+        ("`shim_globals_attn_or` (`__ATOMIC_SEQ_CST`) raises the bit", 1,
+         "order-constant"),
+        ("__atomic_load_n(&x, 0);", 1, "builtin"),
+        # A concrete builtin name teaches the spelling with no call around it.
+        ("`shim_globals_attn_or` is an `__atomic_fetch_or`", 1, "builtin"),
+        ("a `__sync_synchronize` where a fence belongs", 1, "builtin"),
+        # Naming the banned family without calling it is how the rule is
+        # stated, so it must stay legal.
+        ("bans the `__atomic_*` and `__sync_*` builtins", 0, None),
+        # The C11 spellings are what documents are supposed to use.
+        ("`atomic_fetch_or_explicit(..., memory_order_seq_cst)`", 0, None),
+        # Prose may quote a bare C11 call as the thing it is warning about.
+        ("a bare `atomic_load(x)` defaults to seq_cst", 0, None),
+    ]
+    for text, want, rule in prose_cases:
+        got = list(scan_prose(text))
+        if len(got) != want or (want and got[0][2] != rule):
+            print("  self-test FAIL (prose): %r -> %r" % (text, got))
+            failures += 1
+
     if failures:
         return 1
-    print("  self-test: %d cases, all pass" % (len(cases) + len(line_cases)))
+    print("  self-test: %d cases, all pass"
+          % (len(cases) + len(line_cases) + len(prose_cases)))
     return 0
+
+
+def git_ls(root, *args):
+    """Paths git lists under root, NUL-delimited so a space survives."""
+    out = subprocess.run(
+        ["git", "ls-files", "-z", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return [rel for rel in out.split("\0") if rel]
 
 
 def main():
@@ -217,13 +287,7 @@ def main():
         return self_test()
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    files = subprocess.run(
-        ["git", "ls-files", "src/*.c", "src/*.h"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
+    files = git_ls(root, "src/*.c", "src/*.h")
 
     bad = []
     for rel in files:
@@ -239,7 +303,35 @@ def main():
         print("  See .claude/skills/elfuse-conventions/SKILL.md")
         return 1
 
-    print("  %d source file(s), every atomic states its memory order" % len(files))
+    # Enumerated the way check-ascii.py enumerates its sources: tracked, plus
+    # anything untracked that is not ignored, since a skill file is untracked
+    # for as long as it takes to write it. A plain directory walk would instead
+    # fail the build on an ignored scratch file that is not part of the tree.
+    # The is_file test drops a tracked file deleted from the worktree.
+    doc_bad = []
+    skills = sorted(
+        rel
+        for rel in git_ls(root, "--cached", "--others", "--exclude-standard",
+                          ".claude/skills/*.md")
+        if (root / rel).is_file()
+    )
+    for rel in skills:
+        text = (root / rel).read_text(encoding="utf-8", errors="replace")
+        for lineno, sym, rule in scan_prose(text):
+            doc_bad.append((rel, lineno, sym, rule))
+
+    if doc_bad:
+        print("  %d banned atomic spelling(s) in documentation:" % len(doc_bad))
+        for rel, lineno, sym, rule in doc_bad:
+            hint = ("banned builtin" if rule == "builtin"
+                    else "banned order constant, write the family with a star")
+            print("    %s:%d: %s (%s)" % (rel, lineno, sym, hint))
+        print("  See .claude/skills/elfuse-conventions/SKILL.md")
+        return 1
+
+    print("  %d source file(s), every atomic states its memory order; "
+          "%d skill file(s), no banned atomic spelling"
+          % (len(files), len(skills)))
     return 0
 
 

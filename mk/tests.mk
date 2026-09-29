@@ -105,7 +105,7 @@ check-lock-order:
 
 ## Fail when an atomic access states no memory order
 check-atomics:
-	@echo "  ATOMICS src/"
+	@echo "  ATOMICS src/ .claude/skills/"
 	@python3 scripts/check-atomics.py --self-test
 	@python3 scripts/check-atomics.py
 
