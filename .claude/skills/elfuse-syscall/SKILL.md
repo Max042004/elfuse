@@ -1,6 +1,6 @@
 ---
 name: elfuse-syscall
-description: Adding or changing a Linux syscall in elfuse. Covers dispatch.tbl, sc_ wrappers, the translation boundary, path and filename resolution, fd classes, lock order, and the coverage gate. Use when touching src/syscall/ or the syscall side of src/runtime/, adding a syscall number, or debugging a guest ENOSYS/EINVAL/EPERM. If the change also alters what the guest observes on return (registers, page permissions, the EL0 return path), read elfuse-guest-abi as well.
+description: Adding or changing a Linux syscall in elfuse. Covers dispatch.tbl, sc_ wrappers, the translation boundary, path and filename resolution, fd classes, lock order, usbdevfs, and the coverage gate. Use when touching src/syscall/ or the syscall side of src/runtime/, working on a USB descriptor blob, adding a syscall number, or debugging a guest ENOSYS/EINVAL/EPERM. If the change also alters what the guest observes on return (registers, page permissions, the EL0 return path), read elfuse-guest-abi as well.
 ---
 
 # Adding a syscall to elfuse

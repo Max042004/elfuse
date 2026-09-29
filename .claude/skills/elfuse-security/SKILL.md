@@ -1,6 +1,6 @@
 ---
 name: elfuse-security
-description: The guest as an attacker - where the trust boundary runs, the rules a handler on it obeys, what the gates already catch, and what is out of scope. Use when a change parses a guest-chosen length, translates a guest address, resolves a guest path, allocates on the guest's behalf, or blocks holding shared state, and when auditing a diff or writing a finding up.
+description: The guest as an attacker - where the trust boundary runs, the rules a handler on it obeys, what the gates already catch, and what is out of scope. Use when a change parses a guest-chosen length, translates a guest address, resolves a guest path, walks a raw USB descriptor blob, allocates on the guest's behalf, or blocks holding shared state, and when auditing a diff or writing a finding up.
 ---
 
 # Security at the guest boundary

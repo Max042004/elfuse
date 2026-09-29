@@ -564,8 +564,9 @@ argument gate: the async engine's first review found five defects in code no
 lane executed, and the arithmetic half of it is testable on any machine.
 
 `test-usbdev-urb-loopback` covers the other half. IOKit publishes no loopback
-device, so the fixture becomes one: `ELFUSE_USB_FIXTURE=loopback` substitutes
-for the two IOKit COM vtables and for nothing above them (see
+device, so the fixture becomes one: in the `USB_LOOPBACK_FIXTURE=1` build that
+links it (below), `ELFUSE_USB_FIXTURE=loopback` substitutes for the two IOKit
+COM vtables and for nothing above them (see
 [internals.md](internals.md#testing-the-engine-without-hardware)), which puts
 submit, the per-endpoint queue, the completion callback on the event thread,
 `DISCARDURB`, `REAPURB` blocking and non-blocking, poll and epoll readiness,
