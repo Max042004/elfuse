@@ -28,9 +28,11 @@ typedef struct {
     int guest_fd;
     int64_t guest_pid;
     int write_end;
+    uint64_t gen; /* names this open across guest fd number reuse */
 } pidfd_entry_t;
 
 static pidfd_entry_t pidfd_table[PIDFD_TABLE_SIZE];
+static uint64_t pidfd_next_gen;
 static pthread_mutex_t pidfd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pidfd_entry_t *pidfd_find_free_entry(void)
@@ -53,6 +55,30 @@ static pidfd_entry_t *pidfd_find_guest_fd_entry(int guest_fd)
 
 static void pidfd_cleanup(int guest_fd);
 
+/* Caller holds pidfd_lock. */
+static void pidfd_complete_entry(pidfd_entry_t *entry)
+{
+    if (entry->write_end < 0)
+        return;
+    uint8_t byte = 0;
+    (void) write(entry->write_end, &byte, 1);
+    close(entry->write_end);
+    entry->write_end = -1;
+}
+
+/* Complete one pidfd without touching others that watch the same target. */
+static void pidfd_complete_one(uint64_t gen)
+{
+    pthread_mutex_lock(&pidfd_lock);
+    for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
+        if (pidfd_table[i].active && pidfd_table[i].gen == gen) {
+            pidfd_complete_entry(&pidfd_table[i]);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pidfd_lock);
+}
+
 void pidfd_init(void)
 {
     fd_register_cleanup(FD_PIDFD, pidfd_cleanup);
@@ -73,9 +99,10 @@ static void pidfd_cleanup(int guest_fd)
 
 static void *pidfd_monitor_thread(void *arg)
 {
-    int64_t *pids = (int64_t *) arg;
-    int64_t gpid = pids[0];
-    pid_t hpid = (pid_t) pids[1];
+    int64_t *ctx = (int64_t *) arg;
+    int64_t gpid = ctx[0];
+    pid_t hpid = (pid_t) ctx[1];
+    uint64_t gen = (uint64_t) ctx[2];
     free(arg);
 
     if (kill(hpid, 0) < 0 && errno == ESRCH) {
@@ -84,23 +111,38 @@ static void *pidfd_monitor_thread(void *arg)
     }
 
     int kq = kqueue();
-    if (kq < 0)
+    if (kq < 0) {
+        pidfd_complete_one(gen);
         return NULL;
+    }
 
     struct kevent ev;
     EV_SET(&ev, hpid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
     if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+        /* ESRCH means the target exited before registration, which every pidfd
+         * on it should see. Any other failure says nothing about the target, so
+         * only this fd is completed.
+         */
+        bool gone = errno == ESRCH;
         close(kq);
-        proc_pidfd_notify_exit(gpid);
+        if (gone)
+            proc_pidfd_notify_exit(gpid);
+        else
+            pidfd_complete_one(gen);
         return NULL;
     }
 
     struct kevent out;
-    int n = kevent(kq, NULL, 0, &out, 1, NULL);
+    int n;
+    do {
+        n = kevent(kq, NULL, 0, &out, 1, NULL);
+    } while (n < 0 && errno == EINTR);
     close(kq);
 
     if (n > 0 && out.filter == EVFILT_PROC)
         proc_pidfd_notify_exit(gpid);
+    else
+        pidfd_complete_one(gen);
 
     return NULL;
 }
@@ -139,6 +181,8 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     entry->guest_fd = gfd;
     entry->guest_pid = target_pid;
     entry->write_end = pfd[1];
+    entry->gen = ++pidfd_next_gen;
+    uint64_t gen = entry->gen;
     pthread_mutex_unlock(&pidfd_lock);
 
     /* host_pid <= 0 means the target lives inside this host process -- the
@@ -151,10 +195,11 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
 
     bool monitor_ok = false;
     {
-        int64_t *ctx = malloc(2 * sizeof(int64_t));
+        int64_t *ctx = malloc(3 * sizeof(int64_t));
         if (ctx) {
             ctx[0] = target_pid;
             ctx[1] = (int64_t) host_pid;
+            ctx[2] = (int64_t) gen;
             pthread_t thr;
             pthread_attr_t attr;
             if (pthread_attr_init(&attr) == 0) {
@@ -174,12 +219,13 @@ int pidfd_create(guest_t *g, int64_t target_pid, pid_t host_pid)
     }
 
     /* Nothing will ever mark this fd readable without a monitor behind it, so
-     * complete it rather than leave the guest polling forever. A target that
-     * has already exited needs no special case: the monitor thread finds it
-     * gone and completes the fd the same way.
+     * complete it rather than leave the guest polling forever. Only this fd:
+     * other pidfds on the same live target keep their own monitors. A target
+     * that has already exited needs no special case: the monitor thread finds
+     * it gone and completes the fd the same way.
      */
     if (!monitor_ok)
-        proc_pidfd_notify_exit(target_pid);
+        pidfd_complete_one(gen);
 
     return gfd;
 }
@@ -188,13 +234,8 @@ void proc_pidfd_notify_exit(int64_t exited_pid)
 {
     pthread_mutex_lock(&pidfd_lock);
     for (int i = 0; i < PIDFD_TABLE_SIZE; i++) {
-        if (pidfd_table[i].active && pidfd_table[i].guest_pid == exited_pid &&
-            pidfd_table[i].write_end >= 0) {
-            uint8_t byte = 0;
-            (void) write(pidfd_table[i].write_end, &byte, 1);
-            close(pidfd_table[i].write_end);
-            pidfd_table[i].write_end = -1;
-        }
+        if (pidfd_table[i].active && pidfd_table[i].guest_pid == exited_pid)
+            pidfd_complete_entry(&pidfd_table[i]);
     }
     pthread_mutex_unlock(&pidfd_lock);
 }
