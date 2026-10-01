@@ -177,14 +177,26 @@ jobs:
         # current. This found two dead references to a workflow and a makefile
         # that the CI split had already removed.
         if: ${{ !cancelled() }}
-        run: python3 scripts/check-skill-refs.py
+        run: |
+          python3 scripts/check-skill-refs.py --self-test
+          python3 scripts/check-skill-refs.py
+
+      - name: Atomic spelling
+        # Reads src/ and the .claude/ skills, nothing built, so it belongs in
+        # the lane with no path filter. The documentation half in particular:
+        # build.yml ignores '**.md' and '.claude/**', so the pull request this
+        # half was written for is exactly the one that reaches no `make check`.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check-atomics.py --self-test
+          python3 scripts/check-atomics.py
 
       # What follows needs LINT_PKGS, and the three checks that use it read
       # only C sources, the style file, and the .ci scripts that implement
       # them. cppcheck alone is 50 of this job's 85 seconds and the install is
       # another 12, so a pull request touching none of those would otherwise
       # pay about 70 seconds for three checks with nothing to look at.
-      # The six checks above still run on everything, which is what lets this
+      # The checks above still run on everything, which is what lets this
       # workflow carry no path filter at all.
       #
       # Whenever the answer is not certain (a push, a merge queue, a base that

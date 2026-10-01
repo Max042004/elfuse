@@ -43,9 +43,13 @@ Only `bad_exception` vectors may clobber X5, because they halt.
 | #12 | System instruction trap | cache maintenance logging |
 | #13 | Ptrace stop | taken after the shim restores the HVC #5 saved frame |
 
-The register contract per HVC, including which return values each one accepts,
-is the header comment in `src/core/shim.S`. That comment is the specification;
-this table is an index into it.
+The register contract per shim HVC, including which return values each one
+accepts, is the header comment in `src/core/shim.S`. That comment is the
+specification; this table is an index into it. HVC #6 is the exception: it
+never reaches the shim, so the header does not list it. Its contract is the
+`hvc6_handler` comment in `src/core/guest.h`, which names both routes into it;
+they are dispatched from `case 6` in `src/syscall/proc.c` and from the private
+pseudo-syscall in `src/syscall/syscall.c`.
 
 Changing the protocol is never a one-file change. The shim, the host
 dispatcher, the crash and debug paths that decode HVCs, and the documentation
@@ -208,11 +212,20 @@ Two rules survive any layout change:
 ## shim_data integrity
 
 shim_data is `MEM_PERM_RW_EL1_ONLY` and holds a host-published cache the EL1
-shim serves inline: identity slots (pid/ppid/uid/euid/gid/egid/tid), the
-urandom-eligible fd bitmap, a urandom ring, and an attention bitmask
-(`ATTN_BIT_SIGTIMER`, `ATTN_BIT_CRED`, `ATTN_BIT_TRACE`). HVC #5 is taken only
-when attention is raised, the fd is not in the bitmap, or the ring needs a
-refill.
+shim serves inline: identity slots (pid/ppid/uid/euid/gid/egid, plus pgid
+and sid), per-bucket futex waiter counts, the urandom-eligible fd bitmap, a
+urandom ring, and an attention bitmask
+(`ATTN_BIT_SIGTIMER`, `ATTN_BIT_CRED`, `ATTN_BIT_TRACE`, `ATTN_BIT_PTRACE`;
+`src/core/shim-globals.h` is the list). This governs the inline fast paths
+only: the identity calls, getpgid(0) and getsid(0), read on a urandom fd,
+getrandom, a futex wait whose word moves during the EL1 spin (answered EAGAIN,
+or EFAULT when the word cannot be read), and a futex wake whose bucket holds
+no waiter (answered 0). gettid needs no slot: it reads CONTEXTIDR_EL1, which
+the host sets to the tid per vCPU. Every other syscall forwards as HVC #5, and
+so does a fast-path call the shim cannot settle: attention raised, the fd not
+in the urandom bitmap, the ring short, a futex word that still matches, a
+bucket with a waiter. The dispatch and bail labels in `src/core/shim.S` are
+the full list.
 
 Four things keep EL0 out of it, and a change that weakens any one of them is a
 guest-readable host cache:
@@ -226,9 +239,12 @@ guest-readable host cache:
 - `/proc/self/maps` reports the span as PROT_NONE.
 
 Publishing into the cache is bracketed rather than ordered by luck:
-`shim_globals_attn_or` (`__ATOMIC_SEQ_CST`) raises the attention bit before
-the mutator's stores, so a weakly-ordered ARM64 reader cannot observe the
-publish without the bit; the clear is `__ATOMIC_RELEASE`.
+`shim_globals_attn_or` raises the attention bit before the mutator's stores
+with `atomic_fetch_or_explicit(..., memory_order_seq_cst)`, so a
+weakly-ordered ARM64 reader cannot observe the publish without the bit;
+`shim_globals_attn_and` clears it with
+`atomic_fetch_and_explicit(..., memory_order_release)`. Both are C11; the
+atomics rule and its gate are `elfuse-conventions`.
 
 ## Stack construction
 

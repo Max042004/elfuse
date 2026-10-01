@@ -1,6 +1,6 @@
 ---
 name: elfuse-security
-description: The guest as an attacker - where the trust boundary runs, the rules a handler on it obeys, what the gates already catch, and what is out of scope. Use when a change parses a guest-chosen length, translates a guest address, resolves a guest path, allocates on the guest's behalf, or blocks holding shared state, and when auditing a diff or writing a finding up.
+description: The guest as an attacker - where the trust boundary runs, the rules a handler on it obeys, what the gates already catch, and what is out of scope. Use when a change parses a guest-chosen length, translates a guest address, resolves a guest path, walks a raw USB descriptor blob, allocates on the guest's behalf, or blocks holding shared state, and when auditing a diff or writing a finding up.
 ---
 
 # Security at the guest boundary
@@ -25,7 +25,7 @@ which lanes prove it.
 
 ## Where the boundary runs
 
-Five surfaces, ordered by what one bad value reaches:
+The surfaces, ordered by what one bad value reaches:
 
 - Syscall arguments. X0-X5 and X8 arrive from EL0 with no host filter in
   front, so every wrapper reached from `src/syscall/dispatch.tbl` is on the
@@ -34,12 +34,17 @@ Five surfaces, ordered by what one bad value reaches:
   translator, and the permission half is the security half.
 - Formats the host parses for the guest: the ELF the loader reads, netlink
   messages, FUSE frames, control messages, sigframes, sockaddrs, iovecs,
-  dirents. Each carries lengths, offsets, or counts the guest supplies, but
-  what the guest owns differs per format, so answer that per format rather
-  than assuming it. The ELF is read by offset, a sockaddr length arrives as a
-  separate syscall argument, and a sigframe is built by the host and then left
-  where the guest can rewrite it before `rt_sigreturn` reads it back.
+  dirents, and the usbdevfs URB structures (`usbdevfs_urb`,
+  `usbdevfs_ctrltransfer`, `usbdevfs_bulktransfer`). Each carries lengths,
+  offsets, or counts the guest supplies, but what the guest owns differs per
+  format, so answer that per format rather than assuming it. The ELF is read
+  by offset, a sockaddr length arrives as a separate syscall argument, and a
+  sigframe is built by the host and then left where the guest can rewrite it
+  before `rt_sigreturn` reads it back.
 - Paths. Every name the guest supplies, absolute ones included.
+- Raw USB descriptor blobs, walked by `src/runtime/usb-desc.c`. The one
+  input here the guest does not author; the header comment in
+  `src/runtime/usb-desc.h` says why it is untrusted anyway.
 - Shared pages. The guest and the host see the same memory, so a structure
   validated in guest memory and then passed on by address was not validated.
 
@@ -207,10 +212,8 @@ Under `make check`:
 - `scripts/check-atomics.py` fails a C11 atomic operation written without the
   `_explicit` form, and bans the compiler builtins, so the order is written at
   the site. Its docstring names what it deliberately leaves out: plain-operator
-  access to an `_Atomic` object, which needs per-translation-unit declarations
-  and which the tree already carries a large set of. That half is a review
-  question, so it is the one memory-order case to spend budget on rather than
-  skip.
+  access to an `_Atomic` object. That half is a review question, so it is the
+  one memory-order case to spend budget on rather than skip.
 - `scripts/check-svc-tails.py` holds every return tail to the X7 ptrace test,
   bar the one exception its docstring names and allowlists.
 - `scripts/check-syscall-coverage.py` is a best-effort audit of `dispatch.tbl`

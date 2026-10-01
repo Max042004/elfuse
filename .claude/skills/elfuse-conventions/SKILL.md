@@ -130,10 +130,9 @@ coverage. Both fail rather than skip when their tool is missing.
 
 `make indent` is a no-op on a clean tree, in both halves: every file clang-format
 selects already formats to itself, and every file commentflow selects already
-reflows to itself. That was not free. The tree's comments were wrapped by hand
-before the tool existed, and the one-time reflow rewrote 142 of the 353 C and
-header files, both assembly files, and 36 of the 41 shell scripts. It landed as
-its own commit, under the rule the commit section states.
+reflows to itself. The tree's comments were wrapped by hand before the tool
+existed, and the one-time reflow landed as its own commit, under the rule the
+commit section states.
 
 The gate is what keeps it a no-op. If `make indent` ever hands you a diff in a
 file you did not touch, something reintroduced hand-wrapping, or your
@@ -169,8 +168,8 @@ is a sequentially-consistent read-modify-write, and a site already holding the
 lock that serializes it pays for ordering it does not need while saying nothing
 about the ordering it does. Where a file has many such sites, name the
 discipline once in helpers rather than spelling the order out at each: the
-`pending_load` / `pending_or` / `pending_clear` group at the top of
-`src/syscall/signal.c` is the shape.
+`pending_load` / `pending_or` / `pending_clear` group in
+`src/syscall/signal.h` is the shape.
 
 Never hand an `_Atomic` object to `memcpy` or to a guest read/write helper. That
 copies the object representation, which is not an atomic read of it. Load into a
@@ -192,9 +191,11 @@ states no more about the ordering than the plain operator does.
 
 `scripts/check-atomics.py` holds the two halves a regex can settle: no
 `__atomic_*` or `__sync_*`, and no C11 atomic call without its `_explicit`
-form. It does not check plain-operator access to an `_Atomic` object, because
-finding those needs the declarations resolved and the tree still carries a large
-pre-existing set of them; that half stays a review question.
+form. It reads these skill files too, under the banned-spelling half only, so
+prose may quote a bare `atomic_load` but not a concrete `__atomic_*` name or an
+`__ATOMIC_*` order constant; write either family with the star, as this
+paragraph does. That script's module docstring carries the reasoning, and why
+plain-operator access to an `_Atomic` object is left a review question.
 
 State the order and name what it pairs with. Relaxed is right under a lock that
 already serializes the access. Release and acquire are for a publish a lock-free
@@ -265,9 +266,13 @@ flag, or helper is named for its operation, not the manner.
 
 Not in `src/`: attribution, dates, commented-out code, issue-tracker numbers
 (barred from `docs/` and README prose too, PR#40, PR#223; they belong in a
-commit trailer), or `TODO`/`FIXME`; incomplete work belongs in the commit
-message or PR. Editing part of a comment re-opens all of it: re-read the
-block and rewrite what no longer reads cleanly.
+commit trailer), or a bare `TODO`/`FIXME`; incomplete work belongs in the
+commit message or PR. `CONTRIBUTING.md` carries the marker rule, which asks a
+`TODO` to say what remains and to carry an all-caps owner ahead of the word
+when one applies. What `src/` writes instead is the stage or the condition the
+work waits on, as a parenthesis (`grep -rn 'TODO(' src/`). Editing part of a
+comment re-opens all of it: re-read the block and rewrite what no longer reads
+cleanly.
 
 Mechanics: `/* */` only in `.c`, `.h`, and `.S`, no `//`, no Doxygen tags;
 multi-line blocks align on ` * `, close with `*/` on its own line, indented
@@ -417,3 +422,19 @@ would push one person's habit onto everybody.
 
 Build and toolchain requirements are in `docs/testing.md`, section "Build
 Requirements". They belong to a machine, not to this convention set.
+
+## Authoritative sources
+
+- `CONTRIBUTING.md` for C style, the formatter, and the commit-message rules;
+  it wins where both files speak.
+- `scripts/check-atomics.py`, its module docstring, for what the atomics gate
+  checks and what it deliberately leaves to review.
+- `scripts/check-ascii.py` for the character-set gate, which reads only `.c`,
+  `.h` and `.S` under `src`, `tests` and `frama-c-stubs`: the markdown half of
+  the em dash ban has no gate behind it and stays a review question.
+- `scripts/check-skill-refs.py` for how a path, target, or section named in
+  these files is resolved.
+- `scripts/install-git-hooks.sh` for the hooks a fresh clone installs. They
+  run `.ci/check-format.sh` and `.ci/check-commentflow.sh` at commit time and
+  the commit-log check at push time; none of the gates above is among them, so
+  those first fail at `make check` or in CI.

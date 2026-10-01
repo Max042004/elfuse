@@ -1,6 +1,6 @@
 ---
 name: elfuse-syscall
-description: Adding or changing a Linux syscall in elfuse. Covers dispatch.tbl, sc_ wrappers, the translation boundary, path and filename resolution, fd classes, lock order, and the coverage gate. Use when touching src/syscall/ or the syscall side of src/runtime/, adding a syscall number, or debugging a guest ENOSYS/EINVAL/EPERM. If the change also alters what the guest observes on return (registers, page permissions, the EL0 return path), read elfuse-guest-abi as well.
+description: Adding or changing a Linux syscall in elfuse. Covers dispatch.tbl, sc_ wrappers, the translation boundary, path and filename resolution, fd classes, lock order, usbdevfs, and the coverage gate. Use when touching src/syscall/ or the syscall side of src/runtime/, working on a USB descriptor blob, adding a syscall number, or debugging a guest ENOSYS/EINVAL/EPERM. If the change also alters what the guest observes on return (registers, page permissions, the EL0 return path), read elfuse-guest-abi as well.
 ---
 
 # Adding a syscall to elfuse
@@ -152,9 +152,9 @@ target. See the `elfuse-verify` skill.
 ## FDs and locks
 
 Guest fds are not host fds. Allocate through the bitmap allocator in
-`fdtable.c`; classify with the helpers in `fd.c` and `fd.h` (socket, pidfd,
-eventfd, timerfd, signalfd). A class check that reads the raw fd number is wrong after
-a `dup`.
+`fdtable.c`. The `FD_*` type constants live in `linux-wire.h`; the class
+predicates live in `fd.c`, `fd.h` and `internal.h`. A class check that reads
+the raw fd number is wrong after a `dup`.
 
 The lock order is the comment at the top of `internal.h`. Acquire in the order
 it lists, and add a new lock to that comment as soon as it exists, whether or
@@ -169,7 +169,7 @@ the ordering:
 
 ## Subsystems with rules of their own
 
-Three areas under `src/syscall/` are not ordinary domain files, and a change
+Some areas under `src/syscall/` are not ordinary domain files, and a change
 that treats them as such tends to compile and then deadlock or leak:
 
 - FUSE (`fuse.c`) runs a whole filesystem transport inside the guest. Sessions
@@ -185,6 +185,21 @@ that treats them as such tends to compile and then deadlock or leak:
 - Abstract Unix sockets, SCM_RIGHTS, and netlink each carry their own
   serialization format over guest-supplied lengths, which is why several of
   them have proof targets.
+- usbdevfs (`usbdev.c`, with `src/runtime/usb-sysfs.c` and `usb-desc.c`):
+  `/dev/bus/usb/BBB/DDD` character devices over IOKit, asynchronous URBs, and
+  a synthetic `/sys/bus/usb` tree that goes through the same intercept layer
+  as procfs. Its locks do not nest the way the rest of the ordered list does,
+  and the `usbdev_table_lock` entry in `internal.h` is where that is written
+  down. The IOKit calls sit behind a COM seam, and `ELFUSE_USB_FIXTURE` stands
+  modeled devices in front of it so the fd contract runs with no hardware. A
+  device that answers a transfer needs both `ELFUSE_USB_FIXTURE=loopback` at
+  run time and a binary built with `USB_LOOPBACK_FIXTURE=1`: the env var picks
+  the device, the build flavor decides whether the fixture is linked in at all.
+  `mk/config.mk` owns the split and says why the two flavors write separate
+  binaries.
+  `scripts/gen-usbdev-ioctl-departed.py` generates
+  build/usbdev-ioctl-departed-vectors.h from
+  `tests/usbdev-ioctl-departed.tbl`: edit the table, not the header.
 
 `docs/internals.md` has a section for each.
 

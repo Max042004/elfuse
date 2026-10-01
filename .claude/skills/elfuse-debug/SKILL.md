@@ -32,6 +32,7 @@ classification is the first bisection, and it is free:
 | `CRASH_UNEXPECTED_HVC` / `CRASH_UNEXPECTED_EC` | The shim and the host dispatcher disagree about the protocol. Usually a half-landed HVC change. |
 | `CRASH_HV_CHECK` | Hypervisor.framework refused a call. Host-side: a mapping or permission elfuse asked for is not one HVF allows. |
 | `CRASH_ELR_ZERO` | Register state after exec is not what the host wrote. A return-to-EL0 path problem, not a loader problem. |
+| `CRASH_UNEXPECTED_EXIT` | `hv_vcpu_run()` returned an exit reason the loop does not handle. Host-side: HVF or the run loop, not the guest. |
 | `CRASH_TIMEOUT` | One `hv_vcpu_run()` iteration exceeded the `--timeout` watchdog. |
 
 `CRASH_TIMEOUT` is the one that gets misread. The watchdog bounds a single run
@@ -198,6 +199,8 @@ so prefer them when the two disagree:
   `--timeout`, `--fakeroot`, and `ELFUSE_FAKEROOT_EXEC`.
 - `docs/internals.md`, section "GDB Stub" - the snapshot protocol and the
   `src/debug/` split.
-- The header comments in `src/core/startup-trace.h`, `src/debug/syscall-hist.h`,
-  and `src/debug/crashreport.h` - each states its env var's accepted values and
+- The header comments in `src/core/startup-trace.h` and
+  `src/debug/syscall-hist.h` - each states its env var's accepted values and
   what it costs when disabled.
+- `src/debug/crashreport.h` for the crash-type enum and the report layout.
+  The report is unconditional.

@@ -1361,9 +1361,10 @@ fork.
 IOKit publishes no loopback device, so the async engine had no in-tree lane at
 all: `ELFUSE_USB_FIXTURE`'s devices have no IOKit service behind them and stop
 at `SUBMITURB`'s argument gate. `ELFUSE_USB_FIXTURE=loopback` adds one that
-does, by substituting at the narrowest place that leaves every layer above it
-real: the two COM vtables. Every wire call in `usbdev.c` goes through
-`IOUSBDeviceInterface650 **` or `IOUSBInterfaceInterface800 **` as
+does, in the `USB_LOOPBACK_FIXTURE=1` build that links the model rather than
+the stub (below), by substituting at the narrowest place that leaves every
+layer above it real: the two COM vtables. Every wire call in `usbdev.c` goes
+through `IOUSBDeviceInterface650 **` or `IOUSBInterfaceInterface800 **` as
 `(*h)->Method(h, ...)`, so `src/syscall/usbdev-fixture.c` hands back an object
 whose first member is a vtable of the same shape and nothing above it changes.
 The URB records, the per-endpoint FIFO, the completion callback, `urb_status`,
