@@ -2292,10 +2292,10 @@ static int proc_open_mounts_node(const char *path)
  * guest and the buffer, so a split would be a jump table by another name.
  */
 /* NOLINTNEXTLINE(readability-function-size) */
-int proc_intercept_open(const guest_t *g,
-                        const char *path,
-                        int linux_flags,
-                        int mode)
+static int intercept_open_dispatch(const guest_t *g,
+                                   const char *path,
+                                   int linux_flags,
+                                   int mode)
 {
     /* /dev/ptmx -> host /dev/ptmx + keepalive slave (see pty_open_master).
      * O_PATH is path-only on Linux: it must not run the device open hook or
@@ -2387,7 +2387,7 @@ int proc_intercept_open(const guest_t *g,
      * intercepted too or callers that probe then enumerate see inconsistent
      * Linux-visible behavior.
      */
-    if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/"))
+    if (!strcmp(path, "/dev/pts"))
         return pty_open_pts_dir(linux_flags);
 
     /* /dev/pts/N -> the macOS slave path captured at /dev/ptmx open time.
@@ -2420,7 +2420,7 @@ int proc_intercept_open(const guest_t *g,
      * "self" symlink. The DIR* created from this allows getdents64 to enumerate
      * /proc like a real procfs. Cleaned up via atexit.
      */
-    if (!strcmp(path, "/proc") || !strcmp(path, "/proc/")) {
+    if (!strcmp(path, "/proc")) {
         const char *dir = ensure_proc_tmpdir(g);
         if (!dir)
             return -1;
@@ -2428,7 +2428,7 @@ int proc_intercept_open(const guest_t *g,
     }
 
     /* /proc/self -> directory fd for the PID subdirectory */
-    if (!strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
+    if (!strcmp(path, "/proc/self")) {
         const char *dir = ensure_proc_tmpdir(g);
         if (!dir)
             return -1;
@@ -3093,7 +3093,9 @@ int proc_intercept_stat(const char *path, struct stat *st)
     return proc_intercept_stat_at(path, st, false);
 }
 
-int proc_intercept_stat_at(const char *path, struct stat *st, bool follow)
+static int intercept_stat_dispatch(const char *path,
+                                   struct stat *st,
+                                   bool follow)
 {
     /* Intercept stat for /proc paths emulated via proc_intercept_open. Without
      * this, runtime libraries that probe a file's existence via stat() before
@@ -3124,8 +3126,16 @@ int proc_intercept_stat_at(const char *path, struct stat *st, bool follow)
         return 0;
     }
 
+    /* The mount table open() synthesizes; a stat that said ENOENT for a name
+     * open() then served was one object with two answers.
+     */
+    if (!strcmp(path, "/etc/mtab")) {
+        stat_fill_proc_file(st, 0444, path);
+        return 0;
+    }
+
     /* /dev/shm is a directory */
-    if (!strcmp(path, "/dev/shm") || !strcmp(path, "/dev/shm/")) {
+    if (!strcmp(path, "/dev/shm")) {
         stat_fill_proc_dir(st, 01777, 2,
                            path); /* sticky bit, like real /dev/shm */
         return 0;
@@ -3149,7 +3159,7 @@ int proc_intercept_stat_at(const char *path, struct stat *st, bool follow)
      * passes. The numeric tail must round-trip with /dev/ttysN via the open
      * intercept (see proc_intercept_open).
      */
-    if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/")) {
+    if (!strcmp(path, "/dev/pts")) {
         stat_fill_proc_dir(st, 0755, 2, path);
         return 0;
     }
@@ -3209,18 +3219,15 @@ int proc_intercept_stat_at(const char *path, struct stat *st, bool follow)
     }
 
     /* /proc and /proc/<our_pid> are directories */
-    if (!strcmp(path, "/proc") || !strcmp(path, "/proc/")) {
+    if (!strcmp(path, "/proc")) {
         stat_fill_proc_dir(st, 0555, 3, path);
         return 0;
     }
     {
-        char pidbuf[32], pidslash[32];
+        char pidbuf[32];
         snprintf(pidbuf, sizeof(pidbuf), "/proc/%lld",
                  (long long) proc_get_pid());
-        snprintf(pidslash, sizeof(pidslash), "/proc/%lld/",
-                 (long long) proc_get_pid());
-        if (!strcmp(path, pidbuf) || !strcmp(path, pidslash) ||
-            !strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
+        if (!strcmp(path, pidbuf) || !strcmp(path, "/proc/self")) {
             stat_fill_proc_dir(st, 0555, 3, path);
             return 0;
         }
@@ -3439,7 +3446,9 @@ static int proc_readlink_self_exe(char *buf, size_t bufsiz)
     return (int) len;
 }
 
-int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
+static int intercept_readlink_dispatch(const char *path,
+                                       char *buf,
+                                       size_t bufsiz)
 {
     {
         char alias[LINUX_PATH_MAX];
@@ -3447,7 +3456,7 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
         if (aliased < 0)
             return -1;
         if (aliased > 0)
-            return proc_intercept_readlink(alias, buf, bufsiz);
+            return intercept_readlink_dispatch(alias, buf, bufsiz);
     }
 
     if (!strcmp(path, "/proc/self/exe"))
@@ -3695,4 +3704,89 @@ int proc_intercept_write(int guest_fd,
 unlock:
     pthread_mutex_unlock(&oom_write_lock);
     return rc;
+}
+
+/* What the requirement answers for @path once the dispatcher has been asked: 0
+ * when it names an intercepted directory, -1 with errno for an intercepted file
+ * or a lookup that failed, PROC_NOT_INTERCEPTED when the name is not ours and
+ * the host applies the requirement itself.
+ */
+static int intercept_require_dir(const char *stripped)
+{
+    struct stat st;
+    int rc = intercept_stat_dispatch(stripped, &st, true);
+    if (rc != 0)
+        return rc;
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+int proc_intercept_open(const guest_t *g,
+                        const char *path,
+                        int linux_flags,
+                        int mode)
+{
+    /* The directory requirement of a trailing slash or ".": the name has to
+     * resolve to a directory, following a final symlink to get there. The
+     * dispatchers match names literally, so it is taken off here, once, and
+     * enforced on what they answer.
+     */
+    char buf[LINUX_PATH_MAX];
+    const char *name = path_bare_name(path, buf, sizeof(buf));
+    if (name != path) {
+        int rc = intercept_require_dir(name);
+        if (rc != 0)
+            return rc;
+        linux_flags &= ~LINUX_O_NOFOLLOW;
+    }
+    return intercept_open_dispatch(g, name, linux_flags, mode);
+}
+
+int proc_intercept_stat_at(const char *path, struct stat *st, bool follow)
+{
+    char buf[LINUX_PATH_MAX];
+    const char *name = path_bare_name(path, buf, sizeof(buf));
+    if (name == path)
+        return intercept_stat_dispatch(path, st, follow);
+    int rc = intercept_stat_dispatch(name, st, true);
+    if (rc == 0 && !S_ISDIR(st->st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return rc;
+}
+
+int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
+{
+    char name_buf[LINUX_PATH_MAX];
+    const char *name = path_bare_name(path, name_buf, sizeof(name_buf));
+    if (name != path) {
+        /* The requirement resolves the name to a directory, which is no link.
+         */
+        int rc = intercept_require_dir(name);
+        if (rc == 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        return rc;
+    }
+
+    int rc = intercept_readlink_dispatch(path, buf, bufsiz);
+    if (rc != PROC_NOT_INTERCEPTED)
+        return rc;
+
+    /* An object an intercept serves and no readlink arm names is not a link:
+     * Linux answers EINVAL for it, where the host, asked for a name it does not
+     * have, answered ENOENT.
+     */
+    struct stat st;
+    if (intercept_stat_dispatch(path, &st, false) == 0 &&
+        !S_ISLNK(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return PROC_NOT_INTERCEPTED;
 }

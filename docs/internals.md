@@ -1874,6 +1874,30 @@ final component may not exist yet. `path_translate_at()` picks one by flags;
 in the `openat2(RESOLVE_NO_SYMLINKS)` precheck described below, and walks
 relative paths from their descriptor with the same clamp applied in the walk.
 
+### Folding `//` And `.`
+
+Linux steps over `//` runs and `.` components in the walk every path syscall
+shares, so `//sys/bus`, `/./sys/bus` and `/sys/./bus` are `/sys/bus` to all of
+them. The intercepts match literal prefixes, so `path_translate_at()` folds an
+absolute name once, before any of them reads it.
+
+Two things stay as written. `..` is not folded, because Linux applies it to
+what the component before it resolved to. And a `.` that is the last component
+keeps its place, because that is where Linux gives it a meaning of its own:
+`rmdir("d/.")` is `EINVAL` where `rmdir("d/")` removes `d`.
+
+What a final `.` or a trailing slash means to a lookup is a requirement: the
+name has to resolve to a directory, following a final symlink to get there. The
+host walk applies it for itself. The intercepts match names literally, so
+`proc_intercept_open()`, `proc_intercept_stat_at()` and
+`proc_intercept_readlink()` take the requirement off the name once, dispatch on
+the bare name, and enforce it on the answer: a served directory answers as
+itself, anything else answers `ENOTDIR`, and `readlink` of a served directory
+answers `EINVAL`. The gates in `path.c` read the bare name for the same reason.
+
+`tests/test-path-fold.c` holds every respelling of a name to the answer its
+canonical spelling gets, and both endings to what Linux makes of them.
+
 ### Clamping `..` At The Guest Root
 
 A guest resolves `..` against its own root, and Linux clamps it there: `/..`

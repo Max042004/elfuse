@@ -806,6 +806,7 @@ run_unit_tests()
     printf "\n/proc and /dev\n"
     test_check "$runner" "test-proc" "0 failed" "$bindir/test-proc"
     test_check "$runner" "test-sysfs-cpu" "0 failed" "$bindir/test-sysfs-cpu"
+    test_check "$runner" "test-path-fold" "0 failed" "$bindir/test-path-fold"
     test_rc "$runner" "test-procfs" 0 "$bindir/test-procfs"
     test_rc "$runner" "test-procfs-exec" 0 "$bindir/test-procfs-exec"
     test_rc "$runner" "test-proc-limits" 0 "$bindir/test-proc-limits"
@@ -1527,9 +1528,15 @@ run_suite()
 # stop at its neighbors rather than extend page tables over them. No fixture,
 # not in either skip list, so it runs in both lanes. 253 and 228, observed here
 # at 295 and 273.
+#
+# Both went up by two for test-shim-sigreturn-x8 and test-path-fold. The first
+# was registered with one binary run by hand behind it rather than a lane, so
+# its floor was left for a run that observed one; the second holds every
+# respelling of a path to the answer its canonical spelling gets. No fixture,
+# not in either skip list. 255 and 230, observed here at 297 and 275.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|253|0"
-    "qemu-aarch64|228|0"
+    "elfuse-aarch64|255|0"
+    "qemu-aarch64|230|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

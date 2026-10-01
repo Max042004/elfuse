@@ -86,6 +86,18 @@ static inline int path_translation_at_flags(const path_translation_t *tx,
  */
 bool path_prefix_match(const char *path, const char *prefix, size_t plen);
 
+/* Whether @path ends in the directory requirement Linux attaches to a trailing
+ * slash or a final ".": the name has to resolve to a directory, and a final
+ * symlink is followed to get there.
+ */
+bool path_dir_required(const char *path);
+
+/* @path without that requirement, into @buf when there was one to take off, or
+ * @path itself when there was not. The intercepts match names literally and
+ * enforce the requirement for themselves; getcwd reports the directory.
+ */
+const char *path_bare_name(const char *path, char *buf, size_t bufsz);
+
 /* Advance *pathp to the next '/'-separated component, skipping empty segments
  * from repeated slashes.
  *
